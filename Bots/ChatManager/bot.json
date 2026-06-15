@@ -1,0 +1,15 @@
+{
+    "main": "ChatManager.js",
+    "option": {
+        "apiLevel": 2,
+        "useConsoleApi": true,
+        "scriptPower": true,
+        "debugRoom": {
+            "name": "DEBUG ROOM",
+            "sender": "DEBUG SENDER",
+            "isGroupChat": false,
+            "packageName": "com.xfl.msgbot",
+            "channelId": 0
+        }
+    }
+}

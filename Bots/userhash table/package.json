@@ -1,0 +1,8 @@
+{
+  "name": "userhash-table",
+  "version": "1.0.0",
+  "description": "MessengerBot script: userhash table",
+  "main": "userhash table.js",
+  "type": "commonjs",
+  "dependencies": {}
+}

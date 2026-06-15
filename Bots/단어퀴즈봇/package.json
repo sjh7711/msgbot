@@ -1,0 +1,8 @@
+{
+  "name": "단어퀴즈봇",
+  "version": "1.0.0",
+  "description": "MessengerBot script: 단어퀴즈봇",
+  "main": "단어퀴즈봇.js",
+  "type": "commonjs",
+  "dependencies": {}
+}

@@ -1,0 +1,8 @@
+{
+  "name": "chatmanager",
+  "version": "1.0.0",
+  "description": "MessengerBot script: ChatManager",
+  "main": "ChatManager.js",
+  "type": "commonjs",
+  "dependencies": {}
+}

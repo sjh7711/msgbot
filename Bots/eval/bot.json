@@ -1,0 +1,20 @@
+{
+    "main": "eval.js",
+    "option": {
+        "apiLevel": 2,
+        "useConsoleApi": true,
+        "scriptPower": true,
+        "allowEval": true,
+        "targetMessengers": {
+            "com.linkedin.android": true,
+            "com.kakao.talk": true
+        },
+        "debugRoom": {
+            "name": "신종화",
+            "sender": "신종화",
+            "isGroupChat": false,
+            "packageName": "com.linkedin.android",
+            "channelId": 0
+        }
+    }
+}

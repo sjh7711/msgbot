@@ -1,0 +1,8 @@
+{
+  "name": "eval",
+  "version": "1.0.0",
+  "description": "MessengerBot script: eval",
+  "main": "eval.js",
+  "type": "commonjs",
+  "dependencies": {}
+}

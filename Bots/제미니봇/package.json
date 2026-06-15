@@ -1,0 +1,8 @@
+{
+  "name": "제미니봇",
+  "version": "1.0.0",
+  "description": "MessengerBot script: Gemini 기반 간단 질의응답 봇",
+  "main": "제미니봇.js",
+  "type": "commonjs",
+  "dependencies": {}
+}

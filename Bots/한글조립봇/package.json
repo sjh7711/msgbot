@@ -1,0 +1,8 @@
+{
+  "name": "한글조립봇",
+  "version": "1.0.0",
+  "description": "MessengerBot script: 한글조립봇",
+  "main": "한글조립봇.js",
+  "type": "commonjs",
+  "dependencies": {}
+}

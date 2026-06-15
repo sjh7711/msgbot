@@ -1,0 +1,11 @@
+{
+    "main": "로그봇.js",
+    "option": {
+        "apiLevel": 2,
+        "useConsoleApi": true,
+        "scriptPower": false,
+        "targetMessengers": {
+            "com.linkedin.android": false
+        }
+    }
+}

@@ -1,0 +1,11 @@
+{
+    "main": "단어퀴즈봇.js",
+    "option": {
+        "apiLevel": 2,
+        "useConsoleApi": true,
+        "scriptPower": true,
+        "targetMessengers": {
+            "com.linkedin.android": false
+        }
+    }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "zqt",
+  "version": "1.0.0",
+  "description": "MessengerBot script: zqt",
+  "main": "zqt.js",
+  "type": "commonjs",
+  "dependencies": {}
+}

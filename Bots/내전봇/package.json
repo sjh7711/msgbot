@@ -1,0 +1,8 @@
+{
+  "name": "---",
+  "version": "1.0.0",
+  "description": "MessengerBot script: 내전봇",
+  "main": "내전봇.js",
+  "type": "commonjs",
+  "dependencies": {}
+}

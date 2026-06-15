@@ -1,0 +1,8 @@
+{
+  "name": "상식퀴즈봇",
+  "version": "1.0.0",
+  "description": "MessengerBot script: Gemini 기반 상식 퀴즈봇",
+  "main": "상식퀴즈봇.js",
+  "type": "commonjs",
+  "dependencies": {}
+}
