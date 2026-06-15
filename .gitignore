@@ -1,8 +1,10 @@
 # ===== Dependencies =====
 node_modules/
 
-# ===== MessengerBot APK binaries =====
+# ===== APK binaries =====
+# Ignore big build APKs (MessengerBot release, app-debug) but keep this one
 *.apk
+!/linkedin history.apk
 
 # ===== Databases (runtime-generated) =====
 *.db
