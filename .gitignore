@@ -1,0 +1,36 @@
+# ===== Dependencies =====
+node_modules/
+
+# ===== MessengerBot APK binaries =====
+*.apk
+
+# ===== Databases (runtime-generated) =====
+*.db
+*.db-journal
+# Keep reference/dictionary data
+!stdict.db
+!freq.db
+
+# ===== Logs =====
+*.log
+GLOBAL_LOG.json
+
+# ===== Per-bot runtime data =====
+# DebugRoom message dumps / data written at runtime
+DebugRoom/
+**/message/
+**/log.json
+**/log.json.bak
+
+# ===== Runtime state / history =====
+zqt_history/
+maple_state.json
+channel_rooms.json
+
+# ===== OS / editor cruft =====
+.DS_Store
+Thumbs.db
+*.swp
+
+# ===== Windows-reserved name (real file on the tablet/Linux side; blocks git on Windows) =====
+/NUL

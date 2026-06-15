@@ -32,9 +32,7 @@ const BOT_NAME = "상식퀴즈봇";
 // 아래는 기본(코드 내장) 키. 사용자가 !api 로 등록한 키는 quiz_apikey 에 저장되고,
 // 시작 시 loadApiKeys() 가 이 배열 뒤에 append 한다. (const 지만 배열 mutate 는 허용됨)
 const DEFAULT_MODEL = "gemini-3.1-flash-lite";
-const API_KEYS = [
-  { key: "your-key",                  model: DEFAULT_MODEL },
-];
+const API_KEYS = [];
 var currentProviderIndex = 0;
 
 // !api 키 등록 대화 세션 상태 (개인채팅 단계별 진행). 워커 스레드보다 먼저 초기화돼야 해서 상단 선언.
@@ -45,6 +43,9 @@ const ANSWER_WINDOW_MS = 30 * 1000;
 const REVEAL_DELAY_MS  = 30 * 1000;       // 제출 마감과 동시에 정답 공개 (= ANSWER_WINDOW_MS)
 const POST_REVEAL_IGNORE_MS = 2500;       // 정답 공개 직후 이 시간 동안 !상식/!ㅅㅅ+단어 입력 무시
 const MAX_TOTAL_CHARS  = 400;
+
+// 카카오톡 "더보기(접기)" 트리거용 긴 공백(제로폭 공백) 스페이서. 메시지 일부를 접기 위해 끝에 덧붙임.
+var LONG_MSG_SPACER = "​".repeat(500);
 
 // 토픽 출제 일일 한도 (한국시간 자정 리셋). API 키 제공자는 우대 한도 적용.
 const TOPIC_LIMIT_DEFAULT  = 25;
@@ -603,13 +604,15 @@ function kstDayStartMs() {
 //   - 한 provider 라도 정상 응답하면 그 응답을 그대로 사용.
 //   - 모든 provider 가 429 면 { quotaExhausted: true } 반환.
 // 이 방에서 사용 가능한 provider 인덱스 목록.
-//  - 코드 내장 키(room 없음/빈값)는 모든 방 공용.
-//  - 사용자가 !api 로 등록한 키는 등록한 방(room)에서만 사용.
+//  - quiz_apikey 의 첫번째(가장 먼저 등록된) 키 = API_KEYS[0] 은 전역 키로 모든 방에서 사용.
+//    (loadApiKeys 가 created ASC 로 append 하고 API_KEYS 는 빈 배열에서 시작하므로 [0]=최초 등록분)
+//  - room 이 비어있는 키(있다면)도 전역 공용.
+//  - 그 외 !api 등록 키는 등록한 방(room)에서만 사용.
 function eligibleProviderIndexes(room) {
   var out = [];
   for (var i = 0; i < API_KEYS.length; i++) {
     var p = API_KEYS[i];
-    if (!p.room || p.room === room) out.push(i);
+    if (i === 0 || !p.room || p.room === room) out.push(i);
   }
   return out;
 }
@@ -1081,8 +1084,11 @@ function getRanking(topN, room) {
 }
 
 // ── 게임 상태 ────────────────────────────────────────────────────────
-var quiz = newQuizState();
-var lastRevealMs = 0;   // 마지막 정답 공개 시각 (resetQuiz 후에도 유지) — 공개 직후 입력 무시 판정용
+// 방(channelId)별 독립 진행. 같은 시각 서로 다른 방에서 동시에 퀴즈가 돌 수 있다.
+//  - 인메모리 진행 상태 + 정답공개 타이머 라우팅 = channelId 기준.
+//  - DB(quiz_round/appeals/stats) + 봇 답장 = 기존대로 방 이름 문자열(quiz.room) 기준 유지.
+var quizzes = {};               // channelId -> quiz state (newQuizState())
+var lastRevealMsByChan = {};    // channelId -> 마지막 정답 공개 시각 (공개 직후 입력 무시 판정용)
 
 function newQuizState() {
   return {
@@ -1107,11 +1113,11 @@ function newQuizState() {
   };
 }
 
-function resetQuiz() {
-  if (quiz.revealThread) {
+function resetQuiz(quiz, chanId) {
+  if (quiz && quiz.revealThread) {
     try { quiz.revealThread.interrupt(); } catch(_) {}
   }
-  quiz = newQuizState();
+  quizzes[chanId] = newQuizState();
 }
 
 // 난이도 1~5 기준(생성·감사 프롬프트 공용)
@@ -1462,7 +1468,7 @@ function summarizeGenError(err) {
 // startQuiz 는 워커 스레드에서 호출됨.
 // Gemini 호출은 시간이 길어(5~30s) 워커를 막으면 안 되니 별도 스레드에서 돌리되,
 // 결과(data 또는 error)는 큐로 다시 보내서 워커 스레드 위에서 quiz 상태를 변경.
-function startQuiz(msg, customTopic, requesterHash) {
+function startQuiz(msg, customTopic, requesterHash, quiz, chanId) {
   if (quiz.active || quiz.generating) {
     msg.reply("이미 퀴즈가 진행 중입니다.");
     return;
@@ -1480,7 +1486,7 @@ function startQuiz(msg, customTopic, requesterHash) {
 
     try {
       if (!data || data._error || data._quotaExhausted) {
-        msgQueue.put({ type: "quiz_fail", room: room,
+        msgQueue.put({ type: "quiz_fail", room: room, chanId: chanId,
           quotaExhausted: !!(data && data._quotaExhausted),
           attempts: (data && data._attempts) ? data._attempts : null,
           error: (data && data._error) ? data._error : (error || "알 수 없음") });
@@ -1489,7 +1495,7 @@ function startQuiz(msg, customTopic, requesterHash) {
         if (customTopic && requesterHash) {
           try { recordTopicRequest(requesterHash); } catch(_) {}
         }
-        msgQueue.put({ type: "quiz_ready", room: room, data: data });
+        msgQueue.put({ type: "quiz_ready", room: room, chanId: chanId, data: data });
       }
     } catch(_) {}
   }).start();
@@ -1502,7 +1508,7 @@ function difficultyStars(n) {
   return new Array(n + 1).join("★") + new Array(6 - n).join("☆");
 }
 
-function startActiveQuiz(room, data) {
+function startActiveQuiz(room, data, quiz, chanId) {
   quiz.generating = false;
   quiz.active = true;
   quiz.room = room;
@@ -1548,18 +1554,19 @@ function startActiveQuiz(room, data) {
 
   bot.send(room, lines.join("\n"));
 
-  // 정답 공개 타이머도 워커 큐를 거치게 해서 직렬화
+  // 정답 공개 타이머도 워커 큐를 거치게 해서 직렬화.
+  // chanId 를 클로저에 캡처해 reveal 태스크에 실어 보낸다 → 다른 방 타이머가 이 방 퀴즈를 공개하지 못하게 함.
   var th = new java.lang.Thread(function() {
     try {
       java.lang.Thread.sleep(REVEAL_DELAY_MS);
-      try { msgQueue.put({ type: "reveal" }); } catch(_) {}
+      try { msgQueue.put({ type: "reveal", chanId: chanId }); } catch(_) {}
     } catch(_) { /* interrupted = 종료 */ }
   });
   quiz.revealThread = th;
   th.start();
 }
 
-function submitAnswer(msg, raw) {
+function submitAnswer(msg, raw, quiz, chanId) {
   if (!quiz.active) return;
   if (msg.room !== quiz.room) return;
   if (quiz.winnerPid) return; // 이미 우승자 결정됨
@@ -1612,14 +1619,14 @@ function submitAnswer(msg, raw) {
     quiz.winnerName = name;
     quiz.winnerRaw = String(raw);
     quiz.winnerTimeMs = elapsed;
-    revealAnswer();
+    revealAnswer(quiz, chanId);
   } else {
     msg.reply("❌ " + name + "님 오답: " + raw);
   }
 }
 
-function revealAnswer() {
-  if (!quiz.active) return;
+function revealAnswer(quiz, chanId) {
+  if (!quiz || !quiz.active) return;
   var room = quiz.room;
 
   // 참여자 통계 기록 (hash 기반)
@@ -1691,8 +1698,8 @@ function revealAnswer() {
   }
 
   bot.send(room, lines.join("\n"));
-  lastRevealMs = nowMs();   // 공개 직후 늦은 !상식/!ㅅㅅ+단어 입력을 무시하기 위한 기준 시각
-  resetQuiz();
+  lastRevealMsByChan[chanId] = nowMs();   // 공개 직후 늦은 !상식/!ㅅㅅ+단어 입력을 무시하기 위한 기준 시각 (방별)
+  resetQuiz(quiz, chanId);
 }
 
 // ── 이의신청 ────────────────────────────────────────────────────────
@@ -1855,7 +1862,7 @@ function showRanking(msg) {
       "/오:" + u.wrong +
       "(" + (u.wins / (u.wins + u.wrong) * 100).toFixed(1) + "%)"
     );
-    if (i === 2 && top.length > 3) lines[lines.length - 1] = lines[lines.length - 1] + "​".repeat(500);   // 3위와 4위 사이 접기(더보기) 처리
+    if (i === 2 && top.length > 3) lines[lines.length - 1] = lines[lines.length - 1] + LONG_MSG_SPACER;   // 3위와 4위 사이 접기(더보기) 처리
   }
   msg.reply(lines.join("\n"));
 }
@@ -1870,7 +1877,7 @@ function showForbiddenList(msg) {
   var lines = ["🚫 금지목록 (빈출 정답 TOP " + rows.length + ")", "자주 생성된 정답일수록 새 문제에서 회피", "━━━━━━━━━━━━━"];
   for (var i = 0; i < rows.length; i++) {
     lines.push((i + 1) + ". " + rows[i].answer + " (" + rows[i].count + "회)");
-    if (i === 4 && rows.length > 5) lines[lines.length - 1] = lines[lines.length - 1] + "​".repeat(500);   // 5위와 6위 사이 접기(더보기) 처리
+    if (i === 4 && rows.length > 5) lines[lines.length - 1] = lines[lines.length - 1] + LONG_MSG_SPACER;   // 5위와 6위 사이 접기(더보기) 처리
   }
   msg.reply(lines.join("\n"));
 }
@@ -1944,12 +1951,14 @@ new java.lang.Thread(function() {
         var room = String(task.get("room") || "");
         var name = String(task.get("name") || "익명");
         var hash = String(task.get("hash") || "");
+        var channelId = String(task.get("channelId") || "");   // 방별 진행 상태/타이머 라우팅 키
         // !api 등록 세션 진행 중인 사용자는 일반 명령이 아니어도(방/닉네임 입력 등) 받아줘야 함
         var inSession = !!apiSessions[apiSessionKey(room, hash || name)];
         if (!inSession && !isGameCommand(text)) continue;
         var msg = {
           content: text,
           room: room,
+          channelId: channelId,
           author: { name: name, hash: hash },
           reply: (function(r) { return function(s) { try { bot.send(r, s); } catch(_) {} }; })(room)
         };
@@ -1966,15 +1975,19 @@ new java.lang.Thread(function() {
 function processTask(task) {
   if (!task) return;
   if (task.type === "reveal") {
-    revealAnswer();
+    // 이 방(chanId)의 상태만 공개. 다른 방 타이머가 끼어들어 엉뚱한 방을 공개하지 못하게 가드.
+    var rq = quizzes[task.chanId];
+    if (rq && rq.active) revealAnswer(rq, task.chanId);
     return;
   }
   if (task.type === "quiz_ready") {
-    startActiveQuiz(task.room, task.data);
+    var aq = quizzes[task.chanId] || (quizzes[task.chanId] = newQuizState());
+    startActiveQuiz(task.room, task.data, aq, task.chanId);
     return;
   }
   if (task.type === "quiz_fail") {
-    quiz.generating = false;
+    var fq = quizzes[task.chanId] || (quizzes[task.chanId] = newQuizState());
+    fq.generating = false;
     if (task.quotaExhausted) {
       bot.send(task.room,
         "사용가능 API [0/" + API_KEYS.length + "]\n상식퀴즈 일시적으로 사용 불가\n\n" +
@@ -2205,16 +2218,19 @@ function finalizeApiSession(msg, sk, s, chosen) {
 function handleMessage(msg) {
   try {
     var text = msg.content;
+    // 방별 진행 상태 — channelId 로 라우팅. DB/답장은 여전히 방 이름(quiz.room) 기준.
+    var chanId = msg.channelId || "";
+    var quiz = quizzes[chanId] || (quizzes[chanId] = newQuizState());
 
     if (text === "!상식" || text === "!ㅅㅅ") {
-      startQuiz(msg);
+      startQuiz(msg, null, null, quiz, chanId);
       return;
     }
 
     if (text === "!상식종료") {
       if (quiz.active && msg.room === quiz.room) {
         var ans = quiz.answer;
-        resetQuiz();
+        resetQuiz(quiz, chanId);
         msg.reply("퀴즈를 종료합니다. 정답은 \"" + ans + "\" 였습니다.");
       } else {
         msg.reply("진행 중인 퀴즈가 없습니다.");
@@ -2266,7 +2282,7 @@ function handleMessage(msg) {
 
       // 정답 공개 직후 2.5초 동안은 !상식/!ㅅㅅ + 단어 입력을 무시.
       // (마감 직전 늦게 친 답안이 공개 직후 새 퀴즈 토픽으로 잘못 출제되는 것 방지)
-      if (isTopicPrefix && (nowMs() - lastRevealMs) < POST_REVEAL_IGNORE_MS) {
+      if (isTopicPrefix && (nowMs() - (lastRevealMsByChan[chanId] || 0)) < POST_REVEAL_IGNORE_MS) {
         return;
       }
 
@@ -2288,7 +2304,7 @@ function handleMessage(msg) {
             "봇과 1:1 채팅에서 !api 발급받은키 를 입력하면 등록됩니다.")
           return;
         }
-        startQuiz(msg, customTopic, requesterHash);
+        startQuiz(msg, customTopic, requesterHash, quiz, chanId);
         return;
       }
 
@@ -2299,7 +2315,7 @@ function handleMessage(msg) {
         return;
       }
 
-      submitAnswer(msg, arg);
+      submitAnswer(msg, arg, quiz, chanId);
       return;
     }
   } catch(e) {

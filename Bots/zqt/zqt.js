@@ -24,6 +24,8 @@ var PDT_TZ   = java.util.TimeZone.getTimeZone("America/Los_Angeles");
 DATE_FMT.setTimeZone(PDT_TZ);
 VIEW_FMT.setTimeZone(PDT_TZ);
 
+var LONG_MSG_SPACER = "​".repeat(500);
+
 function todayStr(){ return DATE_FMT.format(new java.util.Date()); }
 function parseDateStr(s){ try{ return DATE_FMT.parse(s); }catch(e){ return null; } }
 function toDateStr(d){ return DATE_FMT.format(d); }
@@ -105,7 +107,7 @@ function userExists(name){ var db=openDB(); var cur=null; try{ cur=db.rawQuery("
 
 function registerGame(key){
   key = (key||"").toLowerCase();
-  if (!/^[A-Za-z]{1,2}$/.test(key)) return "게임키는 1~2글자 영문만 가능합니다.";
+  if (!/^[A-Za-z]$/.test(key)) return "게임키는 1글자 영문만 가능합니다.";
   var db = openDB(); var cur=null;
   try{
     cur = db.rawQuery("SELECT ord FROM games WHERE key=?", [key]);
@@ -177,7 +179,7 @@ function parseGameLines(lines, allowedUsers, allowedGames){
   var allowGameSet={}; for (var i=0;i<allowedGames.length;i++) allowGameSet[allowedGames[i]] = true;
   for (var i=0;i<lines.length;i++){
     var line = trim(lines[i]); if(!line) continue;
-    var m = line.match(/^([A-Za-z]{1,2})\s+(.+)$/);
+    var m = line.match(/^([A-Za-z])\s+(.+)$/);
     if (!m) return { error: "형식 오류: "+line+"  (예: z 이(그명)쫑)" };
     var g = m[1].toLowerCase(); if (!allowGameSet[g]) return { error: "미등록 게임키: "+g };
     var parsed = parseOrderToGroups(m[2], allowedUsers); if (!parsed || parsed.error) return parsed || {error:"순위 문자열 오류: "+line};
@@ -509,7 +511,7 @@ function handleDetail(argText){
   var result = lines.join("\n");
   if (dates.length === 1) {
     var timeSection = buildTimeSection(dates[0]);
-    if (timeSection) result += "​".repeat(500) + "\n\n" + timeSection;
+    if (timeSection) result += LONG_MSG_SPACER + "\n\n" + timeSection;
   }
   return result;
 }
@@ -567,7 +569,7 @@ function buildTimeSection(dateStr) {
 function handleGameAvg(argText){
   var parts = trim(argText||"").split(/\s+/).filter(Boolean);
   if (parts.length===0) return "형식: !게임순위 [게임키] [전체|오늘|어제|이번주|저번주|이번달|저번달|n월|올해|작년|yyyyMMdd|yyyyMMdd~yyyyMMdd]\n예) !게임순위 q 이번주";
-  var gameKey = parts[0].toLowerCase(); if (!/^[A-Za-z]{1,2}$/.test(gameKey)) return "게임키는 1~2글자 영문이어야 합니다."; if (!gameExists(gameKey)) return "미등록 게임입니다: "+gameKey;
+  var gameKey = parts[0].toLowerCase(); if (!/^[A-Za-z]$/.test(gameKey)) return "게임키는 1글자 영문이어야 합니다."; if (!gameExists(gameKey)) return "미등록 게임입니다: "+gameKey;
   var range; if (parts.length===1){ range=getFullRangeFromDB(); } else { range=getRangeFromArg(parts.slice(1).join(" ")); if (range.error) return range.error; }
   var avgArr = avgRanksForGame(gameKey, range.from, range.to);
   var nPlayers = getAllPlayersInRange(range.from, range.to).length;
@@ -640,7 +642,7 @@ function handlePerfectWins(player){
 
   var out = [];
   out.push(player + "의 완승 횟수 : " + rows.length + "회");
-  out.push("완승날짜" + "\u200B".repeat(500));
+  out.push("완승날짜" + LONG_MSG_SPACER);
   for (var i=0;i<rows.length;i++){
     out.push(toViewStr(rows[i].date) + " " + sortGames(rows[i].games));
   }
@@ -851,7 +853,7 @@ function handleMultiGameRank(gameKeyStr, rangeArg){
     if (i < gameKeys.length - 1) detailLines.push("");
   }
 
-  return title + "\n" + body + "\n======[" + gameKeys.join("") + "] 상세 순위======" + "\u200B".repeat(500) + "\n" + detailLines.join("\n");
+  return title + "\n" + body + "\n======[" + gameKeys.join("") + "] 상세 순위======" + LONG_MSG_SPACER + "\n" + detailLines.join("\n");
 }
 
 function handleUnifiedRank(argText){
@@ -1289,61 +1291,23 @@ function isMyCommand(text) {
   return !!text && trim(text).indexOf("!") === 0;
 }
 
-// ─── 메시지 큐 + 워커 스레드 (ChatManager 구독) ─────────────────────────────
-var msgQueue = new java.util.concurrent.LinkedBlockingQueue();
+// ─── 메시지 큐 + 워커 스레드 (ChatManager 구독, 공용 subscriber 모듈 사용) ───
 var WORKER_NAME = "ZQT_BOT_WORKER";
 
-(function killOldThreads() {
+var subscribe = (function() {
+  var libPath = "/sdcard/msgbot/Bots/lib/subscriber.js";
   try {
-    var root = java.lang.Thread.currentThread().getThreadGroup();
-    while (root.getParent() != null) root = root.getParent();
-    var n = root.activeCount() + 32;
-    var arr = java.lang.reflect.Array.newInstance(java.lang.Thread, n);
-    var got = root.enumerate(arr, true);
-    for (var i = 0; i < got; i++) {
-      var t = arr[i];
-      if (!t) continue;
-      if (String(t.getName() || "") === WORKER_NAME) {
-        try { t.interrupt(); } catch(_) {}
-      }
+    if (typeof bot.getRootPath === "function") {
+      libPath = bot.getRootPath() + "/../lib/subscriber.js";
     }
   } catch(_) {}
+  return require(libPath);
 })();
 
-(function registerWithChatManager() {
-  try {
-    var sysProps = java.lang.System.getProperties();
-    var REG_KEY = "__CHATMANAGER_REGISTRY__";
-    var registry = sysProps.get(REG_KEY);
-    if (registry == null) {
-      registry = new java.util.concurrent.ConcurrentHashMap();
-      sysProps.put(REG_KEY, registry);
-    }
-    registry.put(BOT_NAME, msgQueue);
-  } catch(_) {}
-})();
-
-new java.lang.Thread(function() {
-  while (!java.lang.Thread.currentThread().isInterrupted()) {
-    var task = null;
-    try { task = msgQueue.take(); } catch(_) { return; }
-    try {
-      if (!(task instanceof java.util.HashMap)) continue;
-      var text = String(task.get("text") || "");
-      if (!isMyCommand(text)) continue;
-      var room = String(task.get("room") || "");
-      var name = String(task.get("name") || "익명");
-      var hash = String(task.get("hash") || "");
-      var msg = {
-        content: text,
-        room: room,
-        author: { name: name, hash: hash },
-        reply: (function(r){ return function(s){ try { bot.send(r, s); } catch(_) {} }; })(room)
-      };
-      handleMessage(msg);
-    } catch(_) {}
-  }
-}, WORKER_NAME).start();
+subscribe(BOT_NAME, WORKER_NAME, function(msg) {
+  if (!isMyCommand(msg.content)) return;
+  handleMessage(msg);
+});
 
 
 function onMessage(rawMsg) {}  // 메시지는 ChatManager 큐로 들어옴

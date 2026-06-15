@@ -25,11 +25,12 @@ const BOT_NAME = "제미니봇";
 // ── 설정 ─────────────────────────────────────────────────────────────
 const DEFAULT_MODEL = "gemini-3.1-flash-lite";
 
+// 긴 답변 미리보기 채움용 제로폭 공백(U+200B) 스페이서.
+var LONG_MSG_SPACER = "​".repeat(500);
+
 // 코드 내장(전역) 키 — 모든 방 공용 폴백. 전용 키로 바꾸거나 비워도 됨([] 로 두면 등록된 방에서만 작동).
 // (상식퀴즈봇과 같은 물리 키를 쓰면 동일 Google 쿼터를 공유하니 주의)
-var BUILTIN_KEYS = [
-  { key: "your-key", model: DEFAULT_MODEL }
-];
+var BUILTIN_KEYS = [];
 
 // 상식퀴즈봇과 공유하는 키 저장소(quiz.db). 읽기 전용으로만 연다.
 const QUIZ_DB_PATH = Packages.android.os.Environment
@@ -125,9 +126,12 @@ function eligibleKeysForRoom(room) {
   try {
     db = Packages.android.database.sqlite.SQLiteDatabase.openDatabase(
       QUIZ_DB_PATH, null, Packages.android.database.sqlite.SQLiteDatabase.OPEN_READONLY);
+    // quiz_apikey 의 첫번째(가장 먼저 등록된, MIN(created)) 키는 전역으로 모든 방에서 사용.
+    // 그 외엔 이 방 등록분 또는 room 빈값(전역)만. 상식퀴즈봇 eligibleProviderIndexes(i===0) 와 동일 정책.
     cur = db.rawQuery(
       "SELECT key, model FROM quiz_apikey " +
       "WHERE added_by_room = ? OR added_by_room IS NULL OR added_by_room = '' " +
+      "OR created = (SELECT MIN(created) FROM quiz_apikey) " +
       "ORDER BY created ASC",
       [String(room)]);
     while (cur.moveToNext()) {
@@ -267,7 +271,7 @@ function handleMessage(msg) {
       if (res && typeof res.text === "string" && res.text.trim()) {
         if (!isProvider) { try { recordUse(hash); } catch(_) {} }   // 성공 응답만 한도에 반영
         // 요청 형식: "답변입니다." 500회 반복(미리보기 채움) 뒤 줄바꿈 후 실제 답변.
-        try { bot.send(room, "답변입니다."+ "​".repeat(500) + "\n" + res.text.trim()); } catch(_) {}
+        try { bot.send(room, "답변입니다."+ LONG_MSG_SPACER + "\n" + res.text.trim()); } catch(_) {}
       } else if (res && res.quotaExhausted) {
         try { bot.send(room, "⚠ 사용 가능한 API 사용량이 모두 소진되었습니다. 잠시 후 다시 시도해주세요.\n" +
           "(상식퀴즈봇과 1:1 채팅에서 !api 로 이 방에 키를 등록하면 사용량이 늘어납니다.)"); } catch(_) {}
@@ -280,66 +284,28 @@ function handleMessage(msg) {
   }
 }
 
-// ── 메시지 큐 + 워커 스레드 ──────────────────────────────────────────
+// ── 메시지 큐 + 워커 스레드 (공유 subscriber 모듈로 위임) ──────────────
 // 큐에는 ChatManager broadcast 메시지(java.util.HashMap)만 들어온다.
-var msgQueue = new java.util.concurrent.LinkedBlockingQueue();
+// subscriber.js 가 큐 생성/옛 워커 정리/레지스트리 등록/instanceof 가드/필드 추출/워커 루프를 담당한다.
 var WORKER_NAME = "GEMINI_BOT_WORKER";
 
-// 재컴파일 시 옛 워커 스레드 정리 (이름으로 식별 → interrupt).
-(function killOldThreads() {
+var subscribe = (function() {
+  var libPath = "/sdcard/msgbot/Bots/lib/subscriber.js";
   try {
-    var root = java.lang.Thread.currentThread().getThreadGroup();
-    while (root.getParent() != null) root = root.getParent();
-    var n = root.activeCount() + 32;
-    var arr = java.lang.reflect.Array.newInstance(java.lang.Thread, n);
-    var got = root.enumerate(arr, true);
-    for (var i = 0; i < got; i++) {
-      var t = arr[i];
-      if (!t) continue;
-      if (String(t.getName() || "") === WORKER_NAME) {
-        try { t.interrupt(); } catch(_) {}
-      }
+    if (typeof bot.getRootPath === "function") {
+      libPath = bot.getRootPath() + "/../lib/subscriber.js";
     }
   } catch(_) {}
+  return require(libPath);
 })();
 
-// ── ChatManager 레지스트리에 자신을 등록 ───────────────────────────
-// 재컴파일 시 같은 이름으로 put → 옛 큐가 새 큐로 교체됨 (멱등).
-(function registerWithChatManager() {
+subscribe(BOT_NAME, WORKER_NAME, function(msg) {
   try {
-    var sysProps = java.lang.System.getProperties();
-    var REG_KEY = "__CHATMANAGER_REGISTRY__";
-    var registry = sysProps.get(REG_KEY);
-    if (registry == null) {
-      registry = new java.util.concurrent.ConcurrentHashMap();
-      sysProps.put(REG_KEY, registry);
-    }
-    registry.put(BOT_NAME, msgQueue);
+    var text = String(msg.content || "").trim();
+    if (!isGeminiCommand(text)) return;   // 우리 명령이 아니면 무시 (모든 메시지가 broadcast 됨)
+    handleMessage(msg);
   } catch(_) {}
-})();
-
-new java.lang.Thread(function() {
-  while (!java.lang.Thread.currentThread().isInterrupted()) {
-    var task = null;
-    try { task = msgQueue.take(); } catch(_) { return; } // interrupt → exit
-    try {
-      if (task instanceof java.util.HashMap) {
-        var text = String(task.get("text") || "").trim();
-        if (!isGeminiCommand(text)) continue;   // 우리 명령이 아니면 무시 (모든 메시지가 broadcast 됨)
-        var room = String(task.get("room") || "");
-        var name = String(task.get("name") || "익명");
-        var hash = String(task.get("hash") || "");
-        var msg = {
-          content: text,
-          room: room,
-          author: { name: name, hash: hash },
-          reply: (function(r) { return function(s) { try { bot.send(r, s); } catch(_) {} }; })(room)
-        };
-        handleMessage(msg);
-      }
-    } catch(_) {}
-  }
-}, WORKER_NAME).start();
+});
 
 // ── 보일러플레이트 ───────────────────────────────────────────────────
 // 메시지는 ChatManager 큐로 들어오므로 onMessage 는 no-op.

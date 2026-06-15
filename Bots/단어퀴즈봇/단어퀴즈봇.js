@@ -57,15 +57,50 @@ const JONG_EXPAND = {
     'ㄲ': ['ㄱ','ㄱ'],  'ㅆ': ['ㅅ','ㅅ']  // 쌍자음 종성
 };
 
-// ─── 게임 상태 ──────────────────────────────────────────────────────────────
-var quizState = {
-    active: false,
-    answer: '',
-    answerJamo: [],
-    quizRoom: '',      // !정답을 받을 방 (그룹채팅)
-    attemptsLeft: 5,
-    history: []        // [{jamo: string, emoji: string}, ...]
-};
+// ─── 게임 상태 (방별 동시 진행 지원) ─────────────────────────────────────────
+// 그룹방의 channelId 를 키로 방마다 독립된 퀴즈 상태를 보관한다.
+function freshQuizState() {
+    return {
+        active: false,
+        answer: null,
+        answerJamo: null,
+        room: null,          // !정답을 받을 그룹방 NAME (bot.send 대상)
+        attemptsLeft: 0,
+        history: [],         // [{word, jamo, emoji}, ...]
+        awaitingWord: false, // !퀴즈 입력 후 !출제 대기중
+        setterName: null,    // !퀴즈 를 입력한 사람의 닉네임
+        openedAt: 0          // !퀴즈 입력 순서(최근일수록 큼)
+    };
+}
+var games = {};              // channelId(group) -> quiz state
+var _gameOpenSeq = 0;        // openedAt 단조 증가 카운터
+
+// userhash.db 경로 (msgbot 폴더에 위치)
+var USERHASH_DB_PATH = Packages.android.os.Environment
+    .getExternalStorageDirectory().getAbsolutePath() + "/msgbot/userhash.db";
+
+// 닉네임이 등장한 방(room) 목록을 userhash.db 에서 조회 (읽기전용, 실패 시 [])
+// schema: userhash(hash TEXT PRIMARY KEY, name, room, first_seen, last_seen)
+function roomsForNickname(name) {
+    var db = null; var cur = null; var out = [];
+    try {
+        db = Packages.android.database.sqlite.SQLiteDatabase.openDatabase(
+            USERHASH_DB_PATH, null,
+            Packages.android.database.sqlite.SQLiteDatabase.OPEN_READONLY
+        );
+        cur = db.rawQuery("SELECT DISTINCT room FROM userhash WHERE name = ?", [name]);
+        while (cur.moveToNext()) {
+            var r = cur.getString(0);
+            if (r != null) out.push(String(r));
+        }
+    } catch(e) {
+        return [];
+    } finally {
+        try { if (cur) cur.close(); } catch(_) {}
+        try { if (db) db.close(); } catch(_) {}
+    }
+    return out;
+}
 
 // ─── DB 함수 ────────────────────────────────────────────────────────────────
 function openDictDB() {
@@ -357,13 +392,11 @@ function buildEndReply(history) {
     return lines.join('\n');
 }
 
-// ─── 게임 초기화 (quizRoom 유지) ────────────────────────────────────────────
-function resetGame() {
-    quizState.active       = false;
-    quizState.answer       = '';
-    quizState.answerJamo   = [];
-    quizState.attemptsLeft = 5;
-    quizState.history      = [];
+// ─── 게임 초기화 (방별) ─────────────────────────────────────────────────────
+// 해당 방의 게임 엔트리를 완전히 제거한다(다음 !퀴즈 때 새로 생성).
+function resetGame(chanId) {
+    if (chanId == null) return;
+    delete games[String(chanId)];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -462,8 +495,10 @@ function _kt_suRun(cmd) {
   finally { try { if (proc) proc.destroy(); } catch(_) {} }
 }
 function _kt_runSqlite(dbPath, sql) {
-  var sqlOneLine = String(sql).replace(/\r?\n/g, ' ').replace(/"/g, '\\"');
-  var cmd = "sqlite3 -batch -line '" + dbPath + "' \"" + sqlOneLine + "\"";
+  // SQL 을 한 줄로 만든 뒤 작은따옴표로 감싼다. 셸 작은따옴표 안에서는
+  // $ ` \ 가 모두 리터럴이므로 무력화된다. 내부의 ' 만 '\'' 기법으로 탈출.
+  var sqlOneLine = String(sql).replace(/\r?\n/g, ' ').replace(/'/g, "'\\''");
+  var cmd = "sqlite3 -batch -line '" + dbPath + "' '" + sqlOneLine + "'";
   var out = String(_kt_suRun(cmd) || "");
   if (out.indexOf("Error:") !== -1 || out.indexOf("rror near") !== -1) return null;
   var rowsObj = [], cur = null, lastKey = null;
@@ -500,10 +535,15 @@ function _kt_initNames() {
 function _kt_getUserNames(uids) {
   var res = {};
   if (!uids.length) return res;
-  if (_kt_friendsTable) {
+  // SQL IN(...) 에는 순수 숫자 uid 만 사용 (비숫자는 제거 → SQL 인젝션 방지)
+  var safeUids = [];
+  for (var gi = 0; gi < uids.length; gi++) {
+    if (/^\d+$/.test(String(uids[gi]))) safeUids.push(String(uids[gi]));
+  }
+  if (_kt_friendsTable && safeUids.length) {
     try {
       var sql = "SELECT " + _kt_friendsId + " AS uid, " + _kt_friendsName + " AS nm, enc FROM " +
-                _kt_friendsTable + " WHERE " + _kt_friendsId + " IN (" + uids.join(",") + ");";
+                _kt_friendsTable + " WHERE " + _kt_friendsId + " IN (" + safeUids.join(",") + ");";
       var rows = _kt_runSqlite(KT_DB2_PATH, sql);
       if (rows) {
         for (var i = 0; i < rows.length; i++) {
@@ -637,19 +677,40 @@ function handleMessage(msg) {
     try {
         var text = msg.content.trim();
         var room = msg.room;
+        // 그룹방 채널 키(숫자만). DM/그룹 어디서 들어와도 그 방 고유 키.
+        var chanId = String(msg.channelId != null ? msg.channelId : "").replace(/[^0-9]/g, "");
+        // 이 방의 게임 상태(없을 수 있음). 추리/정답 경로는 quizState 별칭으로 접근.
+        var st = chanId ? games[chanId] : null;
+        var quizState = st;   // 기존 quizState.* 접근을 방별 객체로 별칭 (undefined 가드 필요)
 
         // ── !오늘단어 : 오늘의 단어 맞히기 집계 (DB 직접 조회) ──
         if (text === '!오늘단어') { handleTodayWord(msg); return; }
 
         // ── !퀴즈 ────────────────────────────────────────────────────────────
         if (text === '!퀴즈' || text === '!단어퀴즈') {
-            if (quizState.active) {
+            if (!chanId) { msg.reply("방 정보를 확인할 수 없습니다."); return; }
+            var g = games[chanId] || freshQuizState();
+            games[chanId] = g;
+            if (g.active) {
                 msg.reply("단어퀴즈가 이미 진행 중입니다.\n!퀴즈종료 로 현재 게임을 종료할 수 있습니다.");
                 return;
             }
-            quizState.quizRoom = room;
+            g.awaitingWord = true;
+            g.room         = room;                 // 그룹방 NAME (bot.send 대상)
+            g.setterName   = msg.author ? msg.author.name : null;
+            g.openedAt     = ++_gameOpenSeq;
+            // 30초 내 !출제(또는 !랜덤)로 단어가 설정되지 않으면 대기 상태를 조용히 해제.
+            // (다른 사람이 다시 출제할 수 있도록. openedAt 토큰으로 그 사이 새로 연 퀴즈는 건드리지 않음.)
+            (function(cid, tok) {
+                setTimeout(function() {
+                    var gg = games[cid];
+                    if (gg && gg.awaitingWord && !gg.active && gg.openedAt === tok) {
+                        delete games[cid];
+                    }
+                }, 30000);
+            })(chanId, g.openedAt);
             msg.reply(
-                "개인톡으로 \"!출제 [단어]\" 를 입력하세요.\n" +
+                "개인톡으로 \"!출제 [단어]\" 를 입력하세요. (30초 내 미출제 시 자동 해제)\n" +
                 "※ 랜덤 출제는 이 방에서 !랜덤 을 입력하세요."
             );
             return;
@@ -657,35 +718,65 @@ function handleMessage(msg) {
 
         // ── !퀴즈종료 ────────────────────────────────────────────────────────
         if (text === '!퀴즈종료') {
-            if (!quizState.active) {
+            if (!st || !st.active) {
                 msg.reply("진행 중인 퀴즈가 없습니다.");
                 return;
             }
-            var ans = quizState.answer;
-            resetGame();
+            var ans = st.answer;
+            resetGame(chanId);
             msg.reply("퀴즈를 종료합니다.\n정답 : \"" + ans + "\"");
             return;
         }
 
         // ── !출제 [단어] ─────────────────────────────────────────────────────
-        // 개인톡에서 입력하여 단어를 비공개로 출제
+        // 개인톡(DM)에서 입력하여 단어를 비공개로 출제.
+        // DM 방의 channelId 는 그룹방과 다르고, 사람도 방마다 user_id(hash)가 다르므로
+        // 닉네임(msg.author.name)으로 대기중인 그룹방을 찾아 라우팅한다.
         if (text.indexOf('!출제 ') === 0 || text.indexOf('!퀴즈출제 ') === 0 || text.indexOf('!단어출제 ') === 0) {
-            if (!quizState.quizRoom) {
-                msg.reply("먼저 퀴즈를 진행할 방에서 !퀴즈 를 입력해주세요.");
-                return;
+            var setterN = msg.author ? msg.author.name : null;
+
+            // 1. !퀴즈 로 출제 대기중인 방 수집
+            var waiting = [];
+            for (var wk in games) {
+                if (games[wk] && games[wk].awaitingWord === true) waiting.push(wk);
             }
-            // 퀴즈방(그룹)에서 !출제를 치면 명령어에 정답이 그대로 노출됨 → 거부.
-            // 반드시 개인톡(DM)에서 출제해야 함.
-            if (room === quizState.quizRoom) {
-                msg.reply("⚠️ 그룹방에서는 출제할 수 없습니다 (정답이 노출됩니다).\n개인톡(DM)으로 \"!출제 [단어]\" 를 입력하세요.");
-                return;
-            }
-            if (quizState.active) {
-                msg.reply("이미 퀴즈가 진행 중입니다.");
+            // 2. 대기방 없음
+            if (!waiting.length) {
+                msg.reply("단어퀴즈 출제 대기중인 방이 없습니다.");
                 return;
             }
 
-            var word = text.split(' ')[1]?.trim();
+            // 3. 후보 선정 (닉네임 기반)
+            //   (a) 이 닉네임이 직접 !퀴즈 를 연 방
+            var cand = [];
+            for (var ci = 0; ci < waiting.length; ci++) {
+                if (setterN != null && games[waiting[ci]].setterName === setterN) cand.push(waiting[ci]);
+            }
+            //   (b) (a)가 비면: userhash.db 에서 이 닉네임이 등장한 방 집합으로 멤버십 폴백
+            if (!cand.length && setterN != null) {
+                var rooms = roomsForNickname(setterN);
+                if (rooms.length) {
+                    var roomSet = {};
+                    for (var ri = 0; ri < rooms.length; ri++) roomSet[rooms[ri]] = true;
+                    for (var ci2 = 0; ci2 < waiting.length; ci2++) {
+                        if (roomSet[games[waiting[ci2]].room]) cand.push(waiting[ci2]);
+                    }
+                }
+            }
+            // 4. 후보 없음
+            if (!cand.length) {
+                msg.reply("닉네임으로 현재 계신 방을 확인할 수 없습니다.");
+                return;
+            }
+            // 5. 여러 개면 가장 최근에 연 방(openedAt 최대) 선택
+            var chosen = cand[0];
+            for (var pi = 1; pi < cand.length; pi++) {
+                if (games[cand[pi]].openedAt > games[chosen].openedAt) chosen = cand[pi];
+            }
+            var target = games[chosen];
+
+            // 6. 출제 단어 검증 후 선택된 방의 상태에 세팅
+            var parts = text.split(' '); var word = parts[1] ? parts[1].trim() : "";
             if (!word) { msg.reply("사용법: !출제 [단어]"); return; }
 
             var jamos = decomposeToBaseJamo(word);
@@ -705,13 +796,15 @@ function handleMessage(msg) {
                 return;
             }
 
-            quizState.active       = true;
-            quizState.answer       = word;
-            quizState.answerJamo   = jamos;
-            quizState.attemptsLeft = 5;
-            msg.reply("✅ 문제출제 완료!");
+            target.active       = true;
+            target.answer       = word;
+            target.answerJamo   = jamos;
+            target.attemptsLeft = 5;
+            target.history      = [];
+            target.awaitingWord = false;
+            msg.reply("✅ 문제출제 완료! (" + target.room + ")");
 
-            bot.send(quizState.quizRoom,
+            bot.send(target.room,
                 "문제출제 완료. 추리를 시작하세요.\n" +
                 "!정답 [단어] 로 도전! (총 5회 기회)\n" +
                 "✅정위치  ⚠️포함  ❌없음"
@@ -719,17 +812,13 @@ function handleMessage(msg) {
             return;
         }
 
-        // ── !랜덤 (!퀴즈 실행 후에만 가능) ───────────────────────────────────
+        // ── !랜덤 (이 방에서 !퀴즈 실행 후에만 가능) ─────────────────────────
         if (text === '!랜덤' || text === '!랜덤출제' || text === '!랜덤퀴즈') {
-            if (!quizState.quizRoom) {
+            if (!st || (!st.awaitingWord && !st.active)) {
                 msg.reply("먼저 퀴즈를 진행할 방에서 !퀴즈 를 입력해주세요.");
                 return;
             }
-            if (room !== quizState.quizRoom) {
-                msg.reply("다른 방에서 퀴즈가 진행 중입니다.");
-                return;
-            }
-            if (quizState.active) {
+            if (st.active) {
                 msg.reply("이미 퀴즈가 진행 중입니다.\n!퀴즈종료 로 종료 후 다시 시도하세요.");
                 return;
             }
@@ -740,12 +829,15 @@ function handleMessage(msg) {
                 return;
             }
 
-            quizState.active       = true;
-            quizState.answer       = result.word;
-            quizState.answerJamo   = result.jamo;
-            quizState.attemptsLeft = 5;
+            st.active       = true;
+            st.answer       = result.word;
+            st.answerJamo   = result.jamo;
+            st.attemptsLeft = 5;
+            st.history      = [];
+            st.awaitingWord = false;
+            st.room         = room;
 
-            bot.send(quizState.quizRoom,
+            bot.send(st.room,
                 "랜덤출제 완료. 추리를 시작하세요.\n" +
                 "!정답 [단어] 로 도전! (총 5회 기회)\n" +
                 "✅정위치  ⚠️포함  ❌없음"
@@ -767,19 +859,17 @@ function handleMessage(msg) {
         }
 
         // ── !정답 [단어] / !단어 [단어] ──────────────────────────────────────
-        if ((text === '!정답' || text === '!단어') && quizState.active) {
+        if ((text === '!정답' || text === '!단어') && quizState && quizState.active) {
             msg.reply(buildGuessReply(quizState.history, quizState.attemptsLeft));
             return;
         }
 
         if (text.indexOf('!정답 ') === 0 || text.indexOf('!단어 ') === 0) {
-            if (!quizState.active) {
-                if (room === quizState.quizRoom)
-                    msg.reply("진행 중인 퀴즈가 없습니다.");
+            // 이 방(chanId)에 활성 퀴즈가 없으면: 이 방이 출제 대기방이면 안내, 아니면 무시
+            if (!quizState || !quizState.active) {
+                if (st) msg.reply("진행 중인 퀴즈가 없습니다.");
                 return;
             }
-            // 퀴즈방에서만 답 허용
-            if (room !== quizState.quizRoom) return;
 
             var prefixLen = (text.indexOf('!정답 ') === 0) ? '!정답 '.length : '!단어 '.length;
             var guess = text.slice(prefixLen).trim();
@@ -812,7 +902,7 @@ function handleMessage(msg) {
             if (isCorrect) {
                 var ans     = quizState.answer;
                 var endMsg  = buildEndReply(quizState.history);
-                resetGame();
+                resetGame(chanId);
                 msg.reply(endMsg + "\n\n🎉 \"" + ans + "\" 정답입니다!");
                 return;
             }
@@ -820,7 +910,7 @@ function handleMessage(msg) {
             if (quizState.attemptsLeft <= 0) {
                 var ans     = quizState.answer;
                 var endMsg  = buildEndReply(quizState.history);
-                resetGame();
+                resetGame(chanId);
                 msg.reply(endMsg + "\n\n기회를 모두 사용했습니다.\n정답 : \"" + ans + "\"");
                 return;
             }
@@ -834,63 +924,23 @@ function handleMessage(msg) {
     }
 }
 
-// ─── 메시지 큐 + 워커 스레드 (ChatManager 구독) ─────────────────────────────
-var msgQueue = new java.util.concurrent.LinkedBlockingQueue();
+// ─── 메시지 큐 + 워커 스레드 (ChatManager 구독, 공유 모듈) ───────────────────
 var WORKER_NAME = "WORD_QUIZ_BOT_WORKER";
 
-(function killOldThreads() {
+var subscribe = (function() {
+  var libPath = "/sdcard/msgbot/Bots/lib/subscriber.js";
   try {
-    var root = java.lang.Thread.currentThread().getThreadGroup();
-    while (root.getParent() != null) root = root.getParent();
-    var n = root.activeCount() + 32;
-    var arr = java.lang.reflect.Array.newInstance(java.lang.Thread, n);
-    var got = root.enumerate(arr, true);
-    for (var i = 0; i < got; i++) {
-      var t = arr[i];
-      if (!t) continue;
-      if (String(t.getName() || "") === WORKER_NAME) {
-        try { t.interrupt(); } catch(_) {}
-      }
+    if (typeof bot.getRootPath === "function") {
+      libPath = bot.getRootPath() + "/../lib/subscriber.js";
     }
   } catch(_) {}
+  return require(libPath);
 })();
 
-(function registerWithChatManager() {
-  try {
-    var sysProps = java.lang.System.getProperties();
-    var REG_KEY = "__CHATMANAGER_REGISTRY__";
-    var registry = sysProps.get(REG_KEY);
-    if (registry == null) {
-      registry = new java.util.concurrent.ConcurrentHashMap();
-      sysProps.put(REG_KEY, registry);
-    }
-    registry.put(BOT_NAME, msgQueue);
-  } catch(_) {}
-})();
-
-new java.lang.Thread(function() {
-  while (!java.lang.Thread.currentThread().isInterrupted()) {
-    var task = null;
-    try { task = msgQueue.take(); } catch(_) { return; }
-    try {
-      if (!(task instanceof java.util.HashMap)) continue;
-      var text = String(task.get("text") || "");
-      if (!isMyCommand(text.trim())) continue;
-      var room = String(task.get("room") || "");
-      var name = String(task.get("name") || "익명");
-      var hash = String(task.get("hash") || "");
-      var channelId = String(task.get("channelId") || "");
-      var msg = {
-        content: text,
-        room: room,
-        channelId: channelId,
-        author: { name: name, hash: hash },
-        reply: (function(r){ return function(s){ try { bot.send(r, s); } catch(_) {} }; })(room)
-      };
-      handleMessage(msg);
-    } catch(_) {}
-  }
-}, WORKER_NAME).start();
+subscribe(BOT_NAME, WORKER_NAME, function(msg) {
+  if (!isMyCommand(String(msg.content || "").trim())) return;
+  handleMessage(msg);
+});
 
 // ─── 보일러플레이트 ─────────────────────────────────────────────────────────
 function onMessage(rawMsg) {}  // 메시지는 ChatManager 큐로 들어옴

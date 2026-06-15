@@ -1,5 +1,15 @@
 var bot = BotManager.getCurrentBot();
 
+var subscribe = (function() {
+  var libPath = "/sdcard/msgbot/Bots/lib/subscriber.js";
+  try {
+    if (typeof bot.getRootPath === "function") {
+      libPath = bot.getRootPath() + "/../lib/subscriber.js";
+    }
+  } catch(_) {}
+  return require(libPath);
+})();
+
 // =====================================================================
 // userhash table — hash → name/room 매핑 저장
 //
@@ -118,53 +128,12 @@ initDB();
 
 
 // ─── 메시지 큐 + 워커 스레드 (ChatManager 구독) ─────────────────────────────
-var msgQueue = new java.util.concurrent.LinkedBlockingQueue();
 var WORKER_NAME = "USERHASH_TABLE_WORKER";
 
-(function killOldThreads() {
-  try {
-    var root = java.lang.Thread.currentThread().getThreadGroup();
-    while (root.getParent() != null) root = root.getParent();
-    var n = root.activeCount() + 32;
-    var arr = java.lang.reflect.Array.newInstance(java.lang.Thread, n);
-    var got = root.enumerate(arr, true);
-    for (var i = 0; i < got; i++) {
-      var t = arr[i];
-      if (!t) continue;
-      if (String(t.getName() || "") === WORKER_NAME) {
-        try { t.interrupt(); } catch(_) {}
-      }
-    }
-  } catch(_) {}
-})();
-
-(function registerWithChatManager() {
-  try {
-    var sysProps = java.lang.System.getProperties();
-    var REG_KEY = "__CHATMANAGER_REGISTRY__";
-    var registry = sysProps.get(REG_KEY);
-    if (registry == null) {
-      registry = new java.util.concurrent.ConcurrentHashMap();
-      sysProps.put(REG_KEY, registry);
-    }
-    registry.put(BOT_NAME, msgQueue);
-  } catch(_) {}
-})();
-
-new java.lang.Thread(function() {
-  while (!java.lang.Thread.currentThread().isInterrupted()) {
-    var task = null;
-    try { task = msgQueue.take(); } catch(_) { return; }
-    try {
-      if (!(task instanceof java.util.HashMap)) continue;
-      var hash = String(task.get("hash") || "");
-      if (!hash) continue;
-      var room = String(task.get("room") || "");
-      var name = String(task.get("name") || "");
-      saveUserHash(hash, room, name);
-    } catch(_) {}
-  }
-}, WORKER_NAME).start();
+subscribe(BOT_NAME, WORKER_NAME, function(msg) {
+  if (!msg.hash) return;
+  saveUserHash(msg.hash, msg.room, msg.name);
+});
 
 
 // ─── 보일러플레이트 ─────────────────────────────────────────────────────────

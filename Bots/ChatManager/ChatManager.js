@@ -220,7 +220,7 @@ function _shell(command, useSu) {
 // ── sqlite3 헬퍼 (su 컨텍스트에서 실행) ────────────────────────────
 function _sql(dbPath, sql, quiet) {
   var sqlOneLine = String(sql).replace(/\r?\n/g, ' ').replace(/"/g, '\\"');
-  var cmd = "sqlite3 -batch -line '" + dbPath + "' \"" + sqlOneLine + "\"";
+  var cmd = "sqlite3 -readonly -batch -line '" + dbPath + "' \"" + sqlOneLine + "\"";
   var out = String(_shell(cmd, true) || "");
 
   if (out.indexOf("Error:") !== -1 || out.indexOf("rror near") !== -1 ||
@@ -264,7 +264,7 @@ function _sql(dbPath, sql, quiet) {
 // (해체 명령처럼 어떤 컬럼이 어떤 값인지 알아야 할 때 사용)
 function _sqlObj(dbPath, sql) {
   var sqlOneLine = String(sql).replace(/\r?\n/g, ' ').replace(/"/g, '\\"');
-  var cmd = "sqlite3 -batch -line '" + dbPath + "' \"" + sqlOneLine + "\"";
+  var cmd = "sqlite3 -readonly -batch -line '" + dbPath + "' \"" + sqlOneLine + "\"";
   var out = String(_shell(cmd, true) || "");
   if (out.indexOf("Error:") !== -1 || out.indexOf("rror near") !== -1 ||
       out.indexOf("extra argument") !== -1) {
@@ -406,19 +406,23 @@ var _registry = (function() {
 })();
 
 function broadcast(name, hash, channelId, room, text) {
+  var base = new java.util.HashMap();
+  base.put("name", String(name));
+  base.put("hash", String(hash));
+  base.put("channelId", String(channelId));
+  base.put("room", String(room));
+  base.put("text", String(text));
+  base.put("ts", java.lang.Long.valueOf(Date.now()));
+  // 한 번만 만들어 모든 구독자 큐가 공유(읽기 전용 계약). unmodifiableMap 으로 감싸면
+  // 구독자들의 `task instanceof java.util.HashMap` 가드를 통과 못해 전 메시지가 버려지므로
+  // 반드시 평범한 HashMap 그대로 공유한다.
+  var m = base;
   var it = _registry.entrySet().iterator();
   while (it.hasNext()) {
     var e = it.next();
     var q = e.getValue();
     if (!q) continue;
     try {
-      var m = new java.util.HashMap();
-      m.put("name", String(name));
-      m.put("hash", String(hash));
-      m.put("channelId", String(channelId));
-      m.put("room", String(room));
-      m.put("text", String(text));
-      m.put("ts", java.lang.Long.valueOf(Date.now()));
       q.put(m);
     } catch(_) {}
   }
@@ -582,7 +586,7 @@ function _botListText(action) {
   var lines = ["[" + label + "] 어떤 봇에 적용할까요?"];
   for (var i = 0; i < names.length; i++) lines.push((i + 1) + ". " + names[i]);
   lines.push("");
-  lines.push("번호를 입력하세요. (취소: !취소)");
+  lines.push("번호를 입력하세요. 여러 개는 공백/쉼표로 구분 (예: 1 3 5), 전체는 '전체'. (취소: !취소)");
   return { text: lines.join("\n"), names: names };
 }
 
@@ -621,6 +625,28 @@ function _statusText() {
   return lines.join("\n");
 }
 
+// 선택 입력 파싱: "전체"/"all"/"모두" → 전체, "1 3 5" 또는 "1,3,5" → 0-기반 인덱스 목록(중복 제거).
+// 선택 형태가 아니면 null 반환(→ 일반 메시지로 흘려보냄). { indices, invalid } 반환.
+function _parseSelection(text, count) {
+  var t = String(text).trim();
+  if (/^(전체|all|모두)$/i.test(t)) {
+    var allIdx = [];
+    for (var a = 0; a < count; a++) allIdx.push(a);
+    return { indices: allIdx, invalid: [] };
+  }
+  if (!/^\d+([\s,]+\d+)*$/.test(t)) return null;   // 숫자(공백/쉼표 구분) 형태가 아님
+  var toks = t.split(/[\s,]+/);
+  var seen = {}, indices = [], invalid = [];
+  for (var i = 0; i < toks.length; i++) {
+    if (toks[i] === "") continue;
+    var num = parseInt(toks[i], 10);
+    if (isNaN(num) || num < 1 || num > count) { invalid.push(toks[i]); continue; }
+    var idx = num - 1;
+    if (!seen[idx]) { seen[idx] = true; indices.push(idx); }
+  }
+  return { indices: indices, invalid: invalid };
+}
+
 // 명령을 처리했으면 true 반환 (이후 룸 학습 로직 건너뜀)
 function handleBotControlCommand(rawMsg) {
   var text, room, key;
@@ -649,40 +675,64 @@ function handleBotControlCommand(rawMsg) {
     return false;
   }
 
-  // 명령 시작: 봇 목록 제시
-  if (text === "!onoff") {
-    var r1 = _botListText("onoff");
-    if (!r1.names.length) { try { rawMsg.reply("제어할 봇이 없습니다."); } catch(_) {} return true; }
-    _botCtlPending[key] = { action: "onoff", names: r1.names, ts: Date.now() };
-    try { rawMsg.reply(r1.text); } catch(_) {}
-    return true;
-  }
-  if (text === "!compile" || text === "!complile" || text === "!컴파일") {
-    var r2 = _botListText("compile");
-    if (!r2.names.length) { try { rawMsg.reply("제어할 봇이 없습니다."); } catch(_) {} return true; }
-    _botCtlPending[key] = { action: "compile", names: r2.names, ts: Date.now() };
-    try { rawMsg.reply(r2.text); } catch(_) {}
+  // 명령 시작 / 인라인 선택: !onoff [선택] / !compile [선택]
+  //   인자 없으면 → 봇 목록 제시(2단계). 인자 있으면(예: "전체" 또는 "1 3 5") → 즉시 적용.
+  var startAction = null;
+  if (text === "!onoff" || text.indexOf("!onoff ") === 0) startAction = "onoff";
+  else if (text === "!compile" || text === "!complile" || text === "!컴파일" ||
+           text.indexOf("!compile ") === 0 || text.indexOf("!complile ") === 0 || text.indexOf("!컴파일 ") === 0) startAction = "compile";
+  if (startAction) {
+    var rL = _botListText(startAction);
+    if (!rL.names.length) { try { rawMsg.reply("제어할 봇이 없습니다."); } catch(_) {} return true; }
+    var spc = text.indexOf(" ");
+    var inlineArg = (spc !== -1) ? text.substring(spc + 1).trim() : "";
+    if (inlineArg) {
+      var selI = _parseSelection(inlineArg, rL.names.length);
+      if (selI && selI.invalid.length) {
+        try { rawMsg.reply("잘못된 번호: " + selI.invalid.join(", ") + " (1 ~ " + rL.names.length + ")"); } catch(_) {}
+        return true;
+      }
+      if (selI && selI.indices.length) {
+        var linesI = [];
+        for (var si = 0; si < selI.indices.length; si++) {
+          var tgtI = rL.names[selI.indices[si]];
+          linesI.push((startAction === "onoff") ? _applyOnOff(tgtI) : _applyCompile(tgtI));
+        }
+        try { rawMsg.reply(linesI.join("\n")); } catch(_) {}
+        return true;
+      }
+      // 인자가 선택 형태가 아니면 아래로 떨어져 목록 제시(2단계)로 폴백
+    }
+    _botCtlPending[key] = { action: startAction, names: rL.names, ts: Date.now() };
+    try { rawMsg.reply(rL.text); } catch(_) {}
     return true;
   }
 
-  // 번호 응답: 대기 중인 선택이 있을 때만 가로챔 (없으면 일반 메시지로 흘려보냄)
-  if (/^[0-9]+$/.test(text)) {
-    var pend = _botCtlPending[key];
-    if (!pend) return false;
+  // 선택 응답(번호/전체): 대기 중인 선택이 있을 때만 가로챔 (없으면 일반 메시지로 흘려보냄)
+  var pend = _botCtlPending[key];
+  if (pend) {
+    var sel = _parseSelection(text, pend.names.length);
+    if (sel === null) return false;   // 선택 형태가 아님 → 일반 메시지로 흘려보냄
     if (Date.now() - pend.ts > BOT_CTL_TTL_MS) {
       delete _botCtlPending[key];
       try { rawMsg.reply("선택 시간이 만료되었습니다. 명령을 다시 입력해주세요."); } catch(_) {}
       return true;
     }
-    var idx = parseInt(text, 10) - 1;
-    if (idx < 0 || idx >= pend.names.length) {
-      try { rawMsg.reply("잘못된 번호입니다. 1 ~ " + pend.names.length + " 사이로 입력해주세요."); } catch(_) {}
+    if (sel.invalid.length) {
+      try { rawMsg.reply("잘못된 번호: " + sel.invalid.join(", ") + " (1 ~ " + pend.names.length + "). 다시 입력해주세요."); } catch(_) {}
+      return true;   // 대기 유지 → 재입력 가능
+    }
+    if (!sel.indices.length) {
+      try { rawMsg.reply("선택된 봇이 없습니다. 번호를 입력해주세요."); } catch(_) {}
       return true;
     }
-    var target = pend.names[idx];
     delete _botCtlPending[key];
-    var resultMsg = (pend.action === "onoff") ? _applyOnOff(target) : _applyCompile(target);
-    try { rawMsg.reply(resultMsg); } catch(_) {}
+    var resultLines = [];
+    for (var s = 0; s < sel.indices.length; s++) {
+      var target = pend.names[sel.indices[s]];
+      resultLines.push((pend.action === "onoff") ? _applyOnOff(target) : _applyCompile(target));
+    }
+    try { rawMsg.reply(resultLines.join("\n")); } catch(_) {}
     return true;
   }
 

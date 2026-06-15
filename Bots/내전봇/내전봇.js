@@ -180,8 +180,8 @@ function insertNickname(hash, lolNickname, room) {
                 var gid = gcur.getInt(0);
                 var lt  = gcur.getString(1);
                 var rt  = gcur.getString(2);
-                var nlt = lt.replace(oldNick, lolNickname);
-                var nrt = rt.replace(oldNick, lolNickname);
+                var nlt = lt.split(",").map(function(x){ return x === oldNick ? lolNickname : x; }).join(",");
+                var nrt = rt.split(",").map(function(x){ return x === oldNick ? lolNickname : x; }).join(",");
                 if (lt !== nlt || rt !== nrt) {
                     db.execSQL("UPDATE games SET left_team=?, right_team=? WHERE id=?", [nlt, nrt, gid]);
                 }
@@ -280,8 +280,12 @@ function isValidDateTime(str) {
 // =====================================================================
 // 플레이어 통계
 // =====================================================================
-function updatePlayerStats(nickname, isWin) {
-    var db = openDB(); var cur = null;
+// db 인수가 주어지면 그 연결을 사용하고 닫지 않음(트랜잭션 내 호출용).
+// db 가 null/undefined 면 직접 열고 finally 에서 닫음(기존 동작).
+function updatePlayerStats(db, nickname, isWin) {
+    var ownDb = (db === null || db === undefined);
+    if (ownDb) db = openDB();
+    var cur = null;
     try {
         cur = db.rawQuery("SELECT wins, losses, total_games FROM players WHERE lol_nickname=?", [nickname]);
         if (!cur.moveToFirst()) {
@@ -297,8 +301,11 @@ function updatePlayerStats(nickname, isWin) {
                 [nw, nl, nt, (nw/nt)*100, nickname]);
         }
         return true;
-    } catch(e) { return false; }
-    finally { if (cur) cur.close(); db.close(); }
+    } catch(e) {
+        if (!ownDb) throw e;
+        return false;
+    }
+    finally { if (cur) cur.close(); if (ownDb) db.close(); }
 }
 
 function getPlayerStats(nickname) {
@@ -317,6 +324,7 @@ function getPlayerStats(nickname) {
 function saveGameResult(leftTeam, rightTeam, leftChamps, rightChamps, winningTeam) {
     var db = openDB(); var cur = null;
     try {
+        db.beginTransaction();
         db.execSQL("INSERT INTO games(left_team,right_team,left_team_champions,right_team_champions,winning_team) VALUES(?,?,?,?,?)",
             [leftTeam.join(","), rightTeam.join(","), leftChamps.join(","), rightChamps.join(","), winningTeam]);
         cur = db.rawQuery("SELECT last_insert_rowid()", []);
@@ -326,16 +334,17 @@ function saveGameResult(leftTeam, rightTeam, leftChamps, rightChamps, winningTea
         for (var i=0; i<leftTeam.length; i++) {
             db.execSQL("INSERT INTO game_participants(game_id,lol_nickname,team,is_winner) VALUES(?,?,?,?)",
                 [gameId, leftTeam[i], "left", winningTeam==="left"]);
-            updatePlayerStats(leftTeam[i], winningTeam==="left");
+            updatePlayerStats(db, leftTeam[i], winningTeam==="left");
         }
         for (var i=0; i<rightTeam.length; i++) {
             db.execSQL("INSERT INTO game_participants(game_id,lol_nickname,team,is_winner) VALUES(?,?,?,?)",
                 [gameId, rightTeam[i], "right", winningTeam==="right"]);
-            updatePlayerStats(rightTeam[i], winningTeam==="right");
+            updatePlayerStats(db, rightTeam[i], winningTeam==="right");
         }
+        db.setTransactionSuccessful();
         return gameId;
     } catch(e) { return null; }
-    finally { if (cur) cur.close(); db.close(); }
+    finally { if (cur) cur.close(); try { db.endTransaction(); } catch(_) {} db.close(); }
 }
 
 function getGameRecordById(gameId) {
@@ -543,7 +552,7 @@ function applyGameStats(gameId, winningTeam) {
             var rowId=cur.getInt(0),n=cur.getString(1),team=cur.getString(2);
             var isWin=(team===winningTeam)?1:0;
             db.execSQL("UPDATE game_participants SET is_winner=? WHERE id=?",[isWin,rowId]);
-            updatePlayerStats(n,isWin===1);
+            updatePlayerStats(db,n,isWin===1);
         }
     } finally { if (cur) cur.close(); db.close(); }
 }
@@ -632,17 +641,26 @@ function getPlayerEloInfo(nickname) {
 // =====================================================================
 const champlist = ['아트록스','아리','아칼리','알리스타','아무무','애니비아','애니','암베사','아펠리오스','애쉬','아우렐리온 솔','아지르','바드','블리츠크랭크','브랜드','브라움','케이틀린','카밀','카시오페아','초가스','코르키','다리우스','다이애나','드레이븐','문도 박사','에코','엘리스','이블린','이즈리얼','피들스틱','피오라','피즈','갈리오','갱플랭크','가렌','나르','그라가스','그레이브즈','헤카림','하이머딩거','일라오이','이렐리아','아이번','잔나','자르반 4세','잭스','제이스','진','징크스','카이사','칼리스타','카르마','카서스','카사딘','카타리나','케일','케인','케넨','카직스','킨드레드','클레드','코그모','르블랑','리신','레오나','리산드라','루시안','룰루','럭스','말파이트','말자하','마오카이','마스터 이','미스 포츄','오공','모데카이저','모르가나','나미','나서스','노틸러스','니코','니달리','닐라','녹턴','누누와 윌럼프','올라프','오리아나','오른','판테온','뽀삐','파이크','키아나','퀸','라칸','람머스','렉사이','레넥톤','렝가','리븐','럼블','라이즈','세주아니','세나','세트','샤코','쉔','쉬바나','신지드','사이온','시비르','스카너','소나','소라카','스웨인','사일러스','신드라','탐켄치','탈리야','탈론','타릭','티모','쓰레쉬','트리스타나','트런들','트린다미어','트위스티드 페이트','트위치','우디르','우르곳','바루스','베인','베이가','벨코즈','바이','빅토르','블라디미르','볼리베어','워윅','자야','제라스','신짜오','야스오','요릭','유미','자크','제드','직스','질리언','조이','자이라','사미라','밀리오','렐','벨베스','크산테','나피리','레나타','세라핀','벡스','비에고','요네','아크샨','브라이어','그웬','제리','흐웨이','릴리아','스몰더','오로라','멜','유나라','자헨'];
 
-var party = [];
-var leftTeam = [];
-var rightTeam = [];
-var leftteamchamplist = [];
-var rightteamchamplist = [];
-var lastgameparty = [];
-var partygathering = false;
-var gamestart = false;
+// 긴 메시지 강제 줄바꿈용 제로폭 공백 스페이서
+var LONG_MSG_SPACER = "​".repeat(500);
 
-var manualRecord = { active:false, leftTeam:[], rightTeam:[], leftChamps:[], rightChamps:[], winner:"", gameDate:"" };
-var editRecord = { active:false, gameId:null, originalGame:null, newLeftChamps:null, newRightChamps:null, newWinner:null };
+// 방(채널)별 상태. 전역 공유 상태로 인한 방 간 간섭 제거.
+function freshRoomState() {
+    return {
+        party: [],
+        leftTeam: [],
+        rightTeam: [],
+        leftteamchamplist: [],
+        rightteamchamplist: [],
+        lastgameparty: [],
+        partygathering: false,
+        gamestart: false,
+        manualRecord: { active:false, leftTeam:[], rightTeam:[], leftChamps:[], rightChamps:[], winner:"", gameDate:"" },
+        editRecord: { active:false, gameId:null, originalGame:null, newLeftChamps:null, newRightChamps:null, newWinner:null }
+    };
+}
+
+var rooms = {};
 
 // =====================================================================
 // 날짜 포맷 (내전기록용)
@@ -674,6 +692,10 @@ function handleMessage(msg) {
         var hash = msg.author.hash ? String(msg.author.hash) : null;
         var room = msg.room;
 
+        // 방(채널)별 상태 (전역 공유 제거)
+        var chanId = String(msg.channelId || "");
+        var st = rooms[chanId] || (rooms[chanId] = freshRoomState());
+
         // ── 닉네임 확인 ──────────────────────────────────────────
         if (text === "!닉네임") {
             if (!hash) { msg.reply("유저 해시를 인식할 수 없습니다."); return; }
@@ -704,121 +726,122 @@ function handleMessage(msg) {
         }
 
         // ── 내전 시작 ────────────────────────────────────────────
-        else if (text === "!내전" && !partygathering && !gamestart) {
-            partygathering = true;
-            party = [];
+        else if (text === "!내전시작" && !st.partygathering && !st.gamestart) {
+            st.partygathering = true;
+            st.party = [];
             msg.reply("!참가 로 참가하세요.\n닉네임 등록: !닉네임등록 롤닉네임");
             return;
         }
 
         // ── 이전게임 ─────────────────────────────────────────────
         else if (text === "!이전게임") {
-            if (lastgameparty.length === 0) { msg.reply("이전 게임에 참가한 사람이 없습니다."); return; }
-            partygathering = true; party = [];
-            for (var i=0; i<lastgameparty.length; i++) {
-                if (party.indexOf(lastgameparty[i])===-1) party.push(lastgameparty[i]);
+            if (st.lastgameparty.length === 0) { msg.reply("이전 게임에 참가한 사람이 없습니다."); return; }
+            st.partygathering = true; st.party = [];
+            for (var i=0; i<st.lastgameparty.length; i++) {
+                if (st.party.indexOf(st.lastgameparty[i])===-1) st.party.push(st.lastgameparty[i]);
             }
-            msg.reply("이전 게임 참가자 복원\n현재 참가자("+party.length+"인)\n"+party.join(", "));
+            msg.reply("이전 게임 참가자 복원\n현재 참가자("+st.party.length+"인)\n"+st.party.join(", "));
             return;
         }
 
         // ── 참가 ─────────────────────────────────────────────────
-        else if (text === "!참가" && partygathering && !gamestart) {
+        else if (text === "!참가" && st.partygathering && !st.gamestart) {
             if (!hash) { msg.reply("유저 해시를 인식할 수 없습니다."); return; }
             var nick = getNicknameFromHash(hash);
             if (!nick) { msg.reply("닉네임을 등록하세요.\n!닉네임등록 롤닉네임"); return; }
-            if (party.length >= 10) { msg.reply("참가 인원이 가득 찼습니다."); return; }
-            if (party.indexOf(nick) !== -1) { msg.reply("이미 참가하셨습니다."); return; }
-            party.push(nick);
-            msg.reply(nick+" 님 참가\n현재 참가자("+party.length+"인)\n"+party.join(", "));
+            if (st.party.length >= 10) { msg.reply("참가 인원이 가득 찼습니다."); return; }
+            if (st.party.indexOf(nick) !== -1) { msg.reply("이미 참가하셨습니다."); return; }
+            st.party.push(nick);
+            msg.reply(nick+" 님 참가\n현재 참가자("+st.party.length+"인)\n"+st.party.join(", "));
             return;
         }
 
         // ── 강제참가 ─────────────────────────────────────────────
-        else if (text.startsWith("!강제참가 ") && partygathering && !gamestart) {
+        else if (text.startsWith("!강제참가 ") && st.partygathering && !st.gamestart) {
             var input = text.replace("!강제참가 ","").trim();
             if (!input) { msg.reply("사용법: !강제참가 롤닉네임1,롤닉네임2"); return; }
             var requested = input.split(",");
             var added=[], noregistered=[], alreadyjoined=[], overlimit=[];
             for (var i=0; i<requested.length; i++) {
                 var n=requested[i].replace(/^\s+|\s+$/g,"");
-                if (party.length>=10) { overlimit.push(n); continue; }
+                if (st.party.length>=10) { overlimit.push(n); continue; }
                 if (!getPlayerStats(n)) { noregistered.push(n); continue; }
-                if (party.indexOf(n)!==-1) { alreadyjoined.push(n); continue; }
-                party.push(n); added.push(n);
+                if (st.party.indexOf(n)!==-1) { alreadyjoined.push(n); continue; }
+                st.party.push(n); added.push(n);
             }
             var m="";
             if (added.length) m+="참가 완료:\n"+added.join(", ")+"\n\n";
             if (noregistered.length) m+="등록되지 않은 닉네임:\n"+noregistered.join(", ")+"\n\n";
             if (alreadyjoined.length) m+="이미 참가 중:\n"+alreadyjoined.join(", ")+"\n\n";
             if (overlimit.length) m+="정원 초과:\n"+overlimit.join(", ")+"\n\n";
-            m+="현재 참가자("+party.length+"명)\n"+party.join(", ");
+            m+="현재 참가자("+st.party.length+"명)\n"+st.party.join(", ");
             msg.reply(m);
             return;
         }
 
         // ── 참가취소 ─────────────────────────────────────────────
-        else if (text === "!참가취소" && partygathering && !gamestart) {
+        else if (text === "!참가취소" && st.partygathering && !st.gamestart) {
             if (!hash) { msg.reply("유저 해시를 인식할 수 없습니다."); return; }
             var nick = getNicknameFromHash(hash);
             if (!nick) { msg.reply("닉네임이 등록되어 있지 않습니다."); return; }
-            var idx = party.indexOf(nick);
+            var idx = st.party.indexOf(nick);
             if (idx===-1) { msg.reply("참가하지 않은 상태입니다."); return; }
-            party.splice(idx, 1);
-            msg.reply(nick+" 님 참가 취소\n현재 참가자("+party.length+"인)\n"+party.join(", "));
+            st.party.splice(idx, 1);
+            msg.reply(nick+" 님 참가 취소\n현재 참가자("+st.party.length+"인)\n"+st.party.join(", "));
             return;
         }
 
         // ── 시작 ─────────────────────────────────────────────────
-        else if (text === "!시작" && partygathering && !gamestart) {
-            if (party.length < 2) { msg.reply("최소 2명 이상 참가해야 합니다."); return; }
-            if (party.length % 2 !== 0) { msg.reply("짝수 인원만 게임을 시작할 수 있습니다.\n현재 인원: "+party.length+"명"); return; }
-            gamestart = true; partygathering = false;
-            var shuffled = party.slice().sort(function(){ return Math.random()-0.5; });
+        else if (text === "!시작" && st.partygathering && !st.gamestart) {
+            if (st.party.length < 2) { msg.reply("최소 2명 이상 참가해야 합니다."); return; }
+            if (st.party.length % 2 !== 0) { msg.reply("짝수 인원만 게임을 시작할 수 있습니다.\n현재 인원: "+st.party.length+"명"); return; }
+            st.gamestart = true; st.partygathering = false;
+            var shuffled = st.party.slice(); for (var i=shuffled.length-1;i>0;i--){ var j=Math.floor(Math.random()*(i+1)); var t=shuffled[i]; shuffled[i]=shuffled[j]; shuffled[j]=t; }
             var mid = shuffled.length/2;
-            leftTeam = shuffled.slice(0, mid); rightTeam = shuffled.slice(mid);
-            var tc = champlist.slice(); leftteamchamplist=[]; rightteamchamplist=[];
-            for (var i=0; i<leftTeam.length*3; i++) leftteamchamplist.push(tc.splice(Math.floor(Math.random()*tc.length),1)[0]);
-            for (var i=0; i<rightTeam.length*3; i++) rightteamchamplist.push(tc.splice(Math.floor(Math.random()*tc.length),1)[0]);
-            msg.reply("왼쪽팀 : "+leftTeam.join(", ")+"\n오른쪽팀 : "+rightTeam.join(", ")+"\n\n각 팀은 개인톡으로 !챔프 입력\n게임 종료 후 !승리왼쪽 또는 !승리오른쪽 입력");
+            st.leftTeam = shuffled.slice(0, mid); st.rightTeam = shuffled.slice(mid);
+            var tc = champlist.slice(); st.leftteamchamplist=[]; st.rightteamchamplist=[];
+            for (var i=0; i<st.leftTeam.length*3; i++) st.leftteamchamplist.push(tc.splice(Math.floor(Math.random()*tc.length),1)[0]);
+            for (var i=0; i<st.rightTeam.length*3; i++) st.rightteamchamplist.push(tc.splice(Math.floor(Math.random()*tc.length),1)[0]);
+            msg.reply("왼쪽팀 : "+st.leftTeam.join(", ")+"\n오른쪽팀 : "+st.rightTeam.join(", ")+"\n\n각 팀은 개인톡으로 !챔프 입력\n게임 종료 후 !승리왼쪽 또는 !승리오른쪽 입력");
             return;
         }
 
         // ── 팀다시짜기 ────────────────────────────────────────────
-        else if (text === "!팀다시짜기" && !partygathering && gamestart) {
-            if (party.length < 6) { msg.reply("최소 6명 이상이어야 합니다."); return; }
-            var shuffled = party.slice().sort(function(){ return Math.random()-0.5; });
+        else if (text === "!팀다시짜기" && !st.partygathering && st.gamestart) {
+            if (st.party.length < 6) { msg.reply("최소 6명 이상이어야 합니다."); return; }
+            if (st.party.length % 2 !== 0) { msg.reply("짝수 인원만 게임을 시작할 수 있습니다.\n현재 인원: "+st.party.length+"명"); return; }
+            var shuffled = st.party.slice(); for (var i=shuffled.length-1;i>0;i--){ var j=Math.floor(Math.random()*(i+1)); var t=shuffled[i]; shuffled[i]=shuffled[j]; shuffled[j]=t; }
             var mid = shuffled.length/2;
-            leftTeam = shuffled.slice(0,mid); rightTeam = shuffled.slice(mid);
-            var tc=champlist.slice(); leftteamchamplist=[]; rightteamchamplist=[];
-            for (var i=0;i<leftTeam.length*3;i++) leftteamchamplist.push(tc.splice(Math.floor(Math.random()*tc.length),1)[0]);
-            for (var i=0;i<rightTeam.length*3;i++) rightteamchamplist.push(tc.splice(Math.floor(Math.random()*tc.length),1)[0]);
-            msg.reply("🔄 팀을 새롭게 구성했습니다!\n왼쪽팀 : "+leftTeam.join(", ")+"\n오른쪽팀 : "+rightTeam.join(", ")+"\n각 팀원은 개인톡으로 !챔프 입력");
+            st.leftTeam = shuffled.slice(0,mid); st.rightTeam = shuffled.slice(mid);
+            var tc=champlist.slice(); st.leftteamchamplist=[]; st.rightteamchamplist=[];
+            for (var i=0;i<st.leftTeam.length*3;i++) st.leftteamchamplist.push(tc.splice(Math.floor(Math.random()*tc.length),1)[0]);
+            for (var i=0;i<st.rightTeam.length*3;i++) st.rightteamchamplist.push(tc.splice(Math.floor(Math.random()*tc.length),1)[0]);
+            msg.reply("🔄 팀을 새롭게 구성했습니다!\n왼쪽팀 : "+st.leftTeam.join(", ")+"\n오른쪽팀 : "+st.rightTeam.join(", ")+"\n각 팀원은 개인톡으로 !챔프 입력");
             return;
         }
 
         // ── 승리왼쪽 ─────────────────────────────────────────────
-        else if (text.startsWith("!승리왼쪽") && gamestart) {
-            var gid = saveGameResult(leftTeam, rightTeam, leftteamchamplist, rightteamchamplist, "left");
+        else if (text.startsWith("!승리왼쪽") && st.gamestart) {
+            var gid = saveGameResult(st.leftTeam, st.rightTeam, st.leftteamchamplist, st.rightteamchamplist, "left");
             if (gid) {
                 msg.reply(gid+"회차 내전 왼쪽 팀 승리!\n통계가 업데이트되었습니다.");
-                lastgameparty=party.slice(); party=[]; leftTeam=[]; rightTeam=[]; leftteamchamplist=[]; rightteamchamplist=[]; partygathering=false; gamestart=false;
+                st.lastgameparty=st.party.slice(); st.party=[]; st.leftTeam=[]; st.rightTeam=[]; st.leftteamchamplist=[]; st.rightteamchamplist=[]; st.partygathering=false; st.gamestart=false;
             } else msg.reply("게임 결과 저장에 실패했습니다.");
             return;
         }
 
         // ── 승리오른쪽 ───────────────────────────────────────────
-        else if (text.startsWith("!승리오른쪽") && gamestart) {
-            var gid = saveGameResult(leftTeam, rightTeam, leftteamchamplist, rightteamchamplist, "right");
+        else if (text.startsWith("!승리오른쪽") && st.gamestart) {
+            var gid = saveGameResult(st.leftTeam, st.rightTeam, st.leftteamchamplist, st.rightteamchamplist, "right");
             if (gid) {
                 msg.reply(gid+"회차 내전 오른쪽 팀 승리!\n통계가 업데이트되었습니다.");
-                lastgameparty=party.slice(); party=[]; leftTeam=[]; rightTeam=[]; leftteamchamplist=[]; rightteamchamplist=[]; partygathering=false; gamestart=false;
+                st.lastgameparty=st.party.slice(); st.party=[]; st.leftTeam=[]; st.rightTeam=[]; st.leftteamchamplist=[]; st.rightteamchamplist=[]; st.partygathering=false; st.gamestart=false;
             } else msg.reply("게임 결과 저장에 실패했습니다.");
             return;
         }
 
         // ── 챔프 (롤닉네임으로 판별 — 다른 방 등록도 인식) ───────
-        else if (text.startsWith("!챔프") && gamestart && !partygathering) {
+        else if (text.startsWith("!챔프") && st.gamestart && !st.partygathering) {
             if (room === "명동(공공장소에서열지마세요)") {
                 msg.reply("개인챗으로 !챔프 를 통해 챔피언을 확인하세요."); return;
             }
@@ -831,17 +854,17 @@ function handleMessage(msg) {
             } finally { if (cur2) cur2.close(); db2.close(); }
             var matched = null;
             for (var i=0; i<nicks.length; i++) {
-                if (leftTeam.indexOf(nicks[i])!==-1 || rightTeam.indexOf(nicks[i])!==-1) { matched=nicks[i]; break; }
+                if (st.leftTeam.indexOf(nicks[i])!==-1 || st.rightTeam.indexOf(nicks[i])!==-1) { matched=nicks[i]; break; }
             }
             if (!matched) { msg.reply("현재 게임 참가자 목록에 없습니다.\n닉네임 등록: !닉네임등록 롤닉네임"); return; }
-            if (leftTeam.indexOf(matched)!==-1) msg.reply("왼쪽 팀 챔피언\n"+leftteamchamplist.join(", "));
-            else msg.reply("오른쪽 팀 챔피언\n"+rightteamchamplist.join(", "));
+            if (st.leftTeam.indexOf(matched)!==-1) msg.reply("왼쪽 팀 챔피언\n"+st.leftteamchamplist.join(", "));
+            else msg.reply("오른쪽 팀 챔피언\n"+st.rightteamchamplist.join(", "));
             return;
         }
 
         // ── 초기화 ───────────────────────────────────────────────
         else if (text.startsWith("!초기화")) {
-            partygathering=false; gamestart=false; party=[]; leftTeam=[]; rightTeam=[]; leftteamchamplist=[]; rightteamchamplist=[];
+            st.partygathering=false; st.gamestart=false; st.party=[]; st.leftTeam=[]; st.rightTeam=[]; st.leftteamchamplist=[]; st.rightteamchamplist=[];
             msg.reply("내전 모집 상태가 초기화되었습니다."); return;
         }
 
@@ -901,7 +924,7 @@ function handleMessage(msg) {
                     var p=partnerStats[i];
                     if (pwr!==null&&(Math.abs(pwr-p.winRate)>0.01||pw!==p.wins)) cr=rank;
                     m+=cr+". "+p.partner+"\n "+p.totalGames+"전 "+p.wins+"승 "+p.losses+"패 ("+p.winRate.toFixed(1)+"%)";
-                    if (i===5) m+="\u200B".repeat(500);
+                    if (i===5) m+=LONG_MSG_SPACER;
                     if (i<partnerStats.length-1) m+="\n";
                     pwr=p.winRate; pw=p.wins; rank++;
                 }
@@ -931,7 +954,7 @@ function handleMessage(msg) {
             for (var i=0;i<os.length;i++) {
                 var o=os[i];
                 m+=rank+". "+o.opponent+"\n "+o.totalGames+"전 "+o.wins+"승 "+o.losses+"패 ("+o.winRate.toFixed(1)+"%)";
-                if (i===5) m+="\u200B".repeat(500);
+                if (i===5) m+=LONG_MSG_SPACER;
                 if (i<os.length-1) m+="\n";
                 rank++;
             }
@@ -961,7 +984,7 @@ function handleMessage(msg) {
                     var t=combos[k];
                     if (pwr!==null&&(Math.abs(pwr-t.winRate)>0.01||pw!==t.wins)) cr=rank;
                     m+=cr+". "+t.p1+" + "+t.p2+"\n "+t.totalGames+"전 "+t.wins+"승 "+t.losses+"패 ("+t.winRate.toFixed(1)+"%)";
-                    if (k===5) m+="\u200B".repeat(500);
+                    if (k===5) m+=LONG_MSG_SPACER;
                     if (k<combos.length-1) m+="\n";
                     pwr=t.winRate; pw=t.wins; rank++;
                 }
@@ -1080,37 +1103,37 @@ function handleMessage(msg) {
             if (isNaN(gid)) { msg.reply("사용법: !회차수정 게임ID"); return; }
             var g=getGameRecordById(gid);
             if (!g) { msg.reply("해당 회차 기록이 없습니다."); return; }
-            editRecord={active:true,gameId:gid,originalGame:g,newLeftChamps:null,newRightChamps:null,newWinner:null};
+            st.editRecord={active:true,gameId:gid,originalGame:g,newLeftChamps:null,newRightChamps:null,newWinner:null};
             msg.reply("🛠 "+gid+"회차 수정 모드\n!승리 왼쪽 / 오른쪽\n!챔프수정 왼쪽 챔1,챔2...\n!챔프수정 오른쪽 챔1,챔2...\n!수정완료");
             return;
         }
 
-        else if (editRecord.active && text.startsWith("!승리 ")) {
+        else if (st.editRecord.active && text.startsWith("!승리 ")) {
             var t=text.replace("!승리","").trim();
             if (t!=="왼쪽"&&t!=="오른쪽") { msg.reply("왼쪽 또는 오른쪽만 가능합니다."); return; }
-            editRecord.newWinner=(t==="왼쪽")?"left":"right";
+            st.editRecord.newWinner=(t==="왼쪽")?"left":"right";
             msg.reply("승리 팀 수정 완료"); return;
         }
 
-        else if (editRecord.active && text.startsWith("!챔프수정 ")) {
+        else if (st.editRecord.active && text.startsWith("!챔프수정 ")) {
             var parts=text.replace("!챔프수정","").trim().split(" ");
             var side=parts.shift(), champs=parts.join(" ").split(",");
-            if (side==="왼쪽") editRecord.newLeftChamps=champs;
-            else if (side==="오른쪽") editRecord.newRightChamps=champs;
+            if (side==="왼쪽") st.editRecord.newLeftChamps=champs;
+            else if (side==="오른쪽") st.editRecord.newRightChamps=champs;
             else { msg.reply("왼쪽 또는 오른쪽만 가능합니다."); return; }
             msg.reply(side+" 챔프 수정 완료"); return;
         }
 
-        else if (editRecord.active && text === "!수정완료") {
-            var gid=editRecord.gameId, origW=editRecord.originalGame.winningTeam;
-            var newW=editRecord.newWinner||origW;
+        else if (st.editRecord.active && text === "!수정완료") {
+            var gid=st.editRecord.gameId, origW=st.editRecord.originalGame.winningTeam;
+            var newW=st.editRecord.newWinner||origW;
             if (origW!==newW) { rollbackGameStats(gid); applyGameStats(gid, newW); }
             var db8=openDB();
             try {
                 db8.execSQL("UPDATE games SET winning_team=?,left_team_champions=?,right_team_champions=? WHERE id=?",
-                    [newW,(editRecord.newLeftChamps||editRecord.originalGame.leftChampions).join(","),(editRecord.newRightChamps||editRecord.originalGame.rightChampions).join(","),gid]);
+                    [newW,(st.editRecord.newLeftChamps||st.editRecord.originalGame.leftChampions).join(","),(st.editRecord.newRightChamps||st.editRecord.originalGame.rightChampions).join(","),gid]);
             } finally { db8.close(); }
-            editRecord.active=false;
+            st.editRecord.active=false;
             msg.reply("✅ 회차 수정 완료"); return;
         }
 
@@ -1143,88 +1166,92 @@ function handleMessage(msg) {
 
         // ── 기록모드 ─────────────────────────────────────────────
         else if (text === "!기록모드 시작") {
-            manualRecord={active:true,leftTeam:[],rightTeam:[],leftChamps:[],rightChamps:[],winner:"",gameDate:""};
+            st.manualRecord={active:true,leftTeam:[],rightTeam:[],leftChamps:[],rightChamps:[],winner:"",gameDate:""};
             msg.reply("📘 수동 기록 모드를 시작합니다.\n!기록 왼쪽팀 A,B,C,D,E"); return;
         }
-        else if (text === "!기록 취소" && manualRecord.active) {
-            manualRecord.active=false; msg.reply("수동 기록 모드가 취소되었습니다."); return;
+        else if (text === "!기록 취소" && st.manualRecord.active) {
+            st.manualRecord.active=false; msg.reply("수동 기록 모드가 취소되었습니다."); return;
         }
-        else if (text.startsWith("!기록 왼쪽팀") && manualRecord.active) {
+        else if (text.startsWith("!기록 왼쪽팀") && st.manualRecord.active) {
             var names=text.replace("!기록 왼쪽팀","").trim().split(",").map(function(s){return s.trim();});
             if (names.length>5) { msg.reply("5명을 초과할 수 없습니다."); return; }
             for (var i=0;i<names.length;i++) { if (!isRegisteredNickname(names[i])) { msg.reply("등록되지 않은 닉네임: "+names[i]); return; } }
-            manualRecord.leftTeam=names; msg.reply("왼쪽팀 등록 완료: "+names.join(", ")+"\n!기록 오른쪽팀 을 입력하세요."); return;
+            st.manualRecord.leftTeam=names; msg.reply("왼쪽팀 등록 완료: "+names.join(", ")+"\n!기록 오른쪽팀 을 입력하세요."); return;
         }
-        else if (text.startsWith("!기록 오른쪽팀") && manualRecord.active) {
+        else if (text.startsWith("!기록 오른쪽팀") && st.manualRecord.active) {
             var names=text.replace("!기록 오른쪽팀","").trim().split(",").map(function(s){return s.trim();});
             if (names.length>5) { msg.reply("5명을 초과할 수 없습니다."); return; }
             for (var i=0;i<names.length;i++) { if (!isRegisteredNickname(names[i])) { msg.reply("등록되지 않은 닉네임: "+names[i]); return; } }
-            manualRecord.rightTeam=names; msg.reply("오른쪽팀 등록 완료: "+names.join(", ")+"\n!기록 왼쪽챔프 을 입력하세요."); return;
+            st.manualRecord.rightTeam=names; msg.reply("오른쪽팀 등록 완료: "+names.join(", ")+"\n!기록 왼쪽챔프 을 입력하세요."); return;
         }
-        else if (text.startsWith("!기록 왼쪽챔프") && manualRecord.active) {
+        else if (text.startsWith("!기록 왼쪽챔프") && st.manualRecord.active) {
             var champs=text.replace("!기록 왼쪽챔프","").trim().split(",").map(function(s){return s.trim();});
             if (champs.length>5) { msg.reply("5개를 초과할 수 없습니다."); return; }
             for (var i=0;i<champs.length;i++) { if (champlist.indexOf(champs[i])===-1) { msg.reply("존재하지 않는 챔피언: "+champs[i]); return; } }
-            manualRecord.leftChamps=champs; msg.reply("왼쪽팀 챔피언 입력 완료.\n!기록 오른쪽챔프 을 입력하세요."); return;
+            st.manualRecord.leftChamps=champs; msg.reply("왼쪽팀 챔피언 입력 완료.\n!기록 오른쪽챔프 을 입력하세요."); return;
         }
-        else if (text.startsWith("!기록 오른쪽챔프") && manualRecord.active) {
+        else if (text.startsWith("!기록 오른쪽챔프") && st.manualRecord.active) {
             var champs=text.replace("!기록 오른쪽챔프","").trim().split(",").map(function(s){return s.trim();});
             if (champs.length>5) { msg.reply("5개를 초과할 수 없습니다."); return; }
             for (var i=0;i<champs.length;i++) { if (champlist.indexOf(champs[i])===-1) { msg.reply("존재하지 않는 챔피언: "+champs[i]); return; } }
-            manualRecord.rightChamps=champs; msg.reply("오른쪽팀 챔피언 입력 완료.\n!기록 승리 을 입력하세요."); return;
+            st.manualRecord.rightChamps=champs; msg.reply("오른쪽팀 챔피언 입력 완료.\n!기록 승리 을 입력하세요."); return;
         }
-        else if (text.startsWith("!기록 승리") && manualRecord.active) {
+        else if (text.startsWith("!기록 승리") && st.manualRecord.active) {
             var w=text.replace("!기록 승리","").trim();
             if (w!=="left"&&w!=="right") { msg.reply("left 또는 right 만 가능합니다."); return; }
-            manualRecord.winner=w; msg.reply("승리팀 입력 완료: "+w+"\n!기록 날짜 을 입력하세요."); return;
+            st.manualRecord.winner=w; msg.reply("승리팀 입력 완료: "+w+"\n!기록 날짜 을 입력하세요."); return;
         }
-        else if (text.startsWith("!기록 날짜") && manualRecord.active) {
+        else if (text.startsWith("!기록 날짜") && st.manualRecord.active) {
             var dt=text.replace("!기록 날짜","").trim();
             if (!isValidDateTime(dt)) { msg.reply("날짜 형식 오류\n예: 2025-01-02 21:30"); return; }
-            manualRecord.gameDate=dt;
+            st.manualRecord.gameDate=dt;
             var m="날짜 입력 완료: "+dt+"\n=== 기록 예정 게임 ===\n";
-            m+="왼쪽팀: "+manualRecord.leftTeam.join(", ")+"\n왼쪽챔프: "+manualRecord.leftChamps.join(", ")+"\n\n";
-            m+="오른쪽팀: "+manualRecord.rightTeam.join(", ")+"\n오른쪽챔프: "+manualRecord.rightChamps.join(", ")+"\n\n";
-            m+="승리팀: "+manualRecord.winner+"\n날짜: "+manualRecord.gameDate+"\n\n!기록 저장 으로 저장합니다.";
+            m+="왼쪽팀: "+st.manualRecord.leftTeam.join(", ")+"\n왼쪽챔프: "+st.manualRecord.leftChamps.join(", ")+"\n\n";
+            m+="오른쪽팀: "+st.manualRecord.rightTeam.join(", ")+"\n오른쪽챔프: "+st.manualRecord.rightChamps.join(", ")+"\n\n";
+            m+="승리팀: "+st.manualRecord.winner+"\n날짜: "+st.manualRecord.gameDate+"\n\n!기록 저장 으로 저장합니다.";
             msg.reply(m); return;
         }
-        else if (text === "!기록 확인" && manualRecord.active) {
-            var m="=== 현재 기록 상태 ===\n왼쪽팀: "+manualRecord.leftTeam.join(", ")+"\n오른쪽팀: "+manualRecord.rightTeam.join(", ")+"\n승리팀: "+manualRecord.winner+"\n날짜: "+manualRecord.gameDate+"\n\n!기록 저장 으로 저장합니다.";
+        else if (text === "!기록 확인" && st.manualRecord.active) {
+            var m="=== 현재 기록 상태 ===\n왼쪽팀: "+st.manualRecord.leftTeam.join(", ")+"\n오른쪽팀: "+st.manualRecord.rightTeam.join(", ")+"\n승리팀: "+st.manualRecord.winner+"\n날짜: "+st.manualRecord.gameDate+"\n\n!기록 저장 으로 저장합니다.";
             msg.reply(m); return;
         }
-        else if (text === "!기록 저장" && manualRecord.active) {
-            if (!manualRecord.winner||!manualRecord.gameDate) { msg.reply("입력이 완료되지 않은 항목이 있습니다.\n!기록 확인으로 확인하세요."); return; }
+        else if (text === "!기록 저장" && st.manualRecord.active) {
+            if (!st.manualRecord.winner||!st.manualRecord.gameDate) { msg.reply("입력이 완료되지 않은 항목이 있습니다.\n!기록 확인으로 확인하세요."); return; }
+            var db9=openDB();
             try {
-                var db9=openDB();
+                db9.beginTransaction();
                 db9.execSQL("INSERT INTO games(left_team,right_team,left_team_champions,right_team_champions,winning_team,game_date) VALUES(?,?,?,?,?,?)",
-                    [manualRecord.leftTeam.join(","),manualRecord.rightTeam.join(","),manualRecord.leftChamps.join(","),manualRecord.rightChamps.join(","),manualRecord.winner,manualRecord.gameDate]);
+                    [st.manualRecord.leftTeam.join(","),st.manualRecord.rightTeam.join(","),st.manualRecord.leftChamps.join(","),st.manualRecord.rightChamps.join(","),st.manualRecord.winner,st.manualRecord.gameDate]);
                 var cur9=db9.rawQuery("SELECT last_insert_rowid()",[]);
                 cur9.moveToFirst(); var gid=cur9.getInt(0); cur9.close();
-                db9.close();
-                for (var i=0;i<manualRecord.leftTeam.length;i++) {
-                    var isW=(manualRecord.winner==="left");
-                    var dbp=openDB(); dbp.execSQL("INSERT INTO game_participants(game_id,lol_nickname,team,is_winner) VALUES(?,?,?,?)",[gid,manualRecord.leftTeam[i],"left",isW]); dbp.close();
-                    updatePlayerStats(manualRecord.leftTeam[i],isW);
+                for (var i=0;i<st.manualRecord.leftTeam.length;i++) {
+                    var isWL=(st.manualRecord.winner==="left");
+                    db9.execSQL("INSERT INTO game_participants(game_id,lol_nickname,team,is_winner) VALUES(?,?,?,?)",[gid,st.manualRecord.leftTeam[i],"left",isWL]);
+                    updatePlayerStats(db9,st.manualRecord.leftTeam[i],isWL);
                 }
-                for (var i=0;i<manualRecord.rightTeam.length;i++) {
-                    var isW=(manualRecord.winner==="right");
-                    var dbp=openDB(); dbp.execSQL("INSERT INTO game_participants(game_id,lol_nickname,team,is_winner) VALUES(?,?,?,?)",[gid,manualRecord.rightTeam[i],"right",isW]); dbp.close();
-                    updatePlayerStats(manualRecord.rightTeam[i],isW);
+                for (var i=0;i<st.manualRecord.rightTeam.length;i++) {
+                    var isWR=(st.manualRecord.winner==="right");
+                    db9.execSQL("INSERT INTO game_participants(game_id,lol_nickname,team,is_winner) VALUES(?,?,?,?)",[gid,st.manualRecord.rightTeam[i],"right",isWR]);
+                    updatePlayerStats(db9,st.manualRecord.rightTeam[i],isWR);
                 }
-                manualRecord.active=false;
+                db9.setTransactionSuccessful();
+                st.manualRecord.active=false;
                 msg.reply("저장 완료! 게임ID: "+gid);
             } catch(e) { msg.reply("저장 실패: "+e.message); }
+            finally { try { db9.endTransaction(); } catch(_) {} db9.close(); }
             return;
         }
 
         // ── 도움말 ───────────────────────────────────────────────
-        else if (text.startsWith("!도움말")||text.startsWith("!기능")||text.startsWith("!명령어")||text.startsWith("!help")) {
+        else if (text === "!내전") {
             var h="=== 내전봇 명령어 ===\n";
+            h+="!내전 - 이 명령어 도움말\n";
+            h+="==================\n";
             h+="!닉네임 - 현재 등록된 롤 닉네임 확인\n";
             h+="!닉네임등록 롤닉네임 - 신규등록 / 닉네임변경 (hash 기준)\n";
             h+="!닉네임재등록 롤닉네임 - 카카오계정 변경 시 hash 재연결\n";
             h+="==================\n";
-            h+="!내전 - 내전 시작\n";
+            h+="!내전시작 - 내전 시작\n";
             h+="!참가 - 내전 참가\n";
             h+="!강제참가 롤닉네임 - 특정 플레이어 강제참가\n";
             h+="!참가취소 - 내전 참가 취소\n";
@@ -1263,61 +1290,24 @@ function isMyCommand(text) {
     return !!text && text.indexOf("!") === 0;
 }
 
-// ─── 메시지 큐 + 워커 스레드 (ChatManager 구독) ─────────────────────────────
-var msgQueue = new java.util.concurrent.LinkedBlockingQueue();
+// ─── 메시지 큐 + 워커 스레드 (ChatManager 구독, 공용 모듈) ───────────────────
 var WORKER_NAME = "NAEJEON_BOT_WORKER";
 
-(function killOldThreads() {
+var subscribe = (function() {
+    var libPath = "/sdcard/msgbot/Bots/lib/subscriber.js";
     try {
-        var root = java.lang.Thread.currentThread().getThreadGroup();
-        while (root.getParent() != null) root = root.getParent();
-        var n = root.activeCount() + 32;
-        var arr = java.lang.reflect.Array.newInstance(java.lang.Thread, n);
-        var got = root.enumerate(arr, true);
-        for (var i = 0; i < got; i++) {
-            var t = arr[i];
-            if (!t) continue;
-            if (String(t.getName() || "") === WORKER_NAME) {
-                try { t.interrupt(); } catch(_) {}
-            }
+        if (typeof bot.getRootPath === "function") {
+            libPath = bot.getRootPath() + "/../lib/subscriber.js";
         }
     } catch(_) {}
+    return require(libPath);
 })();
 
-(function registerWithChatManager() {
-    try {
-        var sysProps = java.lang.System.getProperties();
-        var REG_KEY = "__CHATMANAGER_REGISTRY__";
-        var registry = sysProps.get(REG_KEY);
-        if (registry == null) {
-            registry = new java.util.concurrent.ConcurrentHashMap();
-            sysProps.put(REG_KEY, registry);
-        }
-        registry.put(BOT_NAME, msgQueue);
-    } catch(_) {}
-})();
-
-new java.lang.Thread(function() {
-    while (!java.lang.Thread.currentThread().isInterrupted()) {
-        var task = null;
-        try { task = msgQueue.take(); } catch(_) { return; }
-        try {
-            if (!(task instanceof java.util.HashMap)) continue;
-            var text = String(task.get("text") || "");
-            if (!isMyCommand(text)) continue;
-            var room = String(task.get("room") || "");
-            var name = String(task.get("name") || "익명");
-            var hash = String(task.get("hash") || "");
-            var msg = {
-                content: text,
-                room: room,
-                author: { name: name, hash: hash },
-                reply: (function(r){ return function(s){ try { bot.send(r, s); } catch(_) {} }; })(room)
-            };
-            handleMessage(msg);
-        } catch(_) {}
-    }
-}, WORKER_NAME).start();
+subscribe(BOT_NAME, WORKER_NAME, function(msg) {
+    var text = String(msg.content || "");
+    if (!isMyCommand(text)) return;
+    handleMessage(msg);
+});
 
 
 function onMessage(rawMsg) {}  // 메시지는 ChatManager 큐로 들어옴

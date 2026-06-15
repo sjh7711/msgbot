@@ -25,60 +25,30 @@ function handleMessage(msg) {
 }
 
 // ─── 메시지 큐 + 워커 스레드 (ChatManager 구독) ─────────────────────────────
-var msgQueue = new java.util.concurrent.LinkedBlockingQueue();
+//   공용 subscriber.js 모듈로 추출. 옛 인라인 보일러플레이트(killOldThreads +
+//   레지스트리 등록 + take()-루프)는 subscriber.subscribe() 안으로 이동.
+//
+// ⚠ require() 경로 미확인: 디바이스측 require() 해석 규칙과 lib 폴더 실제
+//   위치는 태블릿에서 검증 필요. bot.getRootPath() 가 있으면 그 기준 상대
+//   경로를, 없으면 절대경로로 폴백. 이 봇(eval)은 프로토타입이며, 로딩이
+//   확인되기 전까지 나머지 봇은 인라인 보일러플레이트를 유지한다.
 var WORKER_NAME = "EVAL_BOT_WORKER";
 
-(function killOldThreads() {
+var subscribe = (function() {
+  var libPath = "/sdcard/msgbot/Bots/lib/subscriber.js";
   try {
-    var root = java.lang.Thread.currentThread().getThreadGroup();
-    while (root.getParent() != null) root = root.getParent();
-    var n = root.activeCount() + 32;
-    var arr = java.lang.reflect.Array.newInstance(java.lang.Thread, n);
-    var got = root.enumerate(arr, true);
-    for (var i = 0; i < got; i++) {
-      var t = arr[i];
-      if (!t) continue;
-      if (String(t.getName() || "") === WORKER_NAME) {
-        try { t.interrupt(); } catch(_) {}
-      }
+    if (typeof bot.getRootPath === "function") {
+      libPath = bot.getRootPath() + "/../lib/subscriber.js";
     }
   } catch(_) {}
+  return require(libPath);
 })();
 
-(function registerWithChatManager() {
-  try {
-    var sysProps = java.lang.System.getProperties();
-    var REG_KEY = "__CHATMANAGER_REGISTRY__";
-    var registry = sysProps.get(REG_KEY);
-    if (registry == null) {
-      registry = new java.util.concurrent.ConcurrentHashMap();
-      sysProps.put(REG_KEY, registry);
-    }
-    registry.put(BOT_NAME, msgQueue);
-  } catch(_) {}
-})();
-
-new java.lang.Thread(function() {
-  while (!java.lang.Thread.currentThread().isInterrupted()) {
-    var task = null;
-    try { task = msgQueue.take(); } catch(_) { return; }
-    try {
-      if (!(task instanceof java.util.HashMap)) continue;
-      var text = String(task.get("text") || "");
-      if (!isMyCommand(text)) continue;
-      var room = String(task.get("room") || "");
-      var name = String(task.get("name") || "익명");
-      var hash = String(task.get("hash") || "");
-      var msg = {
-        content: text,
-        room: room,
-        author: { name: name, hash: hash },
-        reply: (function(r){ return function(s){ try { bot.send(r, s); } catch(_) {} }; })(room)
-      };
-      handleMessage(msg);
-    } catch(_) {}
-  }
-}, WORKER_NAME).start();
+subscribe(BOT_NAME, WORKER_NAME, function(msg) {
+  // eval 의 실제 핸들러: text 가 내 커맨드(']'프리픽스)일 때만 처리.
+  if (!isMyCommand(msg.content)) return;
+  handleMessage(msg);
+});
 
 
 // ─── 보일러플레이트 ─────────────────────────────────────────────────────────

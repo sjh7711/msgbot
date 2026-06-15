@@ -35,6 +35,17 @@ var notifyTargets = []; // [{ room, packageName }, ...]
 var keepPolling   = false;
 var pollThread    = null;
 
+// 긴 메시지 구분자 (제로폭 공백 500개) — 미리보기 줄바꿈 강제용
+var LONG_MSG_SPACER = "​".repeat(500);
+
+// 인메모리 상태 (init 에서 loadState 로 시드, 폴링/커맨드 스레드가 공유)
+var _seenIds   = null;
+var _httpCache = null;
+
+// sendNotify 오류 로그 중복 억제용
+var _lastErr      = null;
+var _lastErrCount = 0;
+
 // =====================================================================
 // 상태 파일 I/O
 // =====================================================================
@@ -52,14 +63,22 @@ function loadState() {
     } catch (e) { return {}; }
 }
 
+// 동시 쓰기(폴링 스레드 / 커맨드 워커) 충돌 방지를 위해,
+// 저장 직전에 인메모리 권위본(notifyTargets / _seenIds / _httpCache)을 병합한다.
+// data 에 명시된 값이 있으면 우선하고, 없으면 인메모리 값으로 채운다.
 function saveState(data) {
     try {
+        var out = data || {};
+        if (out.notifyTargets == null) out.notifyTargets = notifyTargets;
+        if (out.seenIds == null)       out.seenIds       = (_seenIds   || {});
+        if (out.httpCache == null)     out.httpCache     = (_httpCache || {});
+
         var f = new java.io.File(STATE_PATH);
         var parent = f.getParentFile();
         if (parent && !parent.exists()) parent.mkdirs();
         var fw = new java.io.OutputStreamWriter(
             new java.io.FileOutputStream(f), "UTF-8");
-        fw.write(JSON.stringify(data));
+        fw.write(JSON.stringify(out));
         fw.flush();
         fw.close();
     } catch (e) {}
@@ -88,6 +107,57 @@ function fetchHtml(url) {
         conn.disconnect();
         return String(sb.toString());
     } catch (e) { return null; }
+}
+
+// ETag / Last-Modified 조건부 GET.
+// cacheEntry: { etag, lastMod } (없으면 빈 객체)
+// 반환: { status: 200|304|0, body: String|null, etag: String|null, lastMod: String|null }
+//  - 200: body 와 새 etag/lastMod
+//  - 304: body=null, 캐시값 그대로 반환 (스트림 미독)
+//  - 0  : 실패
+function fetchHtmlConditional(url, cacheEntry) {
+    var ce = cacheEntry || {};
+    try {
+        var conn = new java.net.URL(url).openConnection();
+        conn.setConnectTimeout(15000);
+        conn.setReadTimeout(20000);
+        conn.setRequestProperty("User-Agent",
+            "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36");
+        conn.setRequestProperty("Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+        conn.setRequestProperty("Accept-Language", "ko-KR,ko;q=0.9");
+        if (ce.etag)    conn.setRequestProperty("If-None-Match", ce.etag);
+        if (ce.lastMod) conn.setRequestProperty("If-Modified-Since", ce.lastMod);
+
+        var code = conn.getResponseCode();
+        if (code === 304) {
+            conn.disconnect();
+            return { status: 304, body: null, etag: ce.etag || null, lastMod: ce.lastMod || null };
+        }
+        if (code !== 200) {
+            conn.disconnect();
+            return { status: 0, body: null, etag: null, lastMod: null };
+        }
+
+        var br = new java.io.BufferedReader(
+            new java.io.InputStreamReader(conn.getInputStream(), "UTF-8"));
+        var sb = new java.lang.StringBuilder();
+        var line;
+        while ((line = br.readLine()) !== null) sb.append(line).append("\n");
+        br.close();
+
+        var etag    = conn.getHeaderField("ETag");
+        var lastMod = conn.getHeaderField("Last-Modified");
+        conn.disconnect();
+        return {
+            status: 200,
+            body: String(sb.toString()),
+            etag: (etag != null) ? String(etag) : null,
+            lastMod: (lastMod != null) ? String(lastMod) : null
+        };
+    } catch (e) {
+        return { status: 0, body: null, etag: null, lastMod: null };
+    }
 }
 
 // =====================================================================
@@ -235,12 +305,29 @@ function sendNotify(message, targets) {
             bot.send(targets[i].room, message);
         } catch (e) {
             try {
-                var logPath = Packages.android.os.Environment
-                    .getExternalStorageDirectory().getAbsolutePath()
-                    + "/msgbot/maple_error.log";
-                var fw = new java.io.FileWriter(logPath, true);
-                fw.write(new java.util.Date().toString() + " sendNotify error: " + e + "\n");
-                fw.close();
+                var msg = String(e);
+                // 동일 오류 연속 반복은 억제 (카운트만 증가)
+                if (msg === _lastErr) {
+                    _lastErrCount++;
+                } else {
+                    var logPath = Packages.android.os.Environment
+                        .getExternalStorageDirectory().getAbsolutePath()
+                        + "/msgbot/maple_error.log";
+                    // 하드 사이즈 캡: 256KB 초과 시 로그 비우기
+                    var lf = new java.io.File(logPath);
+                    if (lf.exists() && lf.length() > 262144) {
+                        new java.io.FileWriter(logPath, false).close();
+                    }
+                    var fw = new java.io.FileWriter(logPath, true);
+                    // 직전 오류가 반복됐다면 요약 한 줄 남기기
+                    if (_lastErrCount > 0) {
+                        fw.write("(이전 오류 " + _lastErrCount + "회 반복)\n");
+                    }
+                    _lastErr      = msg;
+                    _lastErrCount = 0;
+                    fw.write(new java.util.Date().toString() + " sendNotify error: " + msg + "\n");
+                    fw.close();
+                }
             } catch (le) {}
         }
     }
@@ -251,16 +338,26 @@ function sendNotify(message, targets) {
 // seenIds 값: { title: "저장된 제목" } 또는 true (구버전 호환)
 // =====================================================================
 function checkAndNotify() {
-    var state    = loadState();
-    var seenIds  = state.seenIds || {};
-    // 스레드에서 전역 notifyTargets 대신 파일에서 로드해 가시성 문제 회피
-    var targets  = state.notifyTargets || [];
+    // 인메모리 권위본 사용 (init 에서 시드됨). loadState 재호출 안 함.
+    if (_seenIds == null)   _seenIds   = {};
+    if (_httpCache == null) _httpCache = {};
+    var seenIds  = _seenIds;
+    var targets  = notifyTargets;   // 커맨드 핸들러가 갱신하는 전역
     var needSave = false;
     var toNotify = [];
 
     for (var t = 0; t < TARGETS.length; t++) {
         var target = TARGETS[t];
-        var html   = fetchHtml(target.url);
+
+        // ETag / Last-Modified 조건부 GET
+        var cacheEntry = _httpCache[target.key] || {};
+        var resp = fetchHtmlConditional(target.url, cacheEntry);
+        if (resp.status === 304) continue;        // 변경 없음 → 파싱/알림 생략
+        if (resp.status !== 200) continue;        // 실패 → 기존 동작대로 건너뜀
+        // 200: 새 etag/lastMod 를 인메모리 캐시에 반영
+        _httpCache[target.key] = { etag: resp.etag, lastMod: resp.lastMod };
+        needSave = true;
+        var html   = resp.body;
         if (!html) continue;
 
         var events = parsePage(html, target);
@@ -299,11 +396,9 @@ function checkAndNotify() {
     }
 
     if (needSave) {
-        // 폴링 스레드가 시작할 때 로드한 state로 덮어쓰면 notifyTargets가 유실되므로
-        // 저장 직전에 다시 로드해서 seenIds만 갱신
-        var latestState = loadState();
-        latestState.seenIds = seenIds;
-        saveState(latestState);
+        // saveState 가 인메모리 권위본(notifyTargets/_seenIds/_httpCache)을
+        // 병합 저장하므로 빈 객체만 넘기면 됨 (동시 쓰기 충돌 방지)
+        saveState({});
     }
 
     if (!targets.length) return;
@@ -356,6 +451,9 @@ function stopPolling() {
 // =====================================================================
 (function init() {
     var state = loadState();
+    // 인메모리 권위본 시드 (이후 loadState 재호출 없이 이 값들을 공유)
+    _seenIds   = state.seenIds   || {};
+    _httpCache = state.httpCache || {};
     if (state.notifyTargets && state.notifyTargets.length) {
         notifyTargets = state.notifyTargets;
         startPolling();
@@ -415,9 +513,9 @@ function handleMessage(msg) {
             return;
         }
         notifyTargets.push({ room: msg.room, packageName: msg.packageName });
-        var state = loadState();
-        state.notifyTargets = notifyTargets;
-        saveState(state);
+        // saveState 가 _seenIds / _httpCache 를 인메모리에서 병합하므로
+        // notifyTargets 만 명시 (폴링 스레드 데이터 유실 방지)
+        saveState({ notifyTargets: notifyTargets });
         if (!keepPolling) startPolling();
         msg.reply("메이플 이벤트/공지 알림 구독 완료!");
         return;
@@ -432,9 +530,8 @@ function handleMessage(msg) {
             msg.reply("이 방은 메이플 알림을 구독하고 있지 않습니다.");
             return;
         }
-        var state = loadState();
-        state.notifyTargets = notifyTargets;
-        saveState(state);
+        // _seenIds / _httpCache 는 saveState 에서 인메모리 병합
+        saveState({ notifyTargets: notifyTargets });
         // 구독 방이 0개가 되면 폴링도 중지
         if (notifyTargets.length === 0) stopPolling();
         msg.reply("메이플 이벤트/공지 알림 구독을 해제했습니다.");
@@ -443,8 +540,7 @@ function handleMessage(msg) {
 
     if (text === "!메알림 상태") {
         var status  = keepPolling ? "실행 중" : "중지됨";
-        var state   = loadState();
-        var seenIds = state.seenIds || {};
+        var seenIds = _seenIds || {};   // 인메모리 권위본
         var evCnt   = 0;
         var ntCnt   = 0;
         for (var k in seenIds) {
@@ -476,7 +572,7 @@ function handleMessage(msg) {
             for (var i = 0; i < limit; i++) {
                 lines.push("\n• " + events[i].title);
                 // 첫 번째 게시물 URL 뒤에 구분자 삽입
-                lines.push("  " + events[i].url + " " + (i === 0 ? "​".repeat(500) : ""));
+                lines.push("  " + events[i].url + " " + (i === 0 ? LONG_MSG_SPACER : ""));
             }
             if (events.length > 10) lines.push("\n... 외 " + (events.length - 10) + "개");
             msg.reply(lines.join("\n"));
@@ -485,9 +581,11 @@ function handleMessage(msg) {
     }
 
     if (text === "!메알림 초기화") {
-        var state = loadState();
-        state.seenIds = {};
-        saveState(state);
+        // 인메모리 권위본 초기화. httpCache 도 비워야 다음 폴링이 304 로
+        // 스킵되지 않고 현재 게시물을 다시 등록한다.
+        _seenIds   = {};
+        _httpCache = {};
+        saveState({ seenIds: {}, httpCache: {} });
         msg.reply(
             "감지 목록을 초기화했습니다.\n" +
             "다음 폴링 시 현재 게시물들을 새 기준으로 등록합니다.\n" +
@@ -504,62 +602,27 @@ function isMyCommand(text) {
     return t.indexOf("!메알림") === 0;
 }
 
-// ─── 메시지 큐 + 워커 스레드 (ChatManager 구독) ─────────────────────────────
-var msgQueue = new java.util.concurrent.LinkedBlockingQueue();
+// ─── 메시지 큐 + 워커 스레드 (ChatManager 구독, 공용 subscriber 모듈) ─────────
+// 명령 워커만 subscriber.js 로 위임. 폴링 스레드(maple-poll)는 startPolling/stopPolling 가
+// 그대로 관리하며 subscriber.js 의 killOldThreads(WORKER_NAME 만 대상)와 무관하다.
 var WORKER_NAME = "MAPLE_BOT_WORKER";
 
-(function killOldThreads() {
+var subscribe = (function() {
+    var libPath = "/sdcard/msgbot/Bots/lib/subscriber.js";
     try {
-        var root = java.lang.Thread.currentThread().getThreadGroup();
-        while (root.getParent() != null) root = root.getParent();
-        var n = root.activeCount() + 32;
-        var arr = java.lang.reflect.Array.newInstance(java.lang.Thread, n);
-        var got = root.enumerate(arr, true);
-        for (var i = 0; i < got; i++) {
-            var t = arr[i];
-            if (!t) continue;
-            if (String(t.getName() || "") === WORKER_NAME) {
-                try { t.interrupt(); } catch(_) {}
-            }
+        if (typeof bot.getRootPath === "function") {
+            libPath = bot.getRootPath() + "/../lib/subscriber.js";
         }
     } catch(_) {}
+    return require(libPath);
 })();
 
-(function registerWithChatManager() {
-    try {
-        var sysProps = java.lang.System.getProperties();
-        var REG_KEY = "__CHATMANAGER_REGISTRY__";
-        var registry = sysProps.get(REG_KEY);
-        if (registry == null) {
-            registry = new java.util.concurrent.ConcurrentHashMap();
-            sysProps.put(REG_KEY, registry);
-        }
-        registry.put(BOT_NAME, msgQueue);
-    } catch(_) {}
-})();
-
-new java.lang.Thread(function() {
-    while (!java.lang.Thread.currentThread().isInterrupted()) {
-        var task = null;
-        try { task = msgQueue.take(); } catch(_) { return; }
-        try {
-            if (!(task instanceof java.util.HashMap)) continue;
-            var text = String(task.get("text") || "");
-            if (!isMyCommand(text)) continue;
-            var room = String(task.get("room") || "");
-            var name = String(task.get("name") || "익명");
-            var hash = String(task.get("hash") || "");
-            var msg = {
-                content: text,
-                room: room,
-                packageName: "com.kakao.talk",  // ChatManager 경유는 항상 카카오톡
-                author: { name: name, hash: hash },
-                reply: (function(r){ return function(s){ try { bot.send(r, s); } catch(_) {} }; })(room)
-            };
-            handleMessage(msg);
-        } catch(_) {}
-    }
-}, WORKER_NAME).start();
+subscribe(BOT_NAME, WORKER_NAME, function(msg) {
+    if (!isMyCommand(String(msg.content || ""))) return;
+    // ChatManager 경유는 항상 카카오톡. handleMessage 의 notifyTargets 등록/중복검사가 packageName 을 쓰므로 보존.
+    msg.packageName = "com.kakao.talk";
+    handleMessage(msg);
+});
 
 
 function onMessage(rawMsg) {}  // 메시지는 ChatManager 큐로 들어옴

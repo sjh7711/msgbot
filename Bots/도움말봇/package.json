@@ -1,0 +1,8 @@
+{
+  "name": "도움말봇",
+  "version": "1.0.0",
+  "description": "MessengerBot script: 명령어 설명 중앙 관리 + !검색 + 유사 명령 자동 제안 (ChatManager 구독)",
+  "main": "도움말봇.js",
+  "type": "commonjs",
+  "dependencies": {}
+}
