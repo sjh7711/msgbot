@@ -113,7 +113,7 @@ var REGISTRY = [
       { display: "!메알림",          triggers: ["!메알림"],        desc: "메이플 이벤트/공지 알림봇 도움말", admin: false },
       { display: "!메알림 시작",      triggers: ["!메알림 시작"],   desc: "현재 방에 이벤트/공지 알림 구독 등록", admin: false },
       { display: "!메알림 중지",      triggers: ["!메알림 중지"],   desc: "현재 방의 알림 구독 해제", admin: false },
-      { display: "!메알림 상태",      triggers: ["!메알림 상태"],   desc: "폴링 상태·구독 방 목록 확인", admin: false },
+      { display: "!메알림 상태",      triggers: ["!메알림 상태"],   desc: "폴링 상태·구독 방 목록 확인", admin: true },
       { display: "!메알림 확인",      triggers: ["!메알림 확인"],   desc: "현재 이벤트/공지 목록 (최신 10개)", admin: false },
       { display: "!메알림 초기화",    triggers: ["!메알림 초기화"], desc: "감지 목록 초기화 후 재등록", admin: true },
       { display: "!메알림 디버그 이벤트/공지", triggers: ["!메알림 디버그"], desc: "페이지 링크 샘플 출력 (디버그용)", admin: true }
@@ -429,10 +429,10 @@ function handleHelp(msg) {
 
 // ─── ChatManager 구독 (공용 모듈) ────────────────────────────────────────────
 var subscribe = (function() {
-  var libPath = "/sdcard/msgbot/Bots/lib/subscriber.js";
+  var libPath = "/sdcard/msgbot/lib/subscriber.js";
   try {
     if (typeof bot.getRootPath === "function") {
-      libPath = bot.getRootPath() + "/../lib/subscriber.js";
+      libPath = bot.getRootPath() + "/../../lib/subscriber.js";
     }
   } catch(_) {}
   return require(libPath);

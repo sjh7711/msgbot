@@ -35,10 +35,10 @@ function handleMessage(msg) {
 var WORKER_NAME = "EVAL_BOT_WORKER";
 
 var subscribe = (function() {
-  var libPath = "/sdcard/msgbot/Bots/lib/subscriber.js";
+  var libPath = "/sdcard/msgbot/lib/subscriber.js";
   try {
     if (typeof bot.getRootPath === "function") {
-      libPath = bot.getRootPath() + "/../lib/subscriber.js";
+      libPath = bot.getRootPath() + "/../../lib/subscriber.js";
     }
   } catch(_) {}
   return require(libPath);

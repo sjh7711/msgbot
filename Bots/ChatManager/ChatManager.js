@@ -129,69 +129,26 @@ var _lastDecomposeId = 0;   // 마지막으로 처리한 !해체 명령 행의 _
 
 // ── 쉘 실행 헬퍼 ────────────────────────────────────────────────────
 // useSu=true면 su 권한으로 실행. 영구 su 셸 재사용 (Magisk 프롬프트는 첫 호출만).
-var _suShell = null;
-var _suLock = new java.util.concurrent.locks.ReentrantLock();
-
-function _openSuShell() {
+var _suMod = null;
+try { _suMod = require(Packages.android.os.Environment.getExternalStorageDirectory().getAbsolutePath() + "/msgbot/lib/su-shell.js"); } catch(_) {}
+var _treg = null;
+try { _treg = require(Packages.android.os.Environment.getExternalStorageDirectory().getAbsolutePath() + "/msgbot/lib/thread-registry.js"); } catch(_) {}
+function _suOneShot(command) {
+  var proc = null;
   try {
-    var list = new java.util.ArrayList();
-    list.add("su");
-    var pb = new java.lang.ProcessBuilder(list);
-    pb.redirectErrorStream(true);
-    var proc = pb.start();
-    var sh = {
-      proc: proc,
-      stdin: new java.io.BufferedWriter(
-        new java.io.OutputStreamWriter(proc.getOutputStream(), "UTF-8")),
-      stdout: new java.io.BufferedReader(
-        new java.io.InputStreamReader(proc.getInputStream(), "UTF-8"))
-    };
-    var ready = "__SUREADY_" + Math.floor(Math.random() * 0x7FFFFFFF) + "__";
-    sh.stdin.write("export PS1='' PS2=''\n");
-    sh.stdin.write("echo " + ready + "\n");
-    sh.stdin.flush();
-    var line;
-    while ((line = sh.stdout.readLine()) !== null) {
-      if (String(line).indexOf(ready) !== -1) break;
-    }
-    return sh;
-  } catch(e) {
-    return null;
-  }
+    var l = new java.util.ArrayList(); l.add("su"); l.add("-c"); l.add(command);
+    var pb = new java.lang.ProcessBuilder(l); pb.redirectErrorStream(true);
+    proc = pb.start();
+    var rd = new java.io.BufferedReader(new java.io.InputStreamReader(proc.getInputStream(), "UTF-8"));
+    var sb = new java.lang.StringBuilder(); var ln;
+    while ((ln = rd.readLine()) !== null) sb.append(ln).append("\n");
+    rd.close(); proc.waitFor();
+    return String(sb.toString());
+  } catch(e) { return "ERR: " + (e && e.message ? e.message : e); }
+  finally { try { if (proc) proc.destroy(); } catch(_) {} }
 }
-
-function _suExec(command) {
-  _suLock.lock();
-  try {
-    if (_suShell) {
-      try { if (!_suShell.proc.isAlive()) _suShell = null; } catch(_) { _suShell = null; }
-    }
-    if (!_suShell) _suShell = _openSuShell();
-    if (!_suShell) return "ERR: su shell open 실패";
-
-    var sentinel = "__SUEND_" + Math.floor(Math.random() * 0x7FFFFFFF) + "_" + Date.now() + "__";
-    try {
-      _suShell.stdin.write(command + "\n");
-      _suShell.stdin.write("echo " + sentinel + "\n");
-      _suShell.stdin.flush();
-
-      var sb = new java.lang.StringBuilder();
-      var line;
-      while ((line = _suShell.stdout.readLine()) !== null) {
-        var s = String(line);
-        if (s.indexOf(sentinel) !== -1) break;
-        sb.append(s).append("\n");
-      }
-      return String(sb.toString());
-    } catch(e) {
-      try { _suShell.proc.destroy(); } catch(_) {}
-      _suShell = null;
-      return "ERR: " + (e && e.message ? e.message : e);
-    }
-  } finally {
-    _suLock.unlock();
-  }
-}
+// useSu=true 면 공유 su 셸 모듈로 위임(없으면 1회성 su 폴백).
+function _suExec(command) { return _suMod ? _suMod.exec(command) : _suOneShot(command); }
 
 function _shell(command, useSu) {
   if (useSu) return _suExec(command);
@@ -544,7 +501,7 @@ var POLL_MAX_MS  = 500;   // 유휴 시 최대 폴링 간격 (유휴 후 첫 메
 var POLL_BACKOFF = 2;    // 빈 폴링마다 간격 ×2 (MAX 까지 단계적 증가)
 
 if (initKakaoDB()) {
-  new java.lang.Thread(function() {
+  var _poller = new java.lang.Thread(function() {
     var interval = POLL_MIN_MS;
     while (!java.lang.Thread.currentThread().isInterrupted()) {
       var got = 0;
@@ -553,7 +510,9 @@ if (initKakaoDB()) {
       else interval = Math.min(POLL_MAX_MS, Math.floor(interval * POLL_BACKOFF)); // 유휴 → 점진 백오프
       try { java.lang.Thread.sleep(interval); } catch(_) { return; }
     }
-  }, POLLER_NAME).start();
+  }, POLLER_NAME);
+  try { _treg.registerThread(POLLER_NAME, "ChatManager", _poller); } catch(_) {}
+  _poller.start();
 }
 
 // ── 봇 제어 명령 (!onoff / !compile / !상태) ────────────────
@@ -565,18 +524,39 @@ if (initKakaoDB()) {
 var _botCtlPending = {};            // key(room|author) -> { action, names, ts }
 var BOT_CTL_TTL_MS = 60 * 1000;     // 번호 선택 대기 만료 (1분)
 
-// ChatManager 자신을 제외한 다른 봇 이름 목록
+// ChatManager 자신을 제외한 다른 봇 이름 목록.
+// Bots/ 폴더를 직접 열거한다 — BotManager.getBotNames()/getBotList() 는 "로드된 봇 인스턴스"만
+// 반환해서 OFF(언로드)된 봇이 빠지기 때문(그러면 끈 봇을 다시 켤 수가 없음). 폴더가 곧 봇 목록.
 function _otherBotNames() {
   var out = [];
+  var self = String(bot.getName());
   try {
-    var names = BotManager.getBotNames();
-    var self = String(bot.getName());
-    for (var i = 0; i < names.length; i++) {
-      var nm = String(names[i]);
-      if (nm === self) continue;   // 매니저 자신은 제어 대상에서 제외
-      out.push(nm);
+    var botsDir = new java.io.File(bot.getRootPath()).getParentFile();   // /sdcard/msgbot/Bots
+    var entries = botsDir.listFiles();
+    if (entries) {
+      for (var i = 0; i < entries.length; i++) {
+        var f = entries[i];
+        if (!f.isDirectory()) continue;
+        var nm = String(f.getName());
+        if (nm === self) continue;                                       // 매니저 자신 제외
+        if (!(new java.io.File(f, "bot.json")).exists()) continue;       // 봇 아닌 폴더 제외
+        out.push(nm);
+      }
+      out.sort();
     }
   } catch(_) {}
+  // 폴더 열거 실패 시 폴백: getBotNames (로드된 봇만)
+  if (!out.length) {
+    try {
+      var names = BotManager.getBotNames();
+      for (var j = 0; j < names.length; j++) {
+        if (names[j] == null) continue;
+        var n2 = String(names[j]);
+        if (!n2 || n2 === "null" || n2 === self) continue;
+        out.push(n2);
+      }
+    } catch(_) {}
+  }
   return out;
 }
 
@@ -593,6 +573,8 @@ function _botListText(action) {
 function _applyOnOff(name) {
   try {
     var next = !BotManager.getPower(name);
+    // 켤 때: OFF(언로드)였던 봇은 미컴파일일 수 있으므로 먼저 prepare (이미 컴파일됐으면 무동작)
+    if (next) { try { BotManager.prepare(name, false); } catch(_) {} }
     BotManager.setPower(name, next);
     return name + " : " + (next ? "🟢 ON" : "🔴 OFF");
   } catch(e) {
@@ -647,6 +629,43 @@ function _parseSelection(text, count) {
   return { indices: indices, invalid: invalid };
 }
 
+// ── 스레드/프로세스 관리 (thread-registry) ──────────────────────────
+function _fmtAge(ms) {
+  var s = Math.floor((ms || 0) / 1000);
+  if (s < 60) return s + "s";
+  var m = Math.floor(s / 60); if (m < 60) return m + "m";
+  var h = Math.floor(m / 60); if (h < 24) return h + "h";
+  return Math.floor(h / 24) + "d";
+}
+function _threadListText() {
+  var rows = _treg.list();
+  var lines = ["[스레드/프로세스] 등록 " + rows.length + "개"];
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    lines.push("#" + r.id + " " + r.name + " [" + r.kind + "] " + (r.alive ? "🟢" : "🔴") +
+               " · " + _fmtAge(r.ageMs) + " · " + r.bot);
+  }
+  try {
+    var en = _treg.enumerateThreads();
+    var unreg = 0; for (var j = 0; j < en.length; j++) if (!en[j].registered) unreg++;
+    lines.push("— JVM 스레드 " + en.length + "개 (미등록 " + unreg + ")");
+  } catch(_) {}
+  lines.push("종료: !스레드킬 <#번호 또는 이름>");
+  return lines.join("\n");
+}
+function _threadKill(arg) {
+  if (!arg) return "사용법: !스레드킬 <#번호 또는 이름>";
+  var id = String(arg).replace(/^#/, "");
+  if (/^\d+$/.test(id)) {
+    var r = _treg.kill(id);
+    if (!r.ok && r.error) return "#" + id + " : 없음";
+    return "#" + id + " " + r.name + " [" + r.kind + "] → " +
+           (r.ok ? ((r.kind === "process" ? "destroy" : "interrupt") + " ✅") : "실패");
+  }
+  var killed = _treg.killByName(arg);
+  return killed.length ? ("'" + arg + "' " + killed.length + "개 종료 ✅") : ("'" + arg + "' 일치 없음");
+}
+
 // 명령을 처리했으면 true 반환 (이후 룸 학습 로직 건너뜀)
 function handleBotControlCommand(rawMsg) {
   var text, room, key;
@@ -662,6 +681,21 @@ function handleBotControlCommand(rawMsg) {
   // 상태 조회
   if (text === "!상태") {
     try { rawMsg.reply(_statusText()); } catch(_) {}
+    return true;
+  }
+
+  // 스레드/프로세스 관리
+  if (text === "!스레드" || text === "!스레드목록") {
+    try { rawMsg.reply(_threadListText()); } catch(_) {}
+    return true;
+  }
+  if (text.indexOf("!스레드킬 ") === 0) {
+    var _tkArg = text.substring(text.indexOf(" ") + 1).trim();
+    try { rawMsg.reply(_threadKill(_tkArg)); } catch(_) {}
+    return true;
+  }
+  if (text === "!스레드정리") {
+    try { rawMsg.reply("죽은 항목 " + _treg.sweep() + "개 정리"); } catch(e) { try { rawMsg.reply("정리 오류: " + e); } catch(_) {} }
     return true;
   }
 

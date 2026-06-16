@@ -79,10 +79,18 @@ var _gameOpenSeq = 0;        // openedAt 단조 증가 카운터
 var USERHASH_DB_PATH = Packages.android.os.Environment
     .getExternalStorageDirectory().getAbsolutePath() + "/msgbot/userhash.db";
 
-// 닉네임이 등장한 방(room) 목록을 userhash.db 에서 조회 (읽기전용, 실패 시 [])
+// 닉네임이 등장한 방(room) 목록: 공유 캐시(신뢰) 우선, 미스 시 userhash.db 폴백
 // schema: userhash(hash TEXT PRIMARY KEY, name, room, first_seen, last_seen)
 function roomsForNickname(name) {
-    var db = null; var cur = null; var out = [];
+    var out = [];
+    // 1) 공유 캐시(직접복호화로 채워진 신뢰값, room 포함) 우선
+    try {
+        var hits = kt.findUserIdsByName(name, false);
+        for (var hi = 0; hi < hits.length; hi++) { if (hits[hi].room) out.push(hits[hi].room); }
+    } catch(_) {}
+    if (out.length) return out;
+    // 2) 폴백: userhash.db (평문 name 인덱스)
+    var db = null; var cur = null;
     try {
         db = Packages.android.database.sqlite.SQLiteDatabase.openDatabase(
             USERHASH_DB_PATH, null,
@@ -94,7 +102,7 @@ function roomsForNickname(name) {
             if (r != null) out.push(String(r));
         }
     } catch(e) {
-        return [];
+        return out;
     } finally {
         try { if (cur) cur.close(); } catch(_) {}
         try { if (db) db.close(); } catch(_) {}
@@ -402,174 +410,21 @@ function resetGame(chanId) {
 // ═══════════════════════════════════════════════════════════════════════════
 // 오늘의 단어 맞히기 집계 (!오늘단어)
 //
-// KakaoTalk.db 의 미니게임 결과 카드(type=71, "오늘의 단어 맞히기 성공/실패!")를
-// 오늘자 + 현재 방 기준으로 모아 참가자별 시도횟수/성공여부/연승을 정리해 보여준다.
-// 이 봇은 ChatManager 큐만 구독하므로 DB 접근/복호화 인프라를 여기 직접 포팅했다
-// (ChatManager 의 _deriveKey/_decrypt/_sql 과 동일 알고리즘, su -c 1회성 실행).
-// ═══════════════════════════════════════════════════════════════════════════
-var KT_DB1_PATH = "/data/data/com.kakao.talk/databases/KakaoTalk.db";
-var KT_DB2_PATH = "/data/data/com.kakao.talk/databases/KakaoTalk2.db";
-
-// ── AES 복호화 (ChatManager 포팅) ──
-function _kt_toJavaByteArr(arr) {
-  var B = java.lang.reflect.Array.newInstance(java.lang.Byte.TYPE, arr.length);
-  for (var i = 0; i < arr.length; i++) { var v = arr[i] & 0xFF; if (v > 127) v -= 256; B[i] = v; }
-  return B;
-}
-function _kt_initArray(size, fill) { var a = new Array(size); for (var i = 0; i < size; i++) a[i] = fill; return a; }
-function _kt_arraycopy(src, sp, dst, dp, len) { for (var i = 0; i < len; i++) dst[dp + i] = src[sp + i]; }
-function _kt_genSalt(userId, encType) {
-  if (userId <= 0) return '\0'.repeat(16);
-  var prefixes = ['','','12','24','18','30','36','12','48','7','35','40','17','23','29',
-    'isabel','kale','sulli','van','merry','kyle','james','maddux','tony','hayden',
-    'paul','elijah','dorothy','sally','bran','extr.ursra','veil'];
-  var salt = (prefixes[encType] + userId).slice(0, 16);
-  salt = salt + '\0'.repeat(16 - salt.length);
-  return new java.lang.String(salt).getBytes("UTF-8").slice();
-}
-function _kt_adjust(a, aOff, b) {
-  var x = (b[b.length-1] & 0xff) + (a[aOff + b.length-1] & 0xff) + 1;
-  a[aOff + b.length-1] = x % 256; x = x >> 8;
-  for (var i = b.length-2; i >= 0; i--) { x = x + (b[i] & 0xff) + (a[aOff + i] & 0xff); a[aOff + i] = x % 256; x = x >> 8; }
-}
-function _kt_deriveKey(userId, encType) {
-  var salt = _kt_genSalt(userId, encType);
-  var password = [0,22,0,8,0,9,0,111,0,2,0,23,0,43,0,8,0,33,0,33,0,10,0,16,0,3,0,3,0,7,0,6,0,0];
-  var iterations = 2, dkeySize = 32, v = 64, u = 20;
-  var D = _kt_initArray(v, 1);
-  var S = _kt_initArray(v * Math.floor((salt.length + v - 1) / v), 0);
-  for (var i in S) S[i] = salt[i % salt.length];
-  var P = _kt_initArray(v * Math.floor((password.length + v - 1) / v), 0);
-  for (var i in P) P[i] = password[i % password.length];
-  var I = S.concat(P);
-  var B = _kt_initArray(v, 0);
-  var c = Math.floor((dkeySize + u - 1) / u);
-  var dKey = _kt_initArray(dkeySize, 0);
-  for (var i = 1; i <= c; i++) {
-    var h = java.security.MessageDigest.getInstance("SHA-1");
-    h.update(_kt_toJavaByteArr(D)); h.update(_kt_toJavaByteArr(I));
-    var A = h.digest();
-    for (var j = 1; j < iterations; j++) { h = java.security.MessageDigest.getInstance("SHA-1"); h.update(A); A = h.digest(); }
-    for (var j = 0; j != B.length; j++) B[j] = A[j % A.length];
-    for (var j = 0; j != I.length / v; j++) _kt_adjust(I, j * v, B);
-    if (i == c) _kt_arraycopy(A, 0, dKey, (i-1)*u, dKey.length - ((i-1)*u));
-    else        _kt_arraycopy(A, 0, dKey, (i-1)*u, A.length);
-  }
-  return dKey;
-}
-function _kt_b64AESDecrypt(key, iv, encrypted) {
-  encrypted = Packages.android.util.Base64.decode(encrypted, 0);
-  iv = new Packages.javax.crypto.spec.IvParameterSpec(iv);
-  key = new Packages.javax.crypto.spec.SecretKeySpec(key, "AES");
-  var cipher = Packages.javax.crypto.Cipher.getInstance("AES/CBC/PKCS5PADDING");
-  cipher.init(2, key, iv);
-  return cipher.doFinal(encrypted);
-}
-function _kt_decrypt(key, b64) {
+// KakaoTalk.db 의 미니게임 결과 카드(type=71)를 오늘자 + 현재 방 기준으로 모아
+// 참가자별 시도횟수/성공여부/연승을 정리해 보여준다. user_id→닉네임 복호화 +
+// su/sqlite3 인프라는 lib/kakao-decrypt.js 로 분리했다
+// (영구 su 셸 재사용 → su 스폰 비용 제거, sqlite3 -readonly, 이름 TTL 캐시).
+// ════════════════════════════════════════════════════════════════
+var kt = (function() {
+  var libPath = "/sdcard/msgbot/lib/kakao-decrypt.js";
   try {
-    var iv = [15,8,1,0,25,71,37,220,21,245,23,224,225,21,12,53];
-    var dec = _kt_b64AESDecrypt(_kt_toJavaByteArr(key), _kt_toJavaByteArr(iv), b64);
-    return String(new java.lang.String(dec, "utf-8"));
-  } catch(_) { return b64; }
-}
-var _kt_keyCache = {};
-function _kt_keyFor(uid, enc) {
-  var k = uid + "_" + enc; var v = _kt_keyCache[k];
-  if (!v) { v = _kt_deriveKey(uid, enc); _kt_keyCache[k] = v; }
-  return v;
-}
-
-// ── su + sqlite3 (su -c 1회성 실행 → -line 파싱하여 객체 배열 반환) ──
-function _kt_suRun(cmd) {
-  var proc = null;
-  try {
-    var list = new java.util.ArrayList(); list.add("su"); list.add("-c"); list.add(cmd);
-    var pb = new java.lang.ProcessBuilder(list); pb.redirectErrorStream(true);
-    proc = pb.start();
-    var rd = new java.io.BufferedReader(new java.io.InputStreamReader(proc.getInputStream(), "UTF-8"));
-    var sb = new java.lang.StringBuilder(); var ln;
-    while ((ln = rd.readLine()) !== null) sb.append(ln).append("\n");
-    rd.close(); proc.waitFor();
-    return String(sb.toString());
-  } catch(e) { return "ERR: " + (e && e.message ? e.message : e); }
-  finally { try { if (proc) proc.destroy(); } catch(_) {} }
-}
-function _kt_runSqlite(dbPath, sql) {
-  // SQL 을 한 줄로 만든 뒤 작은따옴표로 감싼다. 셸 작은따옴표 안에서는
-  // $ ` \ 가 모두 리터럴이므로 무력화된다. 내부의 ' 만 '\'' 기법으로 탈출.
-  var sqlOneLine = String(sql).replace(/\r?\n/g, ' ').replace(/'/g, "'\\''");
-  var cmd = "sqlite3 -batch -line '" + dbPath + "' '" + sqlOneLine + "'";
-  var out = String(_kt_suRun(cmd) || "");
-  if (out.indexOf("Error:") !== -1 || out.indexOf("rror near") !== -1) return null;
-  var rowsObj = [], cur = null, lastKey = null;
-  var lines = out.split("\n");
-  for (var i = 0; i < lines.length; i++) {
-    var l = lines[i];
-    if (!l || !l.replace(/\s+/g, "").length) { if (cur) { rowsObj.push(cur); cur = null; lastKey = null; } continue; }
-    var eq = l.indexOf(" = ");
-    if (eq < 0) { if (cur && lastKey != null) cur[lastKey] += "\n" + l; continue; }
-    var k = l.slice(0, eq).replace(/^\s+/, ""); var val = l.slice(eq + 3);
-    if (!cur) cur = {}; cur[k] = val; lastKey = k;
-  }
-  if (cur) rowsObj.push(cur);
-  return rowsObj;
-}
-
-// ── 사용자 이름 (open_chat_member nickname 복호화, 일괄 조회) ──
-var _kt_myKeys = {}, _kt_friendsTable = null, _kt_friendsId = "id", _kt_friendsName = "name";
-function _kt_initNames() {
-  try {
-    var rows = _kt_runSqlite(KT_DB2_PATH, "SELECT user_id FROM open_profile LIMIT 1;");
-    if (rows && rows.length) {
-      var myid = rows[0].user_id;
-      for (var i = 1; i <= 31; i++) _kt_myKeys[String(i)] = _kt_deriveKey(myid, i);
-    }
-    var cands = [["open_chat_member","user_id","nickname"],["friends_v2","id","name"],["friends","id","name"]];
-    for (var ci = 0; ci < cands.length; ci++) {
-      var c = cands[ci];
-      var p = _kt_runSqlite(KT_DB2_PATH, "SELECT COUNT(*) AS n FROM " + c[0] + " LIMIT 1;");
-      if (p && p.length) { _kt_friendsTable = c[0]; _kt_friendsId = c[1]; _kt_friendsName = c[2]; break; }
+    if (typeof bot.getRootPath === "function") {
+      libPath = bot.getRootPath() + "/../../lib/kakao-decrypt.js";
     }
   } catch(_) {}
-}
-function _kt_getUserNames(uids) {
-  var res = {};
-  if (!uids.length) return res;
-  // SQL IN(...) 에는 순수 숫자 uid 만 사용 (비숫자는 제거 → SQL 인젝션 방지)
-  var safeUids = [];
-  for (var gi = 0; gi < uids.length; gi++) {
-    if (/^\d+$/.test(String(uids[gi]))) safeUids.push(String(uids[gi]));
-  }
-  if (_kt_friendsTable && safeUids.length) {
-    try {
-      var sql = "SELECT " + _kt_friendsId + " AS uid, " + _kt_friendsName + " AS nm, enc FROM " +
-                _kt_friendsTable + " WHERE " + _kt_friendsId + " IN (" + safeUids.join(",") + ");";
-      var rows = _kt_runSqlite(KT_DB2_PATH, sql);
-      if (rows) {
-        for (var i = 0; i < rows.length; i++) {
-          var uid = rows[i].uid, encName = rows[i].nm, key = _kt_myKeys[String(rows[i].enc)];
-          var nm = key ? _kt_decrypt(key, encName) : null;
-          if (nm && nm !== encName) res[uid] = nm;
-        }
-      }
-    } catch(_) {}
-  }
-  for (var i = 0; i < uids.length; i++) if (!res[uids[i]]) res[uids[i]] = "user_" + uids[i];
-  return res;
-}
+  return require(libPath);
+})();
 
-// ── 초기화 (lazy: root 확인 + 이름 테이블 준비) ──
-var _kt_ready = null;
-function _kt_ensureInit() {
-  if (_kt_ready !== null) return _kt_ready;
-  try {
-    var who = String(_kt_suRun("whoami") || "").trim();
-    if (who.indexOf("root") === -1) { _kt_ready = false; return false; }
-    _kt_initNames();
-    _kt_ready = true;
-  } catch(_) { _kt_ready = false; }
-  return _kt_ready;
-}
 
 // ── 미니게임 카드 파싱 ──
 // 한 줄이 워들 칸 이모지(🟥🟦🟧🟨🟩🟪🟫⬛⬜)만으로 이뤄졌으면 grid 줄(=추리 1회)
@@ -582,7 +437,9 @@ function _wg_parse(attStr) {
   var P = {}, C = {};
   try { var o = JSON.parse(attStr); P = o.P || {}; C = o.C || {}; } catch(_) { return null; }
   var me = String(P.ME || "");
-  if (me.indexOf("단어 맞히기") === -1) return null;
+  // 단어맞히기 게임 카드 식별: attachment 에 word-guessing 식별자가 있으면
+  // "성공!"/"실패!"/"🎉 N번째 정답자입니다!" 카드 모두 포함 (ME 문구에 의존 안 함)
+  if (String(attStr).indexOf("word-guessing") === -1) return null;
   var D = "";
   try { D = String(C.TI.TD.D || ""); } catch(_) {}
   var lines = D.split("\n");
@@ -594,7 +451,8 @@ function _wg_parse(attStr) {
     var sm = t.match(/연승\s*[:：]?\s*(\d+)/); if (sm) streak = parseInt(sm[1], 10);
     if (!date) { var dm = t.match(/(\d{4}\s*년.*?일)/); if (dm) date = dm[1]; }
   }
-  return { success: me.indexOf("성공") !== -1, attempts: attempts, streak: streak, date: date };
+  // "실패!" 카드만 실패. "성공!"·"🎉 N번째 정답자입니다!"(1~1000)는 정답을 맞힌 것이므로 성공
+  return { success: me.indexOf("실패") === -1, attempts: attempts, streak: streak, date: date };
 }
 // 오늘 0시(로컬) epoch 초 (created_at 은 초 단위)
 function _wg_todayStart() {
@@ -605,12 +463,12 @@ function _wg_todayStart() {
 }
 // ── !오늘단어 핸들러 ──
 function handleTodayWord(msg) {
-  if (!_kt_ensureInit()) { msg.reply("⚠️ KakaoTalk DB 접근 불가 (root/sqlite3 확인)"); return; }
+  if (!kt.isReady()) { msg.reply("⚠️ KakaoTalk DB 접근 불가 (root/sqlite3 확인)"); return; }
   // broadcast 가 전달한 channelId(=chat_id)를 그대로 사용 → 현재 방으로 한정 (DB 역추적 불필요)
   var chatId = String(msg.channelId != null ? msg.channelId : "").replace(/[^0-9]/g, "");
   if (!chatId) { msg.reply("방 정보를 확인할 수 없습니다."); return; }
   var where = "type = 71 AND created_at >= " + _wg_todayStart() + " AND chat_id = " + chatId;
-  var rows = _kt_runSqlite(KT_DB1_PATH,
+  var rows = kt.runSqlite(kt.DB1_PATH,
     "SELECT user_id, message, attachment, v FROM chat_logs WHERE " + where + " ORDER BY created_at ASC;");
   if (rows == null) { msg.reply("⚠️ 조회 실패 (sqlite3 오류)"); return; }
 
@@ -619,9 +477,9 @@ function handleTodayWord(msg) {
     var r = rows[i], enc = null;
     try { enc = (JSON.parse(r.v || "{}")).enc; } catch(_) {}
     if (enc == null || !r.user_id) continue;
-    var key = _kt_keyFor(r.user_id, enc);
-    if (String(r.message ? _kt_decrypt(key, r.message) : "").indexOf("단어 맞히기") === -1) continue;
-    var p = _wg_parse(r.attachment ? String(_kt_decrypt(key, r.attachment) || "") : "");
+    var key = kt.keyFor(r.user_id, enc);
+    // 단어맞히기 카드 인식은 _wg_parse(attachment 의 word-guessing) 가 담당 → message 사전필터 불필요
+    var p = _wg_parse(r.attachment ? String(kt.decrypt(key, r.attachment) || "") : "");
     if (!p) continue;
     if (!dateHeader && p.date) dateHeader = p.date;
     // 같은 사람이 2번 이상 올려도(재공유/포워딩 등) 최초 1건(정식 자동게시)만 집계
@@ -632,7 +490,7 @@ function handleTodayWord(msg) {
   var uids = [];
   for (var k in byUid) uids.push(k);
   if (!uids.length) { msg.reply("오늘 참가한 '단어 맞히기' 기록이 없습니다."); return; }
-  var names = _kt_getUserNames(uids);
+  var names = kt.getUserNames(uids);
 
   var list = [];
   for (var k in byUid) { byUid[k].name = names[k] || ("user_" + k); list.push(byUid[k]); }
@@ -697,7 +555,7 @@ function handleMessage(msg) {
             }
             g.awaitingWord = true;
             g.room         = room;                 // 그룹방 NAME (bot.send 대상)
-            g.setterName   = msg.author ? msg.author.name : null;
+            g.setterName   = (function(){ try { return kt.resolveSender(msg).name; } catch(_) { return msg.author ? msg.author.name : null; } })();
             g.openedAt     = ++_gameOpenSeq;
             // 30초 내 !출제(또는 !랜덤)로 단어가 설정되지 않으면 대기 상태를 조용히 해제.
             // (다른 사람이 다시 출제할 수 있도록. openedAt 토큰으로 그 사이 새로 연 퀴즈는 건드리지 않음.)
@@ -731,9 +589,9 @@ function handleMessage(msg) {
         // ── !출제 [단어] ─────────────────────────────────────────────────────
         // 개인톡(DM)에서 입력하여 단어를 비공개로 출제.
         // DM 방의 channelId 는 그룹방과 다르고, 사람도 방마다 user_id(hash)가 다르므로
-        // 닉네임(msg.author.name)으로 대기중인 그룹방을 찾아 라우팅한다.
+        // 닉네임(직접복호화)으로 대기중인 그룹방을 찾아 라우팅한다.
         if (text.indexOf('!출제 ') === 0 || text.indexOf('!퀴즈출제 ') === 0 || text.indexOf('!단어출제 ') === 0) {
-            var setterN = msg.author ? msg.author.name : null;
+            var setterN = (function(){ try { return kt.resolveSender(msg).name; } catch(_) { return msg.author ? msg.author.name : null; } })();
 
             // 1. !퀴즈 로 출제 대기중인 방 수집
             var waiting = [];
@@ -928,10 +786,10 @@ function handleMessage(msg) {
 var WORKER_NAME = "WORD_QUIZ_BOT_WORKER";
 
 var subscribe = (function() {
-  var libPath = "/sdcard/msgbot/Bots/lib/subscriber.js";
+  var libPath = "/sdcard/msgbot/lib/subscriber.js";
   try {
     if (typeof bot.getRootPath === "function") {
-      libPath = bot.getRootPath() + "/../lib/subscriber.js";
+      libPath = bot.getRootPath() + "/../../lib/subscriber.js";
     }
   } catch(_) {}
   return require(libPath);

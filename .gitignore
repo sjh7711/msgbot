@@ -17,12 +17,14 @@ node_modules/
 *.log
 GLOBAL_LOG.json
 
+# ===== Backup files =====
+*.bak
+
 # ===== Per-bot runtime data =====
 # DebugRoom message dumps / data written at runtime
 DebugRoom/
 **/message/
 **/log.json
-**/log.json.bak
 
 # ===== Runtime state / history =====
 zqt_history/

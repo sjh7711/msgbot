@@ -240,6 +240,17 @@ function isGeminiCommand(text) {
   return text.indexOf("!제미니") === 0 || text.indexOf("!ㅈㅁㄴ") === 0;
 }
 
+// 닉네임 직접복호화 공유 모듈 (msg.author.name 신뢰 안 함)
+var kt = (function() {
+  var libPath = "/sdcard/msgbot/lib/kakao-decrypt.js";
+  try {
+    if (typeof bot.getRootPath === "function") {
+      libPath = bot.getRootPath() + "/../../lib/kakao-decrypt.js";
+    }
+  } catch(_) {}
+  return require(libPath);
+})();
+
 function handleMessage(msg) {
   try {
     var text = String(msg.content || "").trim();
@@ -255,12 +266,14 @@ function handleMessage(msg) {
     }
 
     var room = msg.room;
+    var who = (function(){ try { return kt.resolveSender(msg); } catch(_) { return null; } })();
+    var displayName = (who && who.name) ? who.name : (msg.author.name || "익명");
     var hash = msg.author.hash || ("noname:" + (msg.author.name || "익명"));
     var isProvider = isApiProvider(msg.author.hash, room);   // 이 방에 키 제공 → 무제한
 
     // 사용 한도: 제공자는 무제한, 그 외는 1일 GEMINI_DAILY_LIMIT 회 (한국시간 자정 리셋).
     if (!isProvider && countTodayUses(hash) >= GEMINI_DAILY_LIMIT) {
-      msg.reply("⚠ " + (msg.author.name || "익명") + "님은 오늘 제미니 사용 한도(" + GEMINI_DAILY_LIMIT + "회)에 도달했습니다.\n" +
+      msg.reply("⚠ " + displayName + "님은 오늘 제미니 사용 한도(" + GEMINI_DAILY_LIMIT + "회)에 도달했습니다.\n" +
         "상식퀴즈봇과 1:1 채팅에서 !api 로 이 방에 키를 등록하면 무제한으로 사용할 수 있습니다.");
       return;
     }
@@ -290,10 +303,10 @@ function handleMessage(msg) {
 var WORKER_NAME = "GEMINI_BOT_WORKER";
 
 var subscribe = (function() {
-  var libPath = "/sdcard/msgbot/Bots/lib/subscriber.js";
+  var libPath = "/sdcard/msgbot/lib/subscriber.js";
   try {
     if (typeof bot.getRootPath === "function") {
-      libPath = bot.getRootPath() + "/../lib/subscriber.js";
+      libPath = bot.getRootPath() + "/../../lib/subscriber.js";
     }
   } catch(_) {}
   return require(libPath);

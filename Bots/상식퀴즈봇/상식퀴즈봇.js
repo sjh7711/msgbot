@@ -533,6 +533,17 @@ function testApiKey(key) {
   } finally { try { if (conn) conn.disconnect(); } catch(_) {} }
 }
 
+// 닉네임 직접복호화 공유 모듈 (msg.author.name 신뢰 안 함, user_id→이름)
+var kt = (function() {
+  var libPath = "/sdcard/msgbot/lib/kakao-decrypt.js";
+  try {
+    if (typeof bot.getRootPath === "function") {
+      libPath = bot.getRootPath() + "/../../lib/kakao-decrypt.js";
+    }
+  } catch(_) {}
+  return require(libPath);
+})();
+
 // ── userhash.db 조회 (방/닉네임 → hash 해석) ───────────────────────────
 function _openUserHashDB() {
   try {
@@ -561,8 +572,16 @@ function findRoomsByPartial(partial) {
 
 // 특정 방에서 부분 일치하는 닉네임 후보 [{name, hash}] (hash 기준 distinct, 최근 접속 우선)
 function findNamesByPartial(room, partial) {
-  var db = _openUserHashDB(); if (!db) return [];
-  var cur = null; var out = [];
+  var out = [];
+  // 1) 공유 캐시(직접복호화 신뢰값) 우선 — 해당 방 + 부분일치
+  try {
+    var hits = kt.findUserIdsByName(String(partial), true, String(room));
+    for (var i = 0; i < hits.length; i++) out.push({ name: hits[i].name || "", hash: hits[i].uid });
+  } catch(_) {}
+  if (out.length) return out;
+  // 2) 폴백: userhash.db
+  var db = _openUserHashDB(); if (!db) return out;
+  var cur = null;
   try {
     cur = db.rawQuery(
       "SELECT name, hash, MAX(last_seen) ls FROM userhash " +
@@ -1578,7 +1597,8 @@ function submitAnswer(msg, raw, quiz, chanId) {
   }
 
   var hash = msg.author.hash || "";
-  var name = msg.author.name || "익명";
+  var who = (function(){ try { return kt.resolveSender(msg); } catch(_) { return null; } })();
+  var name = (who && who.name) ? who.name : (msg.author.name || "익명");
   // pid: hash가 있으면 hash, 없으면 "noname:" + name 합성 키 (anon 들이 같은 이름이면 그대로 충돌)
   var pid = hash || ("noname:" + name);
 
@@ -1940,7 +1960,7 @@ var WORKER_NAME = "QUIZ_BOT_WORKER";
   } catch(_) {}
 })();
 
-new java.lang.Thread(function() {
+var _worker = new java.lang.Thread(function() {
   while (!java.lang.Thread.currentThread().isInterrupted()) {
     var task = null;
     try { task = msgQueue.take(); } catch(_) { return; } // interrupt → exit
@@ -1970,7 +1990,12 @@ new java.lang.Thread(function() {
       }
     } catch(_) {}
   }
-}, WORKER_NAME).start();
+}, WORKER_NAME);
+try {
+  var _treg = require(Packages.android.os.Environment.getExternalStorageDirectory().getAbsolutePath() + "/msgbot/lib/thread-registry.js");
+  _treg.registerThread(WORKER_NAME, BOT_NAME, _worker);
+} catch(_) {}
+_worker.start();
 
 function processTask(task) {
   if (!task) return;
