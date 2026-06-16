@@ -49,16 +49,28 @@ function openUsageDB() {
   return Packages.android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(GEMINI_DB_PATH, null);
 }
 
-(function initUsageDB() {
-  var db = openUsageDB();
+// ─── 공용 DB 헬퍼 (lib/db-helper.js): withDB / withReadOnlyDB / queryAll / transaction ───
+var DBH = (function() {
+  var libPath = "/sdcard/msgbot/lib/db-helper.js";
   try {
-    db.execSQL(
-      "CREATE TABLE IF NOT EXISTS gemini_usage (" +
-      " hash TEXT NOT NULL," +
-      " created INTEGER NOT NULL" +
-      ")");
-    try { db.execSQL("CREATE INDEX IF NOT EXISTS idx_gemini_usage ON gemini_usage(hash, created)"); } catch(_) {}
-  } catch(_) {} finally { db.close(); }
+    if (typeof bot.getRootPath === "function") {
+      libPath = bot.getRootPath() + "/../../lib/db-helper.js";
+    }
+  } catch(_) {}
+  return require(libPath);
+})();
+
+(function initUsageDB() {
+  DBH.withDB(GEMINI_DB_PATH, function(db){
+    try {
+      db.execSQL(
+        "CREATE TABLE IF NOT EXISTS gemini_usage (" +
+        " hash TEXT NOT NULL," +
+        " created INTEGER NOT NULL" +
+        ")");
+      try { db.execSQL("CREATE INDEX IF NOT EXISTS idx_gemini_usage ON gemini_usage(hash, created)"); } catch(_) {}
+    } catch(_) {}
+  });
 })();
 
 // 오늘 00:00 KST(UTC+9) 에 해당하는 epoch(ms). 한도를 한국시간 자정 기준으로 리셋.
@@ -72,44 +84,48 @@ function kstDayStartMs() {
 // 이 hash 가 오늘(KST) 사용한 횟수
 function countTodayUses(hash) {
   if (!hash) return 0;
-  var db = openUsageDB(); var cur = null; var n = 0;
-  try {
-    cur = db.rawQuery("SELECT COUNT(*) FROM gemini_usage WHERE hash = ? AND created >= ?",
-      [String(hash), String(kstDayStartMs())]);
-    if (cur.moveToFirst()) n = cur.getInt(0);
-  } catch(e) {} finally { if (cur) cur.close(); db.close(); }
-  return n;
+  return DBH.withDB(GEMINI_DB_PATH, function(db){
+    var cur = null; var n = 0;
+    try {
+      cur = db.rawQuery("SELECT COUNT(*) FROM gemini_usage WHERE hash = ? AND created >= ?",
+        [String(hash), String(kstDayStartMs())]);
+      if (cur.moveToFirst()) n = cur.getInt(0);
+    } catch(e) {} finally { if (cur) cur.close(); }
+    return n;
+  });
 }
 
 // 사용 1회 기록 (답변 성공 시 호출)
 function recordUse(hash) {
   if (!hash) return;
-  var db = openUsageDB();
-  try {
-    var stmt = db.compileStatement("INSERT INTO gemini_usage (hash, created) VALUES (?, ?)");
-    stmt.bindString(1, String(hash));
-    stmt.bindLong(2, nowMs());
-    stmt.execute(); stmt.close();
-  } catch(e) {} finally { db.close(); }
+  DBH.withDB(GEMINI_DB_PATH, function(db){
+    try {
+      var stmt = db.compileStatement("INSERT INTO gemini_usage (hash, created) VALUES (?, ?)");
+      stmt.bindString(1, String(hash));
+      stmt.bindLong(2, nowMs());
+      stmt.execute(); stmt.close();
+    } catch(e) {}
+  });
 }
 
 // 이 hash 의 사용자가 (이 방에) !api 로 키를 제공했는지 — quiz.db 의 quiz_apikey 조회(읽기 전용).
 // 키 사용처가 등록한 방으로 제한되므로 제공자 우대도 같은 방에서만 적용 (= 상식퀴즈봇과 동일 규칙).
 function isApiProvider(hash, room) {
   if (!hash) return false;
-  var db = null, cur = null;
   try {
-    db = Packages.android.database.sqlite.SQLiteDatabase.openDatabase(
-      QUIZ_DB_PATH, null, Packages.android.database.sqlite.SQLiteDatabase.OPEN_READONLY);
-    cur = db.rawQuery(
-      "SELECT 1 FROM quiz_apikey WHERE added_by_hash = ? AND " +
-      "(added_by_room = ? OR added_by_room IS NULL OR added_by_room = '') LIMIT 1",
-      [String(hash), String(room)]);
-    return cur.moveToFirst();
-  } catch(e) { return false; } finally {
-    try { if (cur) cur.close(); } catch(_) {}
-    try { if (db) db.close(); } catch(_) {}
-  }
+    return DBH.withReadOnlyDB(QUIZ_DB_PATH, function(db){
+      var cur = null;
+      try {
+        cur = db.rawQuery(
+          "SELECT 1 FROM quiz_apikey WHERE added_by_hash = ? AND " +
+          "(added_by_room = ? OR added_by_room IS NULL OR added_by_room = '') LIMIT 1",
+          [String(hash), String(room)]);
+        return cur.moveToFirst();
+      } finally {
+        try { if (cur) cur.close(); } catch(_) {}
+      }
+    });
+  } catch(e) { return false; }
 }
 
 // ── 이 방에서 쓸 수 있는 키 목록 ──────────────────────────────────────
@@ -122,28 +138,29 @@ function eligibleKeysForRoom(room) {
     var bk = BUILTIN_KEYS[i];
     if (bk.key && !seen[bk.key]) { seen[bk.key] = true; keys.push({ key: bk.key, model: bk.model || DEFAULT_MODEL }); }
   }
-  var db = null, cur = null;
   try {
-    db = Packages.android.database.sqlite.SQLiteDatabase.openDatabase(
-      QUIZ_DB_PATH, null, Packages.android.database.sqlite.SQLiteDatabase.OPEN_READONLY);
-    // quiz_apikey 의 첫번째(가장 먼저 등록된, MIN(created)) 키는 전역으로 모든 방에서 사용.
-    // 그 외엔 이 방 등록분 또는 room 빈값(전역)만. 상식퀴즈봇 eligibleProviderIndexes(i===0) 와 동일 정책.
-    cur = db.rawQuery(
-      "SELECT key, model FROM quiz_apikey " +
-      "WHERE added_by_room = ? OR added_by_room IS NULL OR added_by_room = '' " +
-      "OR created = (SELECT MIN(created) FROM quiz_apikey) " +
-      "ORDER BY created ASC",
-      [String(room)]);
-    while (cur.moveToNext()) {
-      var k = cur.getString(0);
-      var m = cur.getString(1) || DEFAULT_MODEL;
-      if (k && !seen[k]) { seen[k] = true; keys.push({ key: k, model: m }); }
-    }
+    DBH.withReadOnlyDB(QUIZ_DB_PATH, function(db){
+      var cur = null;
+      try {
+        // quiz_apikey 의 첫번째(가장 먼저 등록된, MIN(created)) 키는 전역으로 모든 방에서 사용.
+        // 그 외엔 이 방 등록분 또는 room 빈값(전역)만. 상식퀴즈봇 eligibleProviderIndexes(i===0) 와 동일 정책.
+        cur = db.rawQuery(
+          "SELECT key, model FROM quiz_apikey " +
+          "WHERE added_by_room = ? OR added_by_room IS NULL OR added_by_room = '' " +
+          "OR created = (SELECT MIN(created) FROM quiz_apikey) " +
+          "ORDER BY created ASC",
+          [String(room)]);
+        while (cur.moveToNext()) {
+          var k = cur.getString(0);
+          var m = cur.getString(1) || DEFAULT_MODEL;
+          if (k && !seen[k]) { seen[k] = true; keys.push({ key: k, model: m }); }
+        }
+      } finally {
+        try { if (cur) cur.close(); } catch(_) {}
+      }
+    });
   } catch(e) {
     // quiz.db 미존재/잠김/테이블 없음 → 내장 키만으로 진행
-  } finally {
-    try { if (cur) cur.close(); } catch(_) {}
-    try { if (db) db.close(); } catch(_) {}
   }
   return keys;
 }

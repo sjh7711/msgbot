@@ -72,8 +72,19 @@ function openDB() {
   return Packages.android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(DB_PATH, null);
 }
 
+// ─── 공용 DB 헬퍼 (lib/db-helper.js): withDB / queryAll / transaction ───
+var DBH = (function() {
+  var libPath = "/sdcard/msgbot/lib/db-helper.js";
+  try {
+    if (typeof bot.getRootPath === "function") {
+      libPath = bot.getRootPath() + "/../../lib/db-helper.js";
+    }
+  } catch(_) {}
+  return require(libPath);
+})();
+
 function initDB() {
-  var db = openDB();
+  DBH.withDB(DB_PATH, function(db){
   try {
     // ── quiz_user: hash 기반 스키마로 마이그레이션 ─────────────────────
     // 신 스키마: PK (hash, room), name 은 표시용 컬럼
@@ -419,7 +430,8 @@ function initDB() {
 
     // 봇 재시작 시 처리 중(state=1) 으로 박힌 이의신청 회차를 재신청 가능 상태(0)로 복구
     try { db.execSQL("UPDATE quiz_round SET appeal_state=0 WHERE appeal_state=1"); } catch(_) {}
-  } finally { db.close(); }
+  } finally { }
+  });
 }
 initDB();
 
@@ -440,54 +452,60 @@ function apiKeyExists(k) {
 // 키 사용처가 등록한 방으로 제한되므로 우대도 같은 방에서만 적용. room 미지정 시 방 무관(하위호환).
 function isApiProvider(hash, room) {
   if (!hash) return false;
-  var db = openDB(); var cur = null;
-  try {
-    if (room == null) {
-      cur = db.rawQuery("SELECT 1 FROM quiz_apikey WHERE added_by_hash = ? LIMIT 1", [hash]);
-    } else {
-      cur = db.rawQuery(
-        "SELECT 1 FROM quiz_apikey WHERE added_by_hash = ? AND " +
-        "(added_by_room = ? OR added_by_room IS NULL OR added_by_room = '') LIMIT 1",
-        [hash, String(room)]);
-    }
-    return cur.moveToFirst();
-  } catch(e) { return false; } finally { if (cur) cur.close(); db.close(); }
+  return DBH.withDB(DB_PATH, function(db){
+    var cur = null;
+    try {
+      if (room == null) {
+        cur = db.rawQuery("SELECT 1 FROM quiz_apikey WHERE added_by_hash = ? LIMIT 1", [hash]);
+      } else {
+        cur = db.rawQuery(
+          "SELECT 1 FROM quiz_apikey WHERE added_by_hash = ? AND " +
+          "(added_by_room = ? OR added_by_room IS NULL OR added_by_room = '') LIMIT 1",
+          [hash, String(room)]);
+      }
+      return cur.moveToFirst();
+    } catch(e) { return false; } finally { if (cur) cur.close(); }
+  });
 }
 
 // 시작 시 quiz_apikey 의 키들을 API_KEYS 뒤에 append (코드 내장 키와 중복 제외)
 function loadApiKeys() {
-  var db = openDB(); var cur = null; var n = 0;
-  try {
-    cur = db.rawQuery("SELECT key, model, added_by_room FROM quiz_apikey ORDER BY created ASC", []);
-    while (cur.moveToNext()) {
-      var k = cur.getString(0);
-      var m = cur.getString(1) || DEFAULT_MODEL;
-      var rm = cur.getString(2) || "";   // 등록한 방 — 이 방에서만 사용 가능 (빈값이면 전역)
-      if (k && !apiKeyExists(k)) { API_KEYS.push({ key: k, model: m, room: rm }); n++; }
-    }
-  } catch(e) {} finally { if (cur) cur.close(); db.close(); }
-  return n;
+  return DBH.withDB(DB_PATH, function(db){
+    var cur = null; var n = 0;
+    try {
+      cur = db.rawQuery("SELECT key, model, added_by_room FROM quiz_apikey ORDER BY created ASC", []);
+      while (cur.moveToNext()) {
+        var k = cur.getString(0);
+        var m = cur.getString(1) || DEFAULT_MODEL;
+        var rm = cur.getString(2) || "";   // 등록한 방 — 이 방에서만 사용 가능 (빈값이면 전역)
+        if (k && !apiKeyExists(k)) { API_KEYS.push({ key: k, model: m, room: rm }); n++; }
+      }
+    } catch(e) {} finally { if (cur) cur.close(); }
+    return n;
+  });
 }
 
 // !api 로 등록: DB 에 영구 저장(누가/어느 방 닉네임으로 줬는지 포함) + 런타임 API_KEYS 에 즉시 추가.
 // 반환: "added" | "exists" | "error"
 function registerApiKey(key, name, hash, room) {
   if (apiKeyExists(key)) return "exists";
-  var db = openDB();
-  try {
-    // PK(key) 충돌 시 무시 → 이미 DB 에만 있고 런타임엔 없던 경우도 안전
-    var stmt = db.compileStatement(
-      "INSERT OR IGNORE INTO quiz_apikey (key, model, added_by_name, added_by_hash, added_by_room, created) VALUES (?, ?, ?, ?, ?, ?)"
-    );
-    stmt.bindString(1, key);
-    stmt.bindString(2, DEFAULT_MODEL);
-    stmt.bindString(3, name || "");
-    stmt.bindString(4, hash || "");
-    stmt.bindString(5, room || "");
-    stmt.bindLong(6, nowMs());
-    stmt.execute(); stmt.close();
-  } catch(e) { db.close(); return "error"; }
-  db.close();
+  var ok = DBH.withDB(DB_PATH, function(db){
+    try {
+      // PK(key) 충돌 시 무시 → 이미 DB 에만 있고 런타임엔 없던 경우도 안전
+      var stmt = db.compileStatement(
+        "INSERT OR IGNORE INTO quiz_apikey (key, model, added_by_name, added_by_hash, added_by_room, created) VALUES (?, ?, ?, ?, ?, ?)"
+      );
+      stmt.bindString(1, key);
+      stmt.bindString(2, DEFAULT_MODEL);
+      stmt.bindString(3, name || "");
+      stmt.bindString(4, hash || "");
+      stmt.bindString(5, room || "");
+      stmt.bindLong(6, nowMs());
+      stmt.execute(); stmt.close();
+    } catch(e) { return false; }
+    return true;
+  });
+  if (!ok) return "error";
   API_KEYS.push({ key: key, model: DEFAULT_MODEL, room: room || "" });   // 등록한 방에서만 사용
   currentProviderIndex = API_KEYS.length - 1;  // 방금 등록한 새 키부터 사용 (기존 키는 쿼터 소진 상태일 수 있음)
   return "added";
@@ -559,14 +577,18 @@ function _likeEscape(s) {
 
 // 부분 일치하는 방 이름 목록 (중복 제거)
 function findRoomsByPartial(partial) {
-  var db = _openUserHashDB(); if (!db) return [];
-  var cur = null; var out = [];
+  var out = [];
   try {
-    cur = db.rawQuery(
-      "SELECT DISTINCT room FROM userhash WHERE room LIKE ? ESCAPE '\\' AND room != '' ORDER BY room",
-      ["%" + _likeEscape(partial) + "%"]);
-    while (cur.moveToNext()) { var r = cur.getString(0); if (r) out.push(r); }
-  } catch(e) {} finally { if (cur) cur.close(); db.close(); }
+    DBH.withReadOnlyDB(USERHASH_DB_PATH, function(db){
+      var cur = null;
+      try {
+        cur = db.rawQuery(
+          "SELECT DISTINCT room FROM userhash WHERE room LIKE ? ESCAPE '\\' AND room != '' ORDER BY room",
+          ["%" + _likeEscape(partial) + "%"]);
+        while (cur.moveToNext()) { var r = cur.getString(0); if (r) out.push(r); }
+      } finally { if (cur) cur.close(); }
+    });
+  } catch(e) {}
   return out;
 }
 
@@ -580,18 +602,21 @@ function findNamesByPartial(room, partial) {
   } catch(_) {}
   if (out.length) return out;
   // 2) 폴백: userhash.db
-  var db = _openUserHashDB(); if (!db) return out;
-  var cur = null;
   try {
-    cur = db.rawQuery(
-      "SELECT name, hash, MAX(last_seen) ls FROM userhash " +
-      "WHERE room = ? AND name LIKE ? ESCAPE '\\' GROUP BY hash ORDER BY ls DESC",
-      [String(room), "%" + _likeEscape(partial) + "%"]);
-    while (cur.moveToNext()) {
-      var nm = cur.getString(0); var h = cur.getString(1);
-      if (h) out.push({ name: nm || "", hash: h });
-    }
-  } catch(e) {} finally { if (cur) cur.close(); db.close(); }
+    DBH.withReadOnlyDB(USERHASH_DB_PATH, function(db){
+      var cur = null;
+      try {
+        cur = db.rawQuery(
+          "SELECT name, hash, MAX(last_seen) ls FROM userhash " +
+          "WHERE room = ? AND name LIKE ? ESCAPE '\\' GROUP BY hash ORDER BY ls DESC",
+          [String(room), "%" + _likeEscape(partial) + "%"]);
+        while (cur.moveToNext()) {
+          var nm = cur.getString(0); var h = cur.getString(1);
+          if (h) out.push({ name: nm || "", hash: h });
+        }
+      } finally { if (cur) cur.close(); }
+    });
+  } catch(e) {}
   return out;
 }
 
@@ -736,7 +761,7 @@ function logGeneratedAnswer(answerText, question, topic) {
   if (!n) return;
   var q = String(question == null ? "" : question).trim();
   var t = String(topic == null ? "" : topic).trim();
-  var db = openDB();
+  DBH.withDB(DB_PATH, function(db){
   try {
     // 기존 데이터 백필: 같은 norm 인데 topic 이 NULL/빈값이던 과거 행을 이번 토픽으로 채움
     if (t) {
@@ -752,56 +777,63 @@ function logGeneratedAnswer(answerText, question, topic) {
     stmt.bindString(4, t);
     stmt.bindLong(5, nowMs());
     stmt.execute(); stmt.close();
-  } catch(_) {} finally { db.close(); }
+  } catch(_) {} finally { }
+  });
 }
 
 // 빈도 상위 N개 정답 (norm 기준 그룹, 표시는 가장 최근 표기)
 function getFrequentAnswers(limit) {
-  var db = openDB(); var cur = null; var out = [];
-  try {
-    cur = db.rawQuery(
-      "SELECT answer, COUNT(*) c, MAX(created) mc FROM quiz_answer_log " +
-      "GROUP BY norm ORDER BY c DESC, mc DESC LIMIT " + (limit || 50), []
-    );
-    while (cur.moveToNext()) {
-      var a = cur.getString(0);
-      if (a && !/^[1-5]$/.test(a)) out.push(a);
-    }
-  } catch(e) {} finally { if (cur) cur.close(); db.close(); }
-  return out;
+  return DBH.withDB(DB_PATH, function(db){
+    var cur = null; var out = [];
+    try {
+      cur = db.rawQuery(
+        "SELECT answer, COUNT(*) c, MAX(created) mc FROM quiz_answer_log " +
+        "GROUP BY norm ORDER BY c DESC, mc DESC LIMIT " + (limit || 50), []
+      );
+      while (cur.moveToNext()) {
+        var a = cur.getString(0);
+        if (a && !/^[1-5]$/.test(a)) out.push(a);
+      }
+    } catch(e) {} finally { if (cur) cur.close(); }
+    return out;
+  });
 }
 
 // 빈출 정답(quiz_answer_log)을 생성 횟수와 함께 상위 N개. !금지목록 표시용.
 function getFrequentAnswersWithCount(limit) {
-  var db = openDB(); var cur = null; var out = [];
-  try {
-    cur = db.rawQuery(
-      "SELECT answer, COUNT(*) c, MAX(created) mc FROM quiz_answer_log " +
-      "GROUP BY norm ORDER BY c DESC, mc DESC LIMIT " + (limit || 50), []
-    );
-    while (cur.moveToNext()) {
-      var a = cur.getString(0);
-      var c = cur.getInt(1);
-      if (a && !/^[1-5]$/.test(a)) out.push({ answer: a, count: c });
-    }
-  } catch(e) {} finally { if (cur) cur.close(); db.close(); }
-  return out;
+  return DBH.withDB(DB_PATH, function(db){
+    var cur = null; var out = [];
+    try {
+      cur = db.rawQuery(
+        "SELECT answer, COUNT(*) c, MAX(created) mc FROM quiz_answer_log " +
+        "GROUP BY norm ORDER BY c DESC, mc DESC LIMIT " + (limit || 50), []
+      );
+      while (cur.moveToNext()) {
+        var a = cur.getString(0);
+        var c = cur.getInt(1);
+        if (a && !/^[1-5]$/.test(a)) out.push({ answer: a, count: c });
+      }
+    } catch(e) {} finally { if (cur) cur.close(); }
+    return out;
+  });
 }
 
 // 실제 출제된(=reveal 까지 간) 정답 중 최근 N개. quiz_round 기준 → dedupSet·프롬프트 "최근" 소스.
 function getRecentRoundAnswers(limit) {
-  var db = openDB(); var cur = null; var out = [];
-  try {
-    cur = db.rawQuery(
-      "SELECT DISTINCT answer FROM quiz_round WHERE answer != '' " +
-      "ORDER BY created DESC LIMIT " + (limit || 1000), []
-    );
-    while (cur.moveToNext()) {
-      var a = cur.getString(0);
-      if (a && !/^[1-5]$/.test(a)) out.push(a);  // 옛 객관식 인덱스('1'~'5') 제외
-    }
-  } catch(e) {} finally { if (cur) cur.close(); db.close(); }
-  return out;
+  return DBH.withDB(DB_PATH, function(db){
+    var cur = null; var out = [];
+    try {
+      cur = db.rawQuery(
+        "SELECT DISTINCT answer FROM quiz_round WHERE answer != '' " +
+        "ORDER BY created DESC LIMIT " + (limit || 1000), []
+      );
+      while (cur.moveToNext()) {
+        var a = cur.getString(0);
+        if (a && !/^[1-5]$/.test(a)) out.push(a);  // 옛 객관식 인덱스('1'~'5') 제외
+      }
+    } catch(e) {} finally { if (cur) cur.close(); }
+    return out;
+  });
 }
 
 // 정답/보기 텍스트가 실제 명칭이 아니라 템플릿 자리표시자(예: "본 정답 명칭", "보기1", "정답")인지 판별.
@@ -821,63 +853,71 @@ function looksLikePlaceholder(s) {
 // 오늘(UTC+9 기준 0시~24시) 해당 유저(해시 기준)가 토픽 출제를 요청한 횟수
 function countRecentTopicRequests(hash) {
   var since = kstDayStartMs();   // 오늘 00:00 KST 의 epoch(ms)
-  var db = openDB(); var cur = null;
-  try {
-    cur = db.rawQuery(
-      "SELECT COUNT(*) FROM quiz_topic_request WHERE hash=? AND created >= " + since, [hash]
-    );
-    if (cur.moveToFirst()) return cur.getInt(0);
-    return 0;
-  } catch(e) { return 0; }
-  finally { if (cur) cur.close(); db.close(); }
+  return DBH.withDB(DB_PATH, function(db){
+    var cur = null;
+    try {
+      cur = db.rawQuery(
+        "SELECT COUNT(*) FROM quiz_topic_request WHERE hash=? AND created >= " + since, [hash]
+      );
+      if (cur.moveToFirst()) return cur.getInt(0);
+      return 0;
+    } catch(e) { return 0; }
+    finally { if (cur) cur.close(); }
+  });
 }
 
 function recordTopicRequest(hash) {
-  var db = openDB();
+  DBH.withDB(DB_PATH, function(db){
   try {
     var stmt = db.compileStatement("INSERT INTO quiz_topic_request (hash, created) VALUES (?, ?)");
     stmt.bindString(1, hash);
     stmt.bindLong(2, nowMs());
     stmt.execute(); stmt.close();
-  } finally { db.close(); }
+  } finally { }
+  });
 }
 
 // 오늘(UTC+9 기준 0시~24시) 해당 유저(해시 기준)가 이의신청한 횟수
 function countRecentAppeals(hash) {
   var since = kstDayStartMs();
-  var db = openDB(); var cur = null;
-  try {
-    cur = db.rawQuery(
-      "SELECT COUNT(*) FROM quiz_appeal_request WHERE hash=? AND created >= " + since, [hash]
-    );
-    if (cur.moveToFirst()) return cur.getInt(0);
-    return 0;
-  } catch(e) { return 0; }
-  finally { if (cur) cur.close(); db.close(); }
+  return DBH.withDB(DB_PATH, function(db){
+    var cur = null;
+    try {
+      cur = db.rawQuery(
+        "SELECT COUNT(*) FROM quiz_appeal_request WHERE hash=? AND created >= " + since, [hash]
+      );
+      if (cur.moveToFirst()) return cur.getInt(0);
+      return 0;
+    } catch(e) { return 0; }
+    finally { if (cur) cur.close(); }
+  });
 }
 
 function recordAppeal(hash) {
-  var db = openDB();
+  DBH.withDB(DB_PATH, function(db){
   try {
     var stmt = db.compileStatement("INSERT INTO quiz_appeal_request (hash, created) VALUES (?, ?)");
     stmt.bindString(1, hash);
     stmt.bindLong(2, nowMs());
     stmt.execute(); stmt.close();
-  } finally { db.close(); }
+  } finally { }
+  });
 }
 
 // ── 라운드 저장 / 이의신청용 ──────────────────────────────────────────
 function nextRoundNum(room) {
-  var db = openDB(); var cur = null;
-  try {
-    cur = db.rawQuery("SELECT COALESCE(MAX(num), 0) + 1 FROM quiz_round WHERE room=?", [room]);
-    if (cur.moveToFirst()) return cur.getInt(0);
-    return 1;
-  } finally { if (cur) cur.close(); db.close(); }
+  return DBH.withDB(DB_PATH, function(db){
+    var cur = null;
+    try {
+      cur = db.rawQuery("SELECT COALESCE(MAX(num), 0) + 1 FROM quiz_round WHERE room=?", [room]);
+      if (cur.moveToFirst()) return cur.getInt(0);
+      return 1;
+    } finally { if (cur) cur.close(); }
+  });
 }
 
 function saveRound(room, num, q) {
-  var db = openDB();
+  DBH.withDB(DB_PATH, function(db){
   try {
     var stmt = db.compileStatement(
       "INSERT INTO quiz_round (room, num, type, topic, question, choices, answer, correct_index, explanation, created) " +
@@ -894,11 +934,12 @@ function saveRound(room, num, q) {
     stmt.bindString(9, q.explanation || "");
     stmt.bindLong(10, nowMs());
     stmt.execute(); stmt.close();
-  } finally { db.close(); }
+  } finally { }
+  });
 }
 
 function saveRoundParticipant(room, num, name, hash, wasWinner, wrongCount, rawAnswer) {
-  var db = openDB();
+  DBH.withDB(DB_PATH, function(db){
   try {
     var stmt = db.compileStatement(
       "INSERT INTO quiz_round_participant (room, num, name, hash, was_winner, wrong_count, raw_answer) VALUES (?, ?, ?, ?, ?, ?, ?)"
@@ -911,31 +952,36 @@ function saveRoundParticipant(room, num, name, hash, wasWinner, wrongCount, rawA
     stmt.bindLong(6, wrongCount || 0);
     stmt.bindString(7, String(rawAnswer || ""));
     stmt.execute(); stmt.close();
-  } finally { db.close(); }
+  } finally { }
+  });
 }
 
 function getLatestRound(room) {
-  var db = openDB(); var cur = null;
-  try {
-    cur = db.rawQuery(
-      "SELECT num, type, question, choices, answer, correct_index, explanation, appeal_state, appeal_verdict " +
-      "FROM quiz_round WHERE room=? ORDER BY num DESC LIMIT 1", [room]
-    );
-    if (!cur.moveToFirst()) return null;
-    return readRoundCursor(cur);
-  } finally { if (cur) cur.close(); db.close(); }
+  return DBH.withDB(DB_PATH, function(db){
+    var cur = null;
+    try {
+      cur = db.rawQuery(
+        "SELECT num, type, question, choices, answer, correct_index, explanation, appeal_state, appeal_verdict " +
+        "FROM quiz_round WHERE room=? ORDER BY num DESC LIMIT 1", [room]
+      );
+      if (!cur.moveToFirst()) return null;
+      return readRoundCursor(cur);
+    } finally { if (cur) cur.close(); }
+  });
 }
 
 function getRoundByNum(room, num) {
-  var db = openDB(); var cur = null;
-  try {
-    cur = db.rawQuery(
-      "SELECT num, type, question, choices, answer, correct_index, explanation, appeal_state, appeal_verdict " +
-      "FROM quiz_round WHERE room=? AND num=?", [room, String(num)]
-    );
-    if (!cur.moveToFirst()) return null;
-    return readRoundCursor(cur);
-  } finally { if (cur) cur.close(); db.close(); }
+  return DBH.withDB(DB_PATH, function(db){
+    var cur = null;
+    try {
+      cur = db.rawQuery(
+        "SELECT num, type, question, choices, answer, correct_index, explanation, appeal_state, appeal_verdict " +
+        "FROM quiz_round WHERE room=? AND num=?", [room, String(num)]
+      );
+      if (!cur.moveToFirst()) return null;
+      return readRoundCursor(cur);
+    } finally { if (cur) cur.close(); }
+  });
 }
 
 function readRoundCursor(cur) {
@@ -953,38 +999,41 @@ function readRoundCursor(cur) {
 }
 
 function getRoundParticipants(room, num) {
-  var db = openDB(); var cur = null; var out = [];
-  try {
-    cur = db.rawQuery(
-      "SELECT name, hash, was_winner, wrong_count, raw_answer FROM quiz_round_participant WHERE room=? AND num=?",
-      [room, String(num)]
-    );
-    while (cur.moveToNext()) {
-      out.push({
-        name: cur.getString(0),
-        hash: cur.getString(1),
-        wasWinner: cur.getInt(2) === 1,
-        wrongCount: cur.getInt(3),
-        rawAnswer: cur.getString(4) || ""
-      });
-    }
-  } finally { if (cur) cur.close(); db.close(); }
-  return out;
+  return DBH.withDB(DB_PATH, function(db){
+    var cur = null; var out = [];
+    try {
+      cur = db.rawQuery(
+        "SELECT name, hash, was_winner, wrong_count, raw_answer FROM quiz_round_participant WHERE room=? AND num=?",
+        [room, String(num)]
+      );
+      while (cur.moveToNext()) {
+        out.push({
+          name: cur.getString(0),
+          hash: cur.getString(1),
+          wasWinner: cur.getInt(2) === 1,
+          wrongCount: cur.getInt(3),
+          rawAnswer: cur.getString(4) || ""
+        });
+      }
+    } finally { if (cur) cur.close(); }
+    return out;
+  });
 }
 
 function setAppealState(room, num, state) {
-  var db = openDB();
+  DBH.withDB(DB_PATH, function(db){
   try {
     var stmt = db.compileStatement("UPDATE quiz_round SET appeal_state=? WHERE room=? AND num=?");
     stmt.bindLong(1, state);
     stmt.bindString(2, room);
     stmt.bindLong(3, num);
     stmt.execute(); stmt.close();
-  } finally { db.close(); }
+  } finally { }
+  });
 }
 
 function saveAppealResult(room, num, verdict, reasoning) {
-  var db = openDB();
+  DBH.withDB(DB_PATH, function(db){
   try {
     var stmt = db.compileStatement(
       "UPDATE quiz_round SET appeal_state=2, appeal_verdict=?, appeal_reasoning=? WHERE room=? AND num=?"
@@ -994,13 +1043,14 @@ function saveAppealResult(room, num, verdict, reasoning) {
     stmt.bindString(3, room);
     stmt.bindLong(4, num);
     stmt.execute(); stmt.close();
-  } finally { db.close(); }
+  } finally { }
+  });
 }
 
 // 한 라운드의 참여자들 통계를 quiz_user에서 차감
 function revertRoundStats(room, num) {
   var parts = getRoundParticipants(room, num);
-  var db = openDB();
+  DBH.withDB(DB_PATH, function(db){
   try {
     var stmt = db.compileStatement(
       "UPDATE quiz_user SET " +
@@ -1022,13 +1072,14 @@ function revertRoundStats(room, num) {
       stmt.clearBindings();
     }
     stmt.close();
-  } finally { db.close(); }
+  } finally { }
+  });
 }
 
 // 참여자 한 명 통계 보정 (오답 -wrongCount, 정답 +1) — 답안이 인정된 비정답자마다 호출
 function correctAppellantStats(room, hash, wrongCount) {
   if (!hash) return;
-  var db = openDB();
+  DBH.withDB(DB_PATH, function(db){
   try {
     var stmt = db.compileStatement(
       "UPDATE quiz_user SET " +
@@ -1042,14 +1093,15 @@ function correctAppellantStats(room, hash, wrongCount) {
     stmt.bindString(3, hash);
     stmt.bindString(4, room);
     stmt.execute(); stmt.close();
-  } finally { db.close(); }
+  } finally { }
+  });
 }
 
 function recordParticipation(hash, name, isWinner, wrongCount, room) {
   if (!hash) return;
   var r = room || "";
   var nm = name || "";
-  var db = openDB();
+  DBH.withDB(DB_PATH, function(db){
   try {
     var cur = db.rawQuery("SELECT 1 FROM quiz_user WHERE hash=? AND room=?", [hash, r]);
     var exists = cur.moveToFirst(); cur.close();
@@ -1077,29 +1129,32 @@ function recordParticipation(hash, name, isWinner, wrongCount, room) {
     upd.bindString(5, hash);
     upd.bindString(6, r);
     upd.execute(); upd.close();
-  } finally { db.close(); }
+  } finally { }
+  });
 }
 
 function getRanking(topN, room) {
-  var db = openDB(); var cur = null; var out = [];
-  try {
-    cur = db.rawQuery(
-      "SELECT name, participated, wins, wrong, (wins*10 - wrong) AS score FROM quiz_user " +
-      "WHERE participated >= 1 AND room = ? " +
-      "ORDER BY score DESC, wins DESC, participated DESC " +
-      "LIMIT " + topN, [room || ""]
-    );
-    while (cur.moveToNext()) {
-      out.push({
-        name: cur.getString(0),
-        participated: cur.getInt(1),
-        wins: cur.getInt(2),
-        wrong: cur.getInt(3),
-        score: cur.getInt(4)
-      });
-    }
-  } finally { if (cur) cur.close(); db.close(); }
-  return out;
+  return DBH.withDB(DB_PATH, function(db){
+    var cur = null; var out = [];
+    try {
+      cur = db.rawQuery(
+        "SELECT name, participated, wins, wrong, (wins*10 - wrong) AS score FROM quiz_user " +
+        "WHERE participated >= 1 AND room = ? " +
+        "ORDER BY score DESC, wins DESC, participated DESC " +
+        "LIMIT " + topN, [room || ""]
+      );
+      while (cur.moveToNext()) {
+        out.push({
+          name: cur.getString(0),
+          participated: cur.getInt(1),
+          wins: cur.getInt(2),
+          wrong: cur.getInt(3),
+          score: cur.getInt(4)
+        });
+      }
+    } finally { if (cur) cur.close(); }
+    return out;
+  });
 }
 
 // ── 게임 상태 ────────────────────────────────────────────────────────

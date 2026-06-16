@@ -28,8 +28,19 @@ function openDB() {
     return Packages.android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(DB_PATH, null);
 }
 
+// ─── 공용 DB 헬퍼 (lib/db-helper.js): withDB / queryAll / transaction ───
+var DBH = (function() {
+  var libPath = "/sdcard/msgbot/lib/db-helper.js";
+  try {
+    if (typeof bot.getRootPath === "function") {
+      libPath = bot.getRootPath() + "/../../lib/db-helper.js";
+    }
+  } catch(_) {}
+  return require(libPath);
+})();
+
 function initDatabase() {
-    var db = openDB();
+    DBH.withDB(DB_PATH, function(db){
     try {
         // users: hash(PK) ↔ lol_nickname + 등록한 방
         db.execSQL(
@@ -85,7 +96,8 @@ function initDatabase() {
 
 
 
-    } finally { db.close(); }
+    } finally {  }
+    });
 }
 initDatabase();
 
@@ -95,26 +107,29 @@ initDatabase();
 
 // hash로 롤닉네임 조회
 function getNicknameFromHash(hash) {
-    var db = openDB(); var cur = null;
+    return DBH.withDB(DB_PATH, function(db){
+    var cur = null;
     try {
         cur = db.rawQuery("SELECT lol_nickname FROM users WHERE hash=?", [hash]);
         if (cur.moveToFirst()) return cur.getString(0);
         return null;
     } catch(e) { return null; }
-    finally { if (cur) cur.close(); db.close(); }
+    finally { if (cur) cur.close(); }
+    });
 }
 
 // 카카오이름으로 hash 조회 (userhash DB 참조)
 function getHashByKakaoName(kakaoName) {
     var HASH_DB_PATH = Packages.android.os.Environment.getExternalStorageDirectory().getAbsolutePath() + "/msgbot/userhash.db";
-    var db = Packages.android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(HASH_DB_PATH, null);
+    return DBH.withDB(HASH_DB_PATH, function(db){
     var cur = null;
     try {
         cur = db.rawQuery("SELECT hash FROM userhash WHERE name=? LIMIT 1", [kakaoName]);
         if (cur.moveToFirst()) return cur.getString(0);
         return null;
     } catch(e) { return null; }
-    finally { if (cur) cur.close(); db.close(); }
+    finally { if (cur) cur.close(); }
+    });
 }
 
 // 카카오이름(@sender) → 롤닉네임
@@ -126,13 +141,15 @@ function getNicknameFromKakaoName(kakaoName) {
 
 // 롤닉네임에 연결된 hash 개수 조회
 function getHashCountByLolNickname(lolNickname) {
-    var db = openDB(); var cur = null;
+    return DBH.withDB(DB_PATH, function(db){
+    var cur = null;
     try {
         cur = db.rawQuery("SELECT COUNT(*) FROM users WHERE lol_nickname=?", [lolNickname]);
         if (cur.moveToFirst()) return cur.getInt(0);
         return 0;
     } catch(e) { return 0; }
-    finally { if (cur) cur.close(); db.close(); }
+    finally { if (cur) cur.close(); }
+    });
 }
 
 // 닉네임 등록 / 닉네임 변경 통합 처리
@@ -140,7 +157,8 @@ function getHashCountByLolNickname(lolNickname) {
 // - 같은 hash로 다른 lol_nickname: UPDATE users + players 연쇄 업데이트
 // - lol_nickname hash 2개 초과 시 거부
 function insertNickname(hash, lolNickname, room) {
-    var db = openDB(); var cur = null;
+    return DBH.withDB(DB_PATH, function(db){
+    var cur = null;
     try {
         // 이 hash가 이미 등록되어 있는지 확인
         cur = db.rawQuery("SELECT lol_nickname FROM users WHERE hash=?", [hash]);
@@ -209,7 +227,8 @@ function insertNickname(hash, lolNickname, room) {
         return { success: true, message: "✔ 롤 닉네임 '" + lolNickname + "' 등록 완료!" };
     } catch(e) {
         return { success: false, message: "등록 실패: " + e.message };
-    } finally { if (cur) cur.close(); db.close(); }
+    } finally { if (cur) cur.close(); }
+    });
 }
 
 // 닉네임 재등록: 카카오계정 변경으로 hash가 바뀐 경우
@@ -217,7 +236,8 @@ function insertNickname(hash, lolNickname, room) {
 // - 새 hash가 이미 다른 닉네임에 등록되어 있으면 거부
 // - 기존 hash를 새 hash로 교체
 function reRegisterNickname(newHash, lolNickname, room) {
-    var db = openDB(); var cur = null;
+    return DBH.withDB(DB_PATH, function(db){
+    var cur = null;
     try {
         // 새 hash가 이미 다른 닉네임에 등록되어 있는지 확인
         cur = db.rawQuery("SELECT lol_nickname FROM users WHERE hash=?", [newHash]);
@@ -252,16 +272,19 @@ function reRegisterNickname(newHash, lolNickname, room) {
         return { success: true, message: "✔ '" + lolNickname + "' 계정 재연결 완료!" };
     } catch(e) {
         return { success: false, message: "재등록 실패: " + e.message };
-    } finally { if (cur) cur.close(); db.close(); }
+    } finally { if (cur) cur.close(); }
+    });
 }
 
 function isRegisteredNickname(nickname) {
-    var db = openDB(); var cur = null;
+    return DBH.withDB(DB_PATH, function(db){
+    var cur = null;
     try {
         cur = db.rawQuery("SELECT 1 FROM players WHERE lol_nickname=?", [nickname]);
         return cur.moveToFirst();
     } catch(e) { return false; }
-    finally { if (cur) cur.close(); db.close(); }
+    finally { if (cur) cur.close(); }
+    });
 }
 
 // =====================================================================
@@ -309,27 +332,30 @@ function updatePlayerStats(db, nickname, isWin) {
 }
 
 function getPlayerStats(nickname) {
-    var db = openDB(); var cur = null;
+    return DBH.withDB(DB_PATH, function(db){
+    var cur = null;
     try {
         cur = db.rawQuery("SELECT wins,losses,total_games,win_rate FROM players WHERE lol_nickname=?", [nickname]);
         if (!cur.moveToFirst()) return null;
         return { wins: cur.getInt(0), losses: cur.getInt(1), totalGames: cur.getInt(2), winRate: cur.getFloat(3) };
     } catch(e) { return null; }
-    finally { if (cur) cur.close(); db.close(); }
+    finally { if (cur) cur.close(); }
+    });
 }
 
 // =====================================================================
 // 게임 저장/조회
 // =====================================================================
 function saveGameResult(leftTeam, rightTeam, leftChamps, rightChamps, winningTeam) {
-    var db = openDB(); var cur = null;
+    return DBH.withDB(DB_PATH, function(db){
+    var cur = null; var gameId = null;
     try {
-        db.beginTransaction();
+        DBH.transaction(db, function(db){
         db.execSQL("INSERT INTO games(left_team,right_team,left_team_champions,right_team_champions,winning_team) VALUES(?,?,?,?,?)",
             [leftTeam.join(","), rightTeam.join(","), leftChamps.join(","), rightChamps.join(","), winningTeam]);
         cur = db.rawQuery("SELECT last_insert_rowid()", []);
         cur.moveToFirst();
-        var gameId = cur.getInt(0);
+        gameId = cur.getInt(0);
         cur.close(); cur = null;
         for (var i=0; i<leftTeam.length; i++) {
             db.execSQL("INSERT INTO game_participants(game_id,lol_nickname,team,is_winner) VALUES(?,?,?,?)",
@@ -341,14 +367,16 @@ function saveGameResult(leftTeam, rightTeam, leftChamps, rightChamps, winningTea
                 [gameId, rightTeam[i], "right", winningTeam==="right"]);
             updatePlayerStats(db, rightTeam[i], winningTeam==="right");
         }
-        db.setTransactionSuccessful();
+        });
         return gameId;
     } catch(e) { return null; }
-    finally { if (cur) cur.close(); try { db.endTransaction(); } catch(_) {} db.close(); }
+    finally { if (cur) cur.close(); }
+    });
 }
 
 function getGameRecordById(gameId) {
-    var db = openDB(); var cur = null;
+    return DBH.withDB(DB_PATH, function(db){
+    var cur = null;
     try {
         cur = db.rawQuery("SELECT * FROM games WHERE id=?", [String(gameId)]);
         if (!cur.moveToFirst()) return null;
@@ -364,17 +392,19 @@ function getGameRecordById(gameId) {
             winningTeam: cur.getString(cur.getColumnIndex("winning_team"))
         };
     } catch(e) { return null; }
-    finally { if (cur) cur.close(); db.close(); }
+    finally { if (cur) cur.close(); }
+    });
 }
 
 function getRecentGameRecords(count) {
-    var db = openDB(); var cur = null; var games = [];
+    var games = DBH.withDB(DB_PATH, function(db){
+    var cur = null; var out = [];
     try {
         cur = db.rawQuery("SELECT * FROM games ORDER BY id DESC LIMIT ?", [String(count)]);
         while (cur.moveToNext()) {
             var lc = cur.getString(cur.getColumnIndex("left_team_champions"));
             var rc = cur.getString(cur.getColumnIndex("right_team_champions"));
-            games.push({
+            out.push({
                 id: cur.getInt(cur.getColumnIndex("id")),
                 gameDate: cur.getString(cur.getColumnIndex("game_date")),
                 leftTeam: cur.getString(cur.getColumnIndex("left_team")).split(","),
@@ -385,7 +415,9 @@ function getRecentGameRecords(count) {
             });
         }
     } catch(e) {}
-    finally { if (cur) cur.close(); db.close(); }
+    finally { if (cur) cur.close(); }
+    return out;
+    });
     return games;
 }
 
@@ -393,7 +425,8 @@ function getRecentGameRecords(count) {
 // 팀 통계
 // =====================================================================
 function getTeamStats(n1, n2) {
-    var db = openDB(); var c1 = null; var c2 = null;
+    return DBH.withDB(DB_PATH, function(db){
+    var c1 = null; var c2 = null;
     try {
         var sameQ = "SELECT COUNT(*) as tot, SUM(CASE WHEN gp1.is_winner=1 THEN 1 ELSE 0 END) as w " +
             "FROM game_participants gp1 JOIN game_participants gp2 ON gp1.game_id=gp2.game_id " +
@@ -411,11 +444,13 @@ function getTeamStats(n1, n2) {
             enemyTeam: { totalGames:et, wins:ew, losses:et-ew, winRate:et>0?(ew/et)*100:0 }
         };
     } catch(e) { return null; }
-    finally { if (c1) c1.close(); if (c2) c2.close(); db.close(); }
+    finally { if (c1) c1.close(); if (c2) c2.close(); }
+    });
 }
 
 function getOpponentStats(baseNickname) {
-    var db = openDB(); var cur = null;
+    return DBH.withDB(DB_PATH, function(db){
+    var cur = null;
     try {
         cur = db.rawQuery(
             "SELECT DISTINCT gp2.lol_nickname FROM game_participants gp1 " +
@@ -439,58 +474,67 @@ function getOpponentStats(baseNickname) {
         });
         return results;
     } catch(e) { return null; }
-    finally { if (cur) cur.close(); db.close(); }
+    finally { if (cur) cur.close(); }
+    });
 }
 
 // =====================================================================
 // 숨기기
 // =====================================================================
 function isHiddenPlayer(lolNickname) {
-    var db = openDB(); var cur = null;
+    return DBH.withDB(DB_PATH, function(db){
+    var cur = null;
     try {
         cur = db.rawQuery("SELECT 1 FROM hiding_players WHERE lol_nickname=?", [lolNickname]);
         return cur.moveToFirst();
     } catch(e) { return false; }
-    finally { if (cur) cur.close(); db.close(); }
+    finally { if (cur) cur.close(); }
+    });
 }
 
 // =====================================================================
 // 무결성 / 복구
 // =====================================================================
 function calculateStatsFromParticipants() {
-    var db = openDB(); var cur = null; var map = {};
+    var map = DBH.withDB(DB_PATH, function(db){
+    var cur = null; var acc = {};
     try {
         cur = db.rawQuery("SELECT lol_nickname,is_winner FROM game_participants WHERE is_winner IS NOT NULL", []);
         while (cur.moveToNext()) {
             var n=cur.getString(0); var w=cur.getInt(1)===1;
-            if (!map[n]) map[n]={wins:0,losses:0,total:0};
-            if (w) map[n].wins++; else map[n].losses++;
-            map[n].total++;
+            if (!acc[n]) acc[n]={wins:0,losses:0,total:0};
+            if (w) acc[n].wins++; else acc[n].losses++;
+            acc[n].total++;
         }
     } catch(e) {}
-    finally { if (cur) cur.close(); db.close(); }
+    finally { if (cur) cur.close(); }
+    return acc;
+    });
     return map;
 }
 
 function checkIntegrity() {
     var pStats = calculateStatsFromParticipants();
-    var db = openDB(); var cur = null; var mismatched = [];
+    var mismatched = DBH.withDB(DB_PATH, function(db){
+    var cur = null; var out = [];
     try {
         cur = db.rawQuery("SELECT lol_nickname,wins,losses,total_games FROM players", []);
         while (cur.moveToNext()) {
             var n=cur.getString(0), w=cur.getInt(1), l=cur.getInt(2), tot=cur.getInt(3);
             var p=pStats[n]||{wins:0,losses:0,total:0};
             if (w!==p.wins||l!==p.losses||tot!==p.total)
-                mismatched.push({nickname:n,players:{wins:w,losses:l,total:tot},actual:p});
+                out.push({nickname:n,players:{wins:w,losses:l,total:tot},actual:p});
         }
     } catch(e) {}
-    finally { if (cur) cur.close(); db.close(); }
+    finally { if (cur) cur.close(); }
+    return out;
+    });
     return mismatched;
 }
 
 function rebuildPlayersTableFromParticipants() {
     var stats = calculateStatsFromParticipants();
-    var db = openDB();
+    DBH.withDB(DB_PATH, function(db){
     try {
         for (var n in stats) {
             var s=stats[n];
@@ -498,26 +542,33 @@ function rebuildPlayersTableFromParticipants() {
             db.execSQL("UPDATE players SET wins=?,losses=?,total_games=?,win_rate=? WHERE lol_nickname=?",
                 [s.wins,s.losses,s.total,wr,n]);
         }
-    } finally { db.close(); }
+    } finally {  }
+    });
 }
 
 function getGameParticipants(gameId) {
-    var db = openDB(); var cur = null; var list = [];
+    var list = DBH.withDB(DB_PATH, function(db){
+    var cur = null; var out = [];
     try {
         cur = db.rawQuery("SELECT lol_nickname,team,is_winner FROM game_participants WHERE game_id=?", [String(gameId)]);
-        while (cur.moveToNext()) list.push({nickname:cur.getString(0),team:cur.getString(1),isWinner:cur.getInt(2)});
+        while (cur.moveToNext()) out.push({nickname:cur.getString(0),team:cur.getString(1),isWinner:cur.getInt(2)});
     } catch(e) {}
-    finally { if (cur) cur.close(); db.close(); }
+    finally { if (cur) cur.close(); }
+    return out;
+    });
     return list;
 }
 
 function findUndefinedParticipants() {
-    var db = openDB(); var cur = null; var results = [];
+    var results = DBH.withDB(DB_PATH, function(db){
+    var cur = null; var out = [];
     try {
         cur = db.rawQuery("SELECT game_id,team FROM game_participants WHERE lol_nickname IS NULL OR lol_nickname=''", []);
-        while (cur.moveToNext()) results.push({gameId:cur.getInt(0),team:cur.getString(1)});
+        while (cur.moveToNext()) out.push({gameId:cur.getInt(0),team:cur.getString(1)});
     } catch(e) {}
-    finally { if (cur) cur.close(); db.close(); }
+    finally { if (cur) cur.close(); }
+    return out;
+    });
     return results;
 }
 
@@ -525,7 +576,8 @@ function findUndefinedParticipants() {
 // 회차 수정
 // =====================================================================
 function rollbackGameStats(gameId) {
-    var db = openDB(); var cur = null;
+    DBH.withDB(DB_PATH, function(db){
+    var cur = null;
     try {
         cur = db.rawQuery("SELECT lol_nickname,is_winner FROM game_participants WHERE game_id=?", [String(gameId)]);
         while (cur.moveToNext()) {
@@ -541,11 +593,13 @@ function rollbackGameStats(gameId) {
             sc.close();
         }
         db.execSQL("UPDATE game_participants SET is_winner=NULL WHERE game_id=?",[String(gameId)]);
-    } finally { if (cur) cur.close(); db.close(); }
+    } finally { if (cur) cur.close(); }
+    });
 }
 
 function applyGameStats(gameId, winningTeam) {
-    var db = openDB(); var cur = null;
+    DBH.withDB(DB_PATH, function(db){
+    var cur = null;
     try {
         cur = db.rawQuery("SELECT id,lol_nickname,team FROM game_participants WHERE game_id=?",[String(gameId)]);
         while (cur.moveToNext()) {
@@ -554,7 +608,8 @@ function applyGameStats(gameId, winningTeam) {
             db.execSQL("UPDATE game_participants SET is_winner=? WHERE id=?",[isWin,rowId]);
             updatePlayerStats(db,n,isWin===1);
         }
-    } finally { if (cur) cur.close(); db.close(); }
+    } finally { if (cur) cur.close(); }
+    });
 }
 
 // =====================================================================
@@ -570,7 +625,8 @@ function getKFactor(games) {
 function calculateExpectedScore(a, b) { return 1/(1+Math.pow(10,(b-a)/400)); }
 
 function calculateAllEloRatings() {
-    var db = openDB(); var gc = null;
+    return DBH.withDB(DB_PATH, function(db){
+    var gc = null;
     var playerStats={}, eloHistory={};
     try {
         gc = db.rawQuery("SELECT id,winning_team FROM games ORDER BY id ASC",[]);
@@ -598,8 +654,9 @@ function calculateAllEloRatings() {
                 playerStats[n].elo=ne; playerStats[n].games++; eloHistory[n].push({gameId:gameId,elo:ne});
             }
         }
-    } finally { if (gc) gc.close(); db.close(); }
+    } finally { if (gc) gc.close(); }
     return { playerStats:playerStats, eloHistory:eloHistory };
+    });
 }
 
 function formatEloRankings(playerStats, excludedPlayers) {
@@ -610,18 +667,19 @@ function formatEloRankings(playerStats, excludedPlayers) {
             filtered.push({nickname:n, elo:playerStats[n].elo, games:playerStats[n].games});
     }
     filtered.sort(function(a,b){ return b.elo-a.elo; });
-    var db = openDB();
-    var result = "=== ELO 레이팅 순위 ===\n";
+    var result = DBH.withDB(DB_PATH, function(db){
+    var res = "=== ELO 레이팅 순위 ===\n";
     for (var i=0;i<filtered.length;i++) {
         var p=filtered[i];
         var sc=db.rawQuery("SELECT wins,losses,win_rate FROM players WHERE lol_nickname=?",[p.nickname]);
         var w=0,l=0,wr=0;
         if (sc.moveToFirst()) { w=sc.getInt(0); l=sc.getInt(1); wr=sc.getFloat(2); }
         sc.close();
-        result += (i+1)+". "+p.nickname+"\n   ELO: "+p.elo+"\n   "+p.games+"전 "+w+"승 "+l+"패 ("+wr.toFixed(1)+"%)";
-        if (i<filtered.length-1) result+="\n";
+        res += (i+1)+". "+p.nickname+"\n   ELO: "+p.elo+"\n   "+p.games+"전 "+w+"승 "+l+"패 ("+wr.toFixed(1)+"%)";
+        if (i<filtered.length-1) res+="\n";
     }
-    db.close();
+    return res;
+    });
     var tot=0, cnt=0;
     for (var n in playerStats) { tot+=playerStats[n].elo; cnt++; }
     result += "\n===================\n평균 ELO: "+(tot/cnt).toFixed(1);
@@ -847,11 +905,14 @@ function handleMessage(msg) {
             }
             if (!hash) { msg.reply("유저 해시를 인식할 수 없습니다."); return; }
             // 이 hash가 가진 모든 롤닉네임 후보
-            var db2 = openDB(); var cur2 = null; var nicks = [];
+            var nicks = DBH.withDB(DB_PATH, function(db2){
+            var cur2 = null; var out = [];
             try {
                 cur2 = db2.rawQuery("SELECT DISTINCT lol_nickname FROM users WHERE hash=?", [hash]);
-                while (cur2.moveToNext()) nicks.push(cur2.getString(0));
-            } finally { if (cur2) cur2.close(); db2.close(); }
+                while (cur2.moveToNext()) out.push(cur2.getString(0));
+            } finally { if (cur2) cur2.close(); }
+            return out;
+            });
             var matched = null;
             for (var i=0; i<nicks.length; i++) {
                 if (st.leftTeam.indexOf(nicks[i])!==-1 || st.rightTeam.indexOf(nicks[i])!==-1) { matched=nicks[i]; break; }
@@ -905,17 +966,20 @@ function handleMessage(msg) {
                 } else {
                     targetNick = input;
                 }
-                var db3 = openDB(); var cur3 = null;
                 var pStats = getPlayerStats(targetNick);
-                if (!pStats || pStats.totalGames===0) { msg.reply(targetNick+" 님의 게임 기록이 없습니다."); db3.close(); return; }
+                if (!pStats || pStats.totalGames===0) { msg.reply(targetNick+" 님의 게임 기록이 없습니다."); return; }
+                var partnerStats = DBH.withDB(DB_PATH, function(db3){
+                var cur3 = null; var acc=[];
+                try {
                 cur3 = db3.rawQuery("SELECT lol_nickname FROM players WHERE total_games>0 AND lol_nickname!=? ORDER BY lol_nickname",[targetNick]);
-                var partnerStats=[];
                 while (cur3.moveToNext()) {
                     var pn=cur3.getString(0), ts=getTeamStats(targetNick,pn);
                     if (ts && ts.sameTeam.totalGames>0)
-                        partnerStats.push({partner:pn,totalGames:ts.sameTeam.totalGames,wins:ts.sameTeam.wins,losses:ts.sameTeam.losses,winRate:ts.sameTeam.winRate});
+                        acc.push({partner:pn,totalGames:ts.sameTeam.totalGames,wins:ts.sameTeam.wins,losses:ts.sameTeam.losses,winRate:ts.sameTeam.winRate});
                 }
-                cur3.close(); db3.close();
+                } finally { if (cur3) cur3.close(); }
+                return acc;
+                });
                 if (!partnerStats.length) { msg.reply(targetNick+" 님과 함께 팀을 이룬 기록이 없습니다."); return; }
                 partnerStats.sort(function(a,b){ return Math.abs(a.winRate-b.winRate)<0.01?b.wins-a.wins:b.winRate-a.winRate; });
                 var m="=== "+targetNick+" 파트너 순위 ===\n";
@@ -965,11 +1029,14 @@ function handleMessage(msg) {
         // ── 팀통계순위 ───────────────────────────────────────────
         else if (text === "!팀통계순위") {
             try {
-                var db4=openDB(); var cur4=null;
+                var players = DBH.withDB(DB_PATH, function(db4){
+                var cur4=null; var acc=[];
+                try {
                 cur4=db4.rawQuery("SELECT lol_nickname FROM players WHERE total_games>0 ORDER BY lol_nickname",[]);
-                var players=[];
-                while (cur4.moveToNext()) players.push(cur4.getString(0));
-                cur4.close(); db4.close();
+                while (cur4.moveToNext()) acc.push(cur4.getString(0));
+                } finally { if (cur4) cur4.close(); }
+                return acc;
+                });
                 if (players.length<2) { msg.reply("플레이어가 부족합니다."); return; }
                 var combos=[];
                 for (var i=0;i<players.length;i++) for (var j=i+1;j<players.length;j++) {
@@ -1010,13 +1077,15 @@ function handleMessage(msg) {
         // ── 순위 ─────────────────────────────────────────────────
         else if (text.startsWith("!순위")) {
             try {
-                var db5=openDB(); var cur5=null;
+                var m = DBH.withDB(DB_PATH, function(db5){
+                var cur5=null;
+                try {
                 cur5=db5.rawQuery(
                     "SELECT p.lol_nickname,p.wins,p.losses,p.total_games,p.win_rate FROM players p " +
                     "LEFT JOIN hiding_players h ON p.lol_nickname=h.lol_nickname " +
                     "WHERE p.total_games>0 AND h.lol_nickname IS NULL " +
                     "ORDER BY p.win_rate DESC, p.wins DESC, p.total_games DESC",[]);
-                if (cur5.getCount()===0) { msg.reply("아직 게임 기록이 없습니다."); cur5.close(); db5.close(); return; }
+                if (cur5.getCount()===0) { msg.reply("아직 게임 기록이 없습니다."); return null; }
                 var m="=== 승률 순위 ===\n"; var rank=1,cr=1,pwr=null,pw=null;
                 while (cur5.moveToNext()) {
                     var n=cur5.getString(0),w=cur5.getInt(1),l=cur5.getInt(2),tot=cur5.getInt(3),wr=cur5.getFloat(4);
@@ -1025,7 +1094,10 @@ function handleMessage(msg) {
                     if (rank<cur5.getCount()) m+="\n";
                     pwr=wr; pw=w; rank++;
                 }
-                cur5.close(); db5.close();
+                return m;
+                } finally { if (cur5) cur5.close(); }
+                });
+                if (m===null) return;
                 msg.reply(m);
             } catch(e) { msg.reply("순위 조회 실패: "+e.message); }
             return;
@@ -1055,7 +1127,7 @@ function handleMessage(msg) {
             if (!nick) { msg.reply("사용법: !숨기기 롤닉네임"); return; }
             if (!isRegisteredNickname(nick)) { msg.reply("등록되지 않은 롤 닉네임입니다."); return; }
             if (isHiddenPlayer(nick)) { msg.reply("'"+nick+"' 은(는) 이미 숨겨져 있습니다."); return; }
-            var db6=openDB(); try { db6.execSQL("INSERT INTO hiding_players(lol_nickname) VALUES(?)",[nick]); } finally { db6.close(); }
+            DBH.withDB(DB_PATH, function(db6){ try { db6.execSQL("INSERT INTO hiding_players(lol_nickname) VALUES(?)",[nick]); } finally {  } });
             msg.reply("🙈 '"+nick+"' 을(를) 순위에서 숨겼습니다.");
             return;
         }
@@ -1065,7 +1137,7 @@ function handleMessage(msg) {
             var nick = text.replace("!숨김해제 ","").trim();
             if (!nick) { msg.reply("사용법: !숨김해제 롤닉네임"); return; }
             if (!isHiddenPlayer(nick)) { msg.reply("'"+nick+"' 은(는) 숨김 상태가 아닙니다."); return; }
-            var db7=openDB(); try { db7.execSQL("DELETE FROM hiding_players WHERE lol_nickname=?",[nick]); } finally { db7.close(); }
+            DBH.withDB(DB_PATH, function(db7){ try { db7.execSQL("DELETE FROM hiding_players WHERE lol_nickname=?",[nick]); } finally {  } });
             msg.reply("👀 '"+nick+"' 을(를) 다시 순위에 표시합니다.");
             return;
         }
@@ -1128,11 +1200,12 @@ function handleMessage(msg) {
             var gid=st.editRecord.gameId, origW=st.editRecord.originalGame.winningTeam;
             var newW=st.editRecord.newWinner||origW;
             if (origW!==newW) { rollbackGameStats(gid); applyGameStats(gid, newW); }
-            var db8=openDB();
+            DBH.withDB(DB_PATH, function(db8){
             try {
                 db8.execSQL("UPDATE games SET winning_team=?,left_team_champions=?,right_team_champions=? WHERE id=?",
                     [newW,(st.editRecord.newLeftChamps||st.editRecord.originalGame.leftChampions).join(","),(st.editRecord.newRightChamps||st.editRecord.originalGame.rightChampions).join(","),gid]);
-            } finally { db8.close(); }
+            } finally {  }
+            });
             st.editRecord.active=false;
             msg.reply("✅ 회차 수정 완료"); return;
         }
@@ -1217,13 +1290,14 @@ function handleMessage(msg) {
         }
         else if (text === "!기록 저장" && st.manualRecord.active) {
             if (!st.manualRecord.winner||!st.manualRecord.gameDate) { msg.reply("입력이 완료되지 않은 항목이 있습니다.\n!기록 확인으로 확인하세요."); return; }
-            var db9=openDB();
+            DBH.withDB(DB_PATH, function(db9){
+            var gid=null;
             try {
-                db9.beginTransaction();
+                DBH.transaction(db9, function(db9){
                 db9.execSQL("INSERT INTO games(left_team,right_team,left_team_champions,right_team_champions,winning_team,game_date) VALUES(?,?,?,?,?,?)",
                     [st.manualRecord.leftTeam.join(","),st.manualRecord.rightTeam.join(","),st.manualRecord.leftChamps.join(","),st.manualRecord.rightChamps.join(","),st.manualRecord.winner,st.manualRecord.gameDate]);
                 var cur9=db9.rawQuery("SELECT last_insert_rowid()",[]);
-                cur9.moveToFirst(); var gid=cur9.getInt(0); cur9.close();
+                cur9.moveToFirst(); gid=cur9.getInt(0); cur9.close();
                 for (var i=0;i<st.manualRecord.leftTeam.length;i++) {
                     var isWL=(st.manualRecord.winner==="left");
                     db9.execSQL("INSERT INTO game_participants(game_id,lol_nickname,team,is_winner) VALUES(?,?,?,?)",[gid,st.manualRecord.leftTeam[i],"left",isWL]);
@@ -1234,11 +1308,12 @@ function handleMessage(msg) {
                     db9.execSQL("INSERT INTO game_participants(game_id,lol_nickname,team,is_winner) VALUES(?,?,?,?)",[gid,st.manualRecord.rightTeam[i],"right",isWR]);
                     updatePlayerStats(db9,st.manualRecord.rightTeam[i],isWR);
                 }
-                db9.setTransactionSuccessful();
+                });
                 st.manualRecord.active=false;
                 msg.reply("저장 완료! 게임ID: "+gid);
             } catch(e) { msg.reply("저장 실패: "+e.message); }
-            finally { try { db9.endTransaction(); } catch(_) {} db9.close(); }
+            finally {  }
+            });
             return;
         }
 

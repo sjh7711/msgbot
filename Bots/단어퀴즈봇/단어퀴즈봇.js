@@ -90,22 +90,21 @@ function roomsForNickname(name) {
     } catch(_) {}
     if (out.length) return out;
     // 2) 폴백: userhash.db (평문 name 인덱스)
-    var db = null; var cur = null;
     try {
-        db = Packages.android.database.sqlite.SQLiteDatabase.openDatabase(
-            USERHASH_DB_PATH, null,
-            Packages.android.database.sqlite.SQLiteDatabase.OPEN_READONLY
-        );
-        cur = db.rawQuery("SELECT DISTINCT room FROM userhash WHERE name = ?", [name]);
-        while (cur.moveToNext()) {
-            var r = cur.getString(0);
-            if (r != null) out.push(String(r));
-        }
+        DBH.withReadOnlyDB(USERHASH_DB_PATH, function(db){
+            var cur = null;
+            try {
+                cur = db.rawQuery("SELECT DISTINCT room FROM userhash WHERE name = ?", [name]);
+                while (cur.moveToNext()) {
+                    var r = cur.getString(0);
+                    if (r != null) out.push(String(r));
+                }
+            } finally {
+                try { if (cur) cur.close(); } catch(_) {}
+            }
+        });
     } catch(e) {
         return out;
-    } finally {
-        try { if (cur) cur.close(); } catch(_) {}
-        try { if (db) db.close(); } catch(_) {}
     }
     return out;
 }
@@ -124,6 +123,18 @@ function openFreqDB() {
         Packages.android.database.sqlite.SQLiteDatabase.OPEN_READONLY
     );
 }
+
+// ─── 공용 DB 헬퍼 (lib/db-helper.js): withDB / withReadOnlyDB / queryAll / transaction ───
+// 이 봇의 DB 접근은 전부 읽기전용(stdict/freq 사전, userhash 폴백)이라 withReadOnlyDB 만 사용.
+var DBH = (function() {
+  var libPath = "/sdcard/msgbot/lib/db-helper.js";
+  try {
+    if (typeof bot.getRootPath === "function") {
+      libPath = bot.getRootPath() + "/../../lib/db-helper.js";
+    }
+  } catch(_) {}
+  return require(libPath);
+})();
 
 // ─── 한글 분해 ──────────────────────────────────────────────────────────────
 function decomposeSyllable(ch) {
@@ -183,27 +194,31 @@ function decomposeToBaseJamo(word) {
 
 // ─── 사전 검사 ──────────────────────────────────────────────────────────────
 function isWordInDict(word) {
-    var db = null; var cur = null;
     try {
-        db = openDictDB();
-        cur = db.rawQuery("SELECT 1 FROM words WHERE norm=? LIMIT 1", [word]);
-        return cur.moveToFirst();
+        return DBH.withReadOnlyDB(DICT_DB_PATH, function(db){
+            var cur = null;
+            try {
+                cur = db.rawQuery("SELECT 1 FROM words WHERE norm=? LIMIT 1", [word]);
+                return cur.moveToFirst();
+            } finally { if (cur) cur.close(); }
+        });
     } catch(e) { return false; }
-    finally { if (cur) cur.close(); if (db) db.close(); }
 }
 
 // ─── 단어 뜻 조회 (없으면 null) ─────────────────────────────────────────────
 function getWordMeaning(word) {
-    var db = null; var cur = null;
     try {
-        db = openDictDB();
-        cur = db.rawQuery("SELECT meaning FROM words WHERE norm=? LIMIT 1", [word]);
-        if (cur.moveToFirst()) {
-            return cur.getString(0);
-        }
-        return null;
+        return DBH.withReadOnlyDB(DICT_DB_PATH, function(db){
+            var cur = null;
+            try {
+                cur = db.rawQuery("SELECT meaning FROM words WHERE norm=? LIMIT 1", [word]);
+                if (cur.moveToFirst()) {
+                    return cur.getString(0);
+                }
+                return null;
+            } finally { if (cur) cur.close(); }
+        });
     } catch(e) { return null; }
-    finally { if (cur) cur.close(); if (db) db.close(); }
 }
 
 // ─── 빈도 DB에서 여러 단어의 빈도를 한 번에 조회 ────────────────────────────
@@ -212,20 +227,22 @@ function getWordMeaning(word) {
 function getWordFreqMap(words) {
     var map = {};
     if (!words || words.length === 0) return map;
-    var db = null; var cur = null;
     try {
-        db = openFreqDB();
-        var placeholders = [];
-        for (var i = 0; i < words.length; i++) placeholders.push('?');
-        cur = db.rawQuery(
-            "SELECT word, freq FROM word_freq WHERE word IN (" + placeholders.join(',') + ")",
-            words
-        );
-        while (cur.moveToNext()) {
-            map[cur.getString(0)] = cur.getInt(1);
-        }
+        DBH.withReadOnlyDB(FREQ_DB_PATH, function(db){
+            var cur = null;
+            try {
+                var placeholders = [];
+                for (var i = 0; i < words.length; i++) placeholders.push('?');
+                cur = db.rawQuery(
+                    "SELECT word, freq FROM word_freq WHERE word IN (" + placeholders.join(',') + ")",
+                    words
+                );
+                while (cur.moveToNext()) {
+                    map[cur.getString(0)] = cur.getInt(1);
+                }
+            } finally { if (cur) cur.close(); }
+        });
     } catch(e) { /* 조회 실패 시 전부 0으로 취급 */ }
-    finally { if (cur) cur.close(); if (db) db.close(); }
     return map;
 }
 
@@ -234,28 +251,30 @@ function getWordFreqMap(words) {
 // 2단계: freq.db에서 각 단어의 빈도 조회
 // 3단계: 빈도가 가장 높은 단어 선정
 function getRandomValidWord() {
-    var db = null; var cur = null;
     var candidates = [];
 
     try {
-        db = openDictDB();
-        // 1~2음절 단어를 랜덤으로 최대 300개 가져와 자모 5개 단어 수집
-        cur = db.rawQuery(
-            "SELECT norm FROM words WHERE length(norm) BETWEEN 1 AND 2 ORDER BY RANDOM() LIMIT 500",
-            []
-        );
-        while (cur.moveToNext() && candidates.length < 20) {
-            var word = cur.getString(0);
-            var jamos = decomposeToBaseJamo(word);
-            if (jamos && jamos.length === 5) {
-                candidates.push({ word: word, jamo: jamos });
+        DBH.withReadOnlyDB(DICT_DB_PATH, function(db){
+            var cur = null;
+            try {
+                // 1~2음절 단어를 랜덤으로 최대 300개 가져와 자모 5개 단어 수집
+                cur = db.rawQuery(
+                    "SELECT norm FROM words WHERE length(norm) BETWEEN 1 AND 2 ORDER BY RANDOM() LIMIT 500",
+                    []
+                );
+                while (cur.moveToNext() && candidates.length < 20) {
+                    var word = cur.getString(0);
+                    var jamos = decomposeToBaseJamo(word);
+                    if (jamos && jamos.length === 5) {
+                        candidates.push({ word: word, jamo: jamos });
+                    }
+                }
+            } finally {
+                if (cur) cur.close();
             }
-        }
+        });
     } catch(e) {
         return null;
-    } finally {
-        if (cur) cur.close();
-        if (db) db.close();
     }
 
     if (candidates.length === 0) return null;

@@ -33,11 +33,19 @@ function toViewStr(yyyymmdd){ try{ var d = parseDateStr(yyyymmdd); return VIEW_F
 function trim(s){ return (s||"").replace(/^\s+|\s+$/g, ""); }
 
 // === DB 오픈/초기화 ===
-function openDB(){ return Packages.android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(DB_PATH, null); }
+// ─── 공용 DB 헬퍼 (lib/db-helper.js): withDB / queryAll / transaction ───
+var DBH = (function() {
+  var libPath = "/sdcard/msgbot/lib/db-helper.js";
+  try {
+    if (typeof bot.getRootPath === "function") {
+      libPath = bot.getRootPath() + "/../../lib/db-helper.js";
+    }
+  } catch(_) {}
+  return require(libPath);
+})();
 
 function initDatabase(){
-  var db = openDB();
-  try{
+  DBH.withDB(DB_PATH, function(db){
     db.execSQL(
       "CREATE TABLE IF NOT EXISTS records_v2 ("+
       " id INTEGER PRIMARY KEY AUTOINCREMENT,"+
@@ -77,7 +85,7 @@ function initDatabase(){
     while (colCur.moveToNext()){ if (colCur.getString(1) === "time"){ hasTimeCol = true; break; } }
     colCur.close();
     if (!hasTimeCol) db.execSQL("ALTER TABLE records_v2 ADD COLUMN time INTEGER");
-  } finally { db.close(); }
+  });
 }
 initDatabase();
 
@@ -85,55 +93,59 @@ initDatabase();
 function isValidKoreanName(name){ return /^([가-힣])$/.test(name); }
 
 function getAllUsers(){
-  var db = openDB(); var cur=null; var out=[];
-  try{
-    cur = db.rawQuery("SELECT name FROM users ORDER BY name ASC", []);
-    while (cur.moveToNext()) out.push(cur.getString(0));
-  } finally { if (cur) cur.close(); db.close(); }
-  return out;
+  return DBH.withDB(DB_PATH, function(db){
+    var rows = DBH.queryAll(db, "SELECT name FROM users ORDER BY name ASC");
+    var out=[];
+    for (var i=0;i<rows.length;i++) out.push(rows[i].name);
+    return out;
+  });
 }
 
 function getAllGamesOrdered(){
-  var db = openDB(); var cur=null; var out=[];
-  try{
-    cur = db.rawQuery("SELECT key FROM games ORDER BY ord ASC", []);
-    while (cur.moveToNext()) out.push(cur.getString(0));
-  } finally { if (cur) cur.close(); db.close(); }
-  return out;
+  return DBH.withDB(DB_PATH, function(db){
+    var rows = DBH.queryAll(db, "SELECT key FROM games ORDER BY ord ASC");
+    var out=[];
+    for (var i=0;i<rows.length;i++) out.push(rows[i].key);
+    return out;
+  });
 }
 
-function gameExists(key){ var db=openDB(); var cur=null; try{ cur=db.rawQuery("SELECT 1 FROM games WHERE key=?", [key]); return cur.moveToFirst(); } finally { if(cur)cur.close(); db.close(); } }
-function userExists(name){ var db=openDB(); var cur=null; try{ cur=db.rawQuery("SELECT 1 FROM users WHERE name=?", [name]); return cur.moveToFirst(); } finally { if(cur)cur.close(); db.close(); } }
+function gameExists(key){ return DBH.withDB(DB_PATH, function(db){ var cur=null; try{ cur=db.rawQuery("SELECT 1 FROM games WHERE key=?", [key]); return cur.moveToFirst(); } finally { if(cur)cur.close(); } }); }
+function userExists(name){ return DBH.withDB(DB_PATH, function(db){ var cur=null; try{ cur=db.rawQuery("SELECT 1 FROM users WHERE name=?", [name]); return cur.moveToFirst(); } finally { if(cur)cur.close(); } }); }
 
 function registerGame(key){
   key = (key||"").toLowerCase();
   if (!/^[A-Za-z]$/.test(key)) return "게임키는 1글자 영문만 가능합니다.";
-  var db = openDB(); var cur=null;
-  try{
-    cur = db.rawQuery("SELECT ord FROM games WHERE key=?", [key]);
-    if (cur.moveToFirst()) return "이미 등록된 게임입니다: "+key;
-    cur.close();
-    cur = db.rawQuery("SELECT IFNULL(MAX(ord),0) FROM games", []);
-    var next = 1; if (cur.moveToFirst()) next = cur.getInt(0) + 1; cur.close();
-    var st = db.compileStatement("INSERT INTO games(key, ord) VALUES(?,?)");
-    st.bindString(1, key); st.bindLong(2, next); st.execute(); st.close();
-    return "게임 등록 완료: "+key+" (순서 "+next+")";
-  } finally { if (cur) cur.close(); db.close(); }
+  return DBH.withDB(DB_PATH, function(db){
+    var cur=null;
+    try{
+      cur = db.rawQuery("SELECT ord FROM games WHERE key=?", [key]);
+      if (cur.moveToFirst()) return "이미 등록된 게임입니다: "+key;
+      cur.close();
+      cur = db.rawQuery("SELECT IFNULL(MAX(ord),0) FROM games", []);
+      var next = 1; if (cur.moveToFirst()) next = cur.getInt(0) + 1; cur.close();
+      var st = db.compileStatement("INSERT INTO games(key, ord) VALUES(?,?)");
+      st.bindString(1, key); st.bindLong(2, next); st.execute(); st.close();
+      return "게임 등록 완료: "+key+" (순서 "+next+")";
+    } finally { if (cur) cur.close(); }
+  });
 }
 
 function registerUser(name){
   name = trim(name||"");
   if (!name) return "형식: !유저등록 [이름]";
   if (!isValidKoreanName(name)) return "유저 이름은 1글자여야 합니다.";
-  var db = openDB(); var cur=null;
-  try{
-    cur = db.rawQuery("SELECT 1 FROM users WHERE name=?", [name]);
-    if (cur.moveToFirst()) return "이미 등록된 유저입니다: "+name;
-    cur.close();
-    var st = db.compileStatement("INSERT INTO users(name) VALUES(?)");
-    st.bindString(1, name); st.execute(); st.close();
-    return "유저 등록 완료: "+name;
-  } finally { if (cur) cur.close(); db.close(); }
+  return DBH.withDB(DB_PATH, function(db){
+    var cur=null;
+    try{
+      cur = db.rawQuery("SELECT 1 FROM users WHERE name=?", [name]);
+      if (cur.moveToFirst()) return "이미 등록된 유저입니다: "+name;
+      cur.close();
+      var st = db.compileStatement("INSERT INTO users(name) VALUES(?)");
+      st.bindString(1, name); st.execute(); st.close();
+      return "유저 등록 완료: "+name;
+    } finally { if (cur) cur.close(); }
+  });
 }
 
 // === 파싱 유틸 ===
@@ -190,40 +202,46 @@ function parseGameLines(lines, allowedUsers, allowedGames){
 
 // === 저장 ===
 function saveV2(dateStr, parsed){
-  var db = openDB(); db.beginTransaction();
-  try{
-    for (var g in parsed){
-      var groups = parsed[g];
-      var currentRank = 1;
-      for (var r = 0; r < groups.length; r++){
-        var arr = groups[r];
-        for (var i = 0; i < arr.length; i++){
-          upsertV2(db, dateStr, g, arr[i], currentRank);
+  DBH.withDB(DB_PATH, function(db){
+    DBH.transaction(db, function(db){
+      for (var g in parsed){
+        var groups = parsed[g];
+        var currentRank = 1;
+        for (var r = 0; r < groups.length; r++){
+          var arr = groups[r];
+          for (var i = 0; i < arr.length; i++){
+            upsertV2(db, dateStr, g, arr[i], currentRank);
+          }
+          currentRank += arr.length;
         }
-        currentRank += arr.length;
       }
-    }
-    db.setTransactionSuccessful();
-  } finally { db.endTransaction(); db.close(); }
+    });
+  });
 }
 
 // === 조회 유틸 ===
 function getGamesInRangeOrdered(fromStr, toStr){
-  var db = openDB(); var cur=null; var usedSet={};
-  try{
-    cur = db.rawQuery("SELECT DISTINCT game FROM records_v2 WHERE play_date BETWEEN ? AND ?", [fromStr, toStr]);
-    while (cur.moveToNext()) usedSet[cur.getString(0)] = true;
-  } finally { if (cur) cur.close(); db.close(); }
+  var usedSet = DBH.withDB(DB_PATH, function(db){
+    var cur=null; var s={};
+    try{
+      cur = db.rawQuery("SELECT DISTINCT game FROM records_v2 WHERE play_date BETWEEN ? AND ?", [fromStr, toStr]);
+      while (cur.moveToNext()) s[cur.getString(0)] = true;
+    } finally { if (cur) cur.close(); }
+    return s;
+  });
   var all = getAllGamesOrdered(); var out=[]; for (var i=0;i<all.length;i++){ if (usedSet[all[i]]) out.push(all[i]); }
   return out;
 }
 
 function getAllPlayersInRange(fromStr, toStr){
-  var db = openDB(); var cur=null; var set={};
-  try{
-    cur = db.rawQuery("SELECT DISTINCT player FROM records_v2 WHERE play_date BETWEEN ? AND ?", [fromStr, toStr]);
-    while (cur.moveToNext()) set[cur.getString(0)] = true;
-  } finally { if (cur) cur.close(); db.close(); }
+  var set = DBH.withDB(DB_PATH, function(db){
+    var cur=null; var s={};
+    try{
+      cur = db.rawQuery("SELECT DISTINCT player FROM records_v2 WHERE play_date BETWEEN ? AND ?", [fromStr, toStr]);
+      while (cur.moveToNext()) s[cur.getString(0)] = true;
+    } finally { if (cur) cur.close(); }
+    return s;
+  });
   var reg = getAllUsers(); var out=[]; var regSet={}; for (var i=0;i<reg.length;i++) regSet[reg[i]]=true;
   for (var k in set){ if (regSet[k]) out.push(k); }
   out.sort();
@@ -244,20 +262,22 @@ function loadAugmentedRecords(fromStr, toStr, gameKeysFilter){
 
   // d -> { ranks:{game:{player:rank}}, gamesSet:{game:true}, partSet:{player:true} }
   var dayInfo = {};
-  var db = openDB(); var cur = null;
-  try{
-    cur = db.rawQuery("SELECT play_date, game, player, rank FROM records_v2 WHERE play_date BETWEEN ? AND ?", [fromStr, toStr]);
-    while (cur.moveToNext()){
-      var d = cur.getString(0), g = cur.getString(1), p = cur.getString(2), r = cur.getInt(3);
-      if (!regSet[p]) continue;        // 미등록 유저는 집계 제외(getAllPlayersInRange 와 동일 기준)
-      if (!dayInfo[d]) dayInfo[d] = { ranks:{}, gamesSet:{}, partSet:{} };
-      var di = dayInfo[d];
-      di.gamesSet[g] = true;
-      di.partSet[p] = true;            // 그날 1게임이라도 참가한 인원(게임 필터와 무관)
-      if (!di.ranks[g]) di.ranks[g] = {};
-      di.ranks[g][p] = r;
-    }
-  } finally { if (cur) cur.close(); db.close(); }
+  DBH.withDB(DB_PATH, function(db){
+    var cur = null;
+    try{
+      cur = db.rawQuery("SELECT play_date, game, player, rank FROM records_v2 WHERE play_date BETWEEN ? AND ?", [fromStr, toStr]);
+      while (cur.moveToNext()){
+        var d = cur.getString(0), g = cur.getString(1), p = cur.getString(2), r = cur.getInt(3);
+        if (!regSet[p]) continue;        // 미등록 유저는 집계 제외(getAllPlayersInRange 와 동일 기준)
+        if (!dayInfo[d]) dayInfo[d] = { ranks:{}, gamesSet:{}, partSet:{} };
+        var di = dayInfo[d];
+        di.gamesSet[g] = true;
+        di.partSet[p] = true;            // 그날 1게임이라도 참가한 인원(게임 필터와 무관)
+        if (!di.ranks[g]) di.ranks[g] = {};
+        di.ranks[g][p] = r;
+      }
+    } finally { if (cur) cur.close(); }
+  });
 
   var out = [];
   for (var d in dayInfo){
@@ -354,10 +374,15 @@ function prettyRankLineFromGroups(groups){ var out=[]; for (var i=0;i<groups.len
 
 // === 기간 파싱 ===
 function getFullRangeFromDB(){
-  var db = openDB(); var cur=null; try{
-    cur = db.rawQuery("SELECT MIN(play_date), MAX(play_date) FROM records_v2", []);
-    if (cur.moveToFirst()){ var minD=cur.getString(0), maxD=cur.getString(1); if (minD && maxD) return { from:minD, to:maxD, view: toViewStr(minD)+" ~ "+toViewStr(maxD) }; }
-  } finally { if (cur) cur.close(); db.close(); }
+  var found = DBH.withDB(DB_PATH, function(db){
+    var cur=null;
+    try{
+      cur = db.rawQuery("SELECT MIN(play_date), MAX(play_date) FROM records_v2", []);
+      if (cur.moveToFirst()){ var minD=cur.getString(0), maxD=cur.getString(1); if (minD && maxD) return { from:minD, to:maxD, view: toViewStr(minD)+" ~ "+toViewStr(maxD) }; }
+    } finally { if (cur) cur.close(); }
+    return null;
+  });
+  if (found) return found;
   var today=todayStr(); return { from:today, to:today, view: toViewStr(today) };
 }
 
@@ -462,16 +487,19 @@ function handleRank(arg){
 }
 
 // === 핸들러: 일자 상세 ===
-function loadDayV2(dateStr){ var db=openDB(); var cur=null; var map={}; try{ cur=db.rawQuery("SELECT game, player, rank FROM records_v2 WHERE play_date=? ORDER BY game, rank", [dateStr]); while (cur.moveToNext()){ var g=cur.getString(0), p=cur.getString(1), r=cur.getInt(2); if(!map[g]) map[g]=[]; while (map[g].length<r) map[g].push([]); map[g][r-1].push(p); } } finally { if (cur) cur.close(); db.close(); } return map; }
+function loadDayV2(dateStr){ return DBH.withDB(DB_PATH, function(db){ var cur=null; var map={}; try{ cur=db.rawQuery("SELECT game, player, rank FROM records_v2 WHERE play_date=? ORDER BY game, rank", [dateStr]); while (cur.moveToNext()){ var g=cur.getString(0), p=cur.getString(1), r=cur.getInt(2); if(!map[g]) map[g]=[]; while (map[g].length<r) map[g].push([]); map[g][r-1].push(p); } } finally { if (cur) cur.close(); } return map; }); }
 function handleDetail(argText){
   var range = getRangeFromArg(trim(argText||""));
   if (range.error) return range.error;
 
-  var db = openDB(); var cur = null; var dates = [];
-  try {
-    cur = db.rawQuery("SELECT DISTINCT play_date FROM records_v2 WHERE play_date BETWEEN ? AND ? ORDER BY play_date", [range.from, range.to]);
-    while (cur.moveToNext()) dates.push(cur.getString(0));
-  } finally { if (cur) cur.close(); db.close(); }
+  var dates = DBH.withDB(DB_PATH, function(db){
+    var cur = null; var d = [];
+    try {
+      cur = db.rawQuery("SELECT DISTINCT play_date FROM records_v2 WHERE play_date BETWEEN ? AND ? ORDER BY play_date", [range.from, range.to]);
+      while (cur.moveToNext()) d.push(cur.getString(0));
+    } finally { if (cur) cur.close(); }
+    return d;
+  });
 
   if (!dates.length) return range.view + " 기록이 없습니다.";
 
@@ -524,19 +552,22 @@ function formatTime(secs) {
 }
 
 function buildTimeSection(dateStr) {
-  var db = openDB(); var cur = null; var gameData = {};
-  try {
-    cur = db.rawQuery(
-      "SELECT game, player, rank, time FROM records_v2 WHERE play_date=? ORDER BY game, rank",
-      [dateStr]
-    );
-    while (cur.moveToNext()) {
-      var g = cur.getString(0), p = cur.getString(1), r = cur.getInt(2);
-      var t = cur.isNull(3) ? null : cur.getInt(3);
-      if (!gameData[g]) gameData[g] = [];
-      gameData[g].push({ player: p, rank: r, time: t });
-    }
-  } finally { if (cur) cur.close(); db.close(); }
+  var gameData = DBH.withDB(DB_PATH, function(db){
+    var cur = null; var gd = {};
+    try {
+      cur = db.rawQuery(
+        "SELECT game, player, rank, time FROM records_v2 WHERE play_date=? ORDER BY game, rank",
+        [dateStr]
+      );
+      while (cur.moveToNext()) {
+        var g = cur.getString(0), p = cur.getString(1), r = cur.getInt(2);
+        var t = cur.isNull(3) ? null : cur.getInt(3);
+        if (!gd[g]) gd[g] = [];
+        gd[g].push({ player: p, rank: r, time: t });
+      }
+    } finally { if (cur) cur.close(); }
+    return gd;
+  });
 
   var allGames = getAllGamesOrdered();
   var usedGames = [];
@@ -610,19 +641,22 @@ function userStatsSummary(player, fromStr, toStr, viewLabel){
 function handlePerfectWins(player){
   if (!userExists(player)) return "미등록 유저입니다: " + player;
 
-  var db = openDB(); var cur = null;
-  var rows = [];
-  try {
-    cur = db.rawQuery(
-      "SELECT play_date, GROUP_CONCAT(DISTINCT game) " +
-      "FROM records_v2 " +
-      "GROUP BY play_date " +
-      "HAVING COUNT(DISTINCT game) = COUNT(DISTINCT CASE WHEN player=? AND rank=1 THEN game END) " +
-      "ORDER BY play_date ASC",
-      [player]
-    );
-    while (cur.moveToNext()) rows.push({ date: cur.getString(0), games: cur.getString(1) });
-  } finally { if(cur) cur.close(); db.close(); }
+  var rows = DBH.withDB(DB_PATH, function(db){
+    var cur = null;
+    var rr = [];
+    try {
+      cur = db.rawQuery(
+        "SELECT play_date, GROUP_CONCAT(DISTINCT game) " +
+        "FROM records_v2 " +
+        "GROUP BY play_date " +
+        "HAVING COUNT(DISTINCT game) = COUNT(DISTINCT CASE WHEN player=? AND rank=1 THEN game END) " +
+        "ORDER BY play_date ASC",
+        [player]
+      );
+      while (cur.moveToNext()) rr.push({ date: cur.getString(0), games: cur.getString(1) });
+    } finally { if(cur) cur.close(); }
+    return rr;
+  });
 
   if (rows.length === 0) return player + "의 완승 기록이 없습니다.";
 
@@ -653,23 +687,25 @@ function handleRankStats(player){
   if (!userExists(player)) return "미등록 유저입니다: " + player;
 
   var rg = getFullRangeFromDB();
-  var db = openDB(); var cur=null;
-  var dayMap = {};
-
-  try {
-    cur = db.rawQuery(
-      "SELECT play_date, player, rank FROM records_v2 ORDER BY play_date, player",
-      []
-    );
-    while (cur.moveToNext()){
-      var d = cur.getString(0);
-      var p = cur.getString(1);
-      var r = cur.getInt(2);
-      if (!dayMap[d]) dayMap[d] = {};
-      if (!dayMap[d][p]) dayMap[d][p] = 0;
-      dayMap[d][p] += r;
-    }
-  } finally { if (cur) cur.close(); db.close(); }
+  var dayMap = DBH.withDB(DB_PATH, function(db){
+    var cur=null;
+    var dm = {};
+    try {
+      cur = db.rawQuery(
+        "SELECT play_date, player, rank FROM records_v2 ORDER BY play_date, player",
+        []
+      );
+      while (cur.moveToNext()){
+        var d = cur.getString(0);
+        var p = cur.getString(1);
+        var r = cur.getInt(2);
+        if (!dm[d]) dm[d] = {};
+        if (!dm[d][p]) dm[d][p] = 0;
+        dm[d][p] += r;
+      }
+    } finally { if (cur) cur.close(); }
+    return dm;
+  });
 
   var rankCount = {1:0, 2:0, 3:0, 4:0};
   var totalDays = 0;
@@ -884,35 +920,35 @@ function handleUnifiedRank(argText){
 }
 
 function loadDailyOverallScores(fromStr, toStr){
-  var db = openDB();
-  var cur = null;
-  var dayMap = {};
+  return DBH.withDB(DB_PATH, function(db){
+    var cur = null;
+    var dayMap = {};
 
-  try {
-    cur = db.rawQuery(
-      "SELECT play_date, player, rank " +
-      "FROM records_v2 " +
-      "WHERE play_date BETWEEN ? AND ? " +
-      "ORDER BY play_date, player",
-      [fromStr, toStr]
-    );
+    try {
+      cur = db.rawQuery(
+        "SELECT play_date, player, rank " +
+        "FROM records_v2 " +
+        "WHERE play_date BETWEEN ? AND ? " +
+        "ORDER BY play_date, player",
+        [fromStr, toStr]
+      );
 
-    while (cur.moveToNext()){
-      var d = cur.getString(0);
-      var p = cur.getString(1);
-      var r = cur.getInt(2);
+      while (cur.moveToNext()){
+        var d = cur.getString(0);
+        var p = cur.getString(1);
+        var r = cur.getInt(2);
 
-      if (!dayMap[d]) dayMap[d] = {};
-      if (!dayMap[d][p]) dayMap[d][p] = 0;
+        if (!dayMap[d]) dayMap[d] = {};
+        if (!dayMap[d][p]) dayMap[d][p] = 0;
 
-      dayMap[d][p] += r;
+        dayMap[d][p] += r;
+      }
+    } finally {
+      if (cur) cur.close();
     }
-  } finally {
-    if (cur) cur.close();
-    db.close();
-  }
 
-  return dayMap;
+    return dayMap;
+  });
 }
 
 function calcDailyOverallRanks(dayScores){
@@ -1198,31 +1234,24 @@ function handleAutoRecord(dateArg) {
     timeMap[e.game][e.player] = e.time;
   }
 
-  var db = openDB();
-  db.beginTransaction();
-  var rankGroups = {};
-
-  try {
-    rankGroups = calcRanksFromEntries(entries);
-    for (var g in rankGroups) {
-      if (!rankGroups.hasOwnProperty(g)) continue;
-      var groups = rankGroups[g];
-      var currentRank = 1;
-      for (var r = 0; r < groups.length; r++) {
-        var grp = groups[r];
-        for (var k = 0; k < grp.length; k++) {
-          var t = (timeMap[g] && timeMap[g][grp[k]] != null) ? timeMap[g][grp[k]] : null;
-          upsertV2(db, dbDateStr, g, grp[k], currentRank, t);
+  DBH.withDB(DB_PATH, function(db){
+    DBH.transaction(db, function(db){
+      var rankGroups = calcRanksFromEntries(entries);
+      for (var g in rankGroups) {
+        if (!rankGroups.hasOwnProperty(g)) continue;
+        var groups = rankGroups[g];
+        var currentRank = 1;
+        for (var r = 0; r < groups.length; r++) {
+          var grp = groups[r];
+          for (var k = 0; k < grp.length; k++) {
+            var t = (timeMap[g] && timeMap[g][grp[k]] != null) ? timeMap[g][grp[k]] : null;
+            upsertV2(db, dbDateStr, g, grp[k], currentRank, t);
+          }
+          currentRank += grp.length;
         }
-        currentRank += grp.length;
       }
-    }
-
-    db.setTransactionSuccessful();
-  } finally {
-    db.endTransaction();
-    db.close();
-  }
+    });
+  });
 
   var lines = [];
   lines.push("[자동기록 완료] " + toViewStr(dbDateStr));
