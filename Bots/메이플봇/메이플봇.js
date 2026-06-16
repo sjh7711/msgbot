@@ -2,8 +2,9 @@ const bot = BotManager.getCurrentBot();
 
 // =====================================================================
 // 메이플봇 — 메이플스토리 이벤트/공지 신규 게시물 알림
-//  - https://maplestory.nexon.com/News/Event  폴링 (30초 ±10초)
-//  - https://maplestory.nexon.com/News/Notice 폴링 (동일 주기)
+//  - https://maplestory.nexon.com/News/Event           폴링 (30초 ±10초)
+//  - https://maplestory.nexon.com/News/Notice          폴링 (동일 주기)
+//  - https://maplestory.nexon.com/Testworld/News/All   폴링 (동일 주기, 테스트서버 공지)
 //  - !메알림 시작   : 현재 방에 알림 등록
 //  - !메알림 중지   : 알림 중지
 //  - !메알림 상태   : 현재 상태 확인
@@ -20,8 +21,9 @@ const BOT_NAME = "메이플봇";
 
 // === 상수 ===
 var TARGETS = [
-    { key: "event",  url: "https://maplestory.nexon.com/News/Event",  label: "메이플 이벤트"  },
-    { key: "notice", url: "https://maplestory.nexon.com/News/Notice", label: "메이플 공지사항" }
+    { key: "event",      url: "https://maplestory.nexon.com/News/Event",         label: "메이플 이벤트"  },
+    { key: "notice",     url: "https://maplestory.nexon.com/News/Notice",        label: "메이플 공지" },
+    { key: "testnotice", url: "https://maplestory.nexon.com/Testworld/News/All", label: "메이플 테스트서버 공지" }
 ];
 var BASE_URL     = "https://maplestory.nexon.com";
 var POLL_BASE_MS = 30000;
@@ -34,6 +36,9 @@ var STATE_PATH   = Packages.android.os.Environment
 var notifyTargets = []; // [{ room, packageName }, ...]
 var keepPolling   = false;
 var pollThread    = null;
+// 폴링 스레드 이름. 재컴파일 시 옛 컨텍스트의 폴링 스레드를 이름으로 찾아 정리하므로
+// 반드시 고정 문자열이어야 한다 (subscriber.js 의 WORKER_NAME 과 같은 역할).
+var POLL_THREAD_NAME = "maple-poll";
 
 // 긴 메시지 구분자 (제로폭 공백 500개) — 미리보기 줄바꿈 강제용
 var LONG_MSG_SPACER = "​".repeat(500);
@@ -276,10 +281,45 @@ function parseNoticePage(html) {
 }
 
 // =====================================================================
+// 테스트월드 공지 페이지 파싱 — div.news_board 기반 (정규 공지와 구조는 유사하나
+// 링크가 소문자 /testworld/news/all/{ID} 형식이고 분류 img 의 alt 가 비어 있음).
+// 분류 태그가 없으므로 제목(<span>)만 추출한다. target.label 이 알림 머리말이 됨.
+// =====================================================================
+function parseTestworldPage(html) {
+    var events     = [];
+    var seenInPage = {};
+    // 소문자 /testworld/news/all/{숫자ID} 형식만 매칭 (페이지네이션 /Testworld/News/All?page=N 은 대문자라 제외됨)
+    var re = /href="(\/testworld\/news\/all\/(\d+)[^"]*)"/g;
+    var m;
+    while ((m = re.exec(html)) !== null) {
+        var path = m[1];
+        var id   = m[2];
+        if (seenInPage[id]) continue;
+        seenInPage[id] = true;
+        var url     = BASE_URL + path;
+        var snippet = html.substring(m.index, Math.min(html.length, m.index + 600));
+        var aEnd    = snippet.indexOf("</a>");
+        var aBlock  = aEnd > 0 ? snippet.substring(0, aEnd + 4) : snippet.substring(0, 500);
+
+        // 제목: <span>텍스트</span> (내부 modify_common em 등 태그는 제거)
+        // modify_common("수정") 가 제목 앞에 붙으면 그대로 살려 제목 수정 감지에 활용.
+        var title = "";
+        var spanMatch = aBlock.match(/<span[^>]*>([\s\S]*?)<\/span>/);
+        if (spanMatch) {
+            title = spanMatch[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+        }
+
+        events.push({ id: id, url: url, title: decodeEntities(title || ("#" + id)) });
+    }
+    return events;
+}
+
+// =====================================================================
 // 타깃별 파서 호출
 // =====================================================================
 function parsePage(html, target) {
-    if (target.key === "notice") return parseNoticePage(html);
+    if (target.key === "testnotice") return parseTestworldPage(html);
+    if (target.key === "notice")     return parseNoticePage(html);
     return parseEventPage(html);
 }
 
@@ -414,7 +454,10 @@ function checkAndNotify() {
         }
         sendNotify(out, targets);
         if (j < toNotify.length - 1) {
-            try { java.lang.Thread.sleep(1000); } catch (e) {}
+            // 재컴파일 정리(interrupt) 신호를 삼키지 말 것: 플래그를 되살리고 남은 알림
+            // 전송을 중단해야 옛 스레드가 즉시 종료된다 (run 루프 while 조건/하단 sleep 가 감지).
+            try { java.lang.Thread.sleep(1000); }
+            catch (e) { java.lang.Thread.currentThread().interrupt(); break; }
         }
     }
 }
@@ -422,13 +465,42 @@ function checkAndNotify() {
 // =====================================================================
 // 폴링 스레드 시작 / 중지
 // =====================================================================
+// 재컴파일로 누수된 옛 maple-poll 스레드 정리.
+//   MessengerBot 재컴파일은 새 JS 컨텍스트만 만들 뿐, 옛 컨텍스트의 데몬 스레드는
+//   죽이지 않는다. 옛 폴링 스레드는 keepPolling(옛 클로저) 이 계속 true 라 스스로
+//   끝나지 않으므로, 새 폴링 스레드를 띄우기 전에 이름으로 찾아 interrupt 한다.
+//   (subscriber.js killOldThreads 와 동일 패턴 — 워커가 아닌 폴링 스레드 전용)
+//   interrupt → run 루프의 Thread.sleep 가 깨지며 catch(ie){break} 로 종료.
+function killOldPollThreads() {
+    try {
+        var root = java.lang.Thread.currentThread().getThreadGroup();
+        while (root.getParent() != null) root = root.getParent();
+        var n = root.activeCount() + 32;
+        var arr = java.lang.reflect.Array.newInstance(java.lang.Thread, n);
+        var got = root.enumerate(arr, true);
+        for (var i = 0; i < got; i++) {
+            var t = arr[i];
+            if (!t) continue;
+            if (String(t.getName() || "") === POLL_THREAD_NAME) {
+                try { t.interrupt(); } catch (_) {}
+            }
+        }
+    } catch (_) {}
+}
+
 function startPolling() {
     if (keepPolling) return;
+    // 새 폴링 스레드 생성 전에 누수됐을 수 있는 옛 maple-poll 스레드를 먼저 정리.
+    // (아직 이번 컨텍스트의 스레드는 만들지 않았으므로 옛 스레드만 대상이 됨)
+    killOldPollThreads();
     keepPolling = true;
 
     pollThread = new java.lang.Thread(new java.lang.Runnable({
         run: function () {
-            while (keepPolling) {
+            // 루프 조건에 라이브 interrupt 플래그를 함께 검사한다 (캐노니컬 ChatManager 폴러와 동일).
+            // keepPolling 만으로는, checkAndNotify 내부 sleep 이 interrupt 를 삼키고 플래그를
+            // 지운 경우(아래 알림 간 sleep) 옛 스레드가 살아남을 수 있으므로 이중 방어.
+            while (keepPolling && !java.lang.Thread.currentThread().isInterrupted()) {
                 try { checkAndNotify(); } catch (e) {}
                 var delay = POLL_BASE_MS + Math.floor((Math.random() * 2 - 1) * POLL_JITTER);
                 delay = Math.max(20000, Math.min(40000, delay));
@@ -437,8 +509,21 @@ function startPolling() {
         }
     }));
     pollThread.setDaemon(true);
-    pollThread.setName("maple-poll");
+    pollThread.setName(POLL_THREAD_NAME);
     pollThread.start();
+
+    // 스레드 레지스트리에 등록 → ChatManager !스레드 목록에 노출되고 !스레드킬 로 정리 가능.
+    // (실패해도 폴링 자체에는 영향 없음). registerThread 는 replace=true 라 같은
+    //  (name,bot,kind) 옛 항목을 먼저 지운다.
+    try {
+        var libPath = "/sdcard/msgbot/lib/thread-registry.js";
+        try {
+            if (typeof bot.getRootPath === "function") {
+                libPath = bot.getRootPath() + "/../../lib/thread-registry.js";
+            }
+        } catch (_) {}
+        require(libPath).registerThread(POLL_THREAD_NAME, BOT_NAME, pollThread);
+    } catch (_) {}
 }
 
 function stopPolling() {
@@ -543,9 +628,11 @@ function handleMessage(msg) {
         var seenIds = _seenIds || {};   // 인메모리 권위본
         var evCnt   = 0;
         var ntCnt   = 0;
+        var tnCnt   = 0;
         for (var k in seenIds) {
             if (!seenIds.hasOwnProperty(k)) continue;
             if (k.indexOf("event:") === 0) evCnt++;
+            else if (k.indexOf("testnotice:") === 0) tnCnt++;
             else if (k.indexOf("notice:") === 0) ntCnt++;
         }
         var roomLines = notifyTargets.length
@@ -555,7 +642,8 @@ function handleMessage(msg) {
             "폴링 상태: " + status + "\n" +
             "구독 방 (" + notifyTargets.length + "개):\n" + roomLines + "\n" +
             "감지된 이벤트: " + evCnt + "개\n" +
-            "감지된 공지: " + ntCnt + "개"
+            "감지된 공지: " + ntCnt + "개\n" +
+            "감지된 테스트서버 공지: " + tnCnt + "개"
         );
         return;
     }
@@ -603,8 +691,9 @@ function isMyCommand(text) {
 }
 
 // ─── 메시지 큐 + 워커 스레드 (ChatManager 구독, 공용 subscriber 모듈) ─────────
-// 명령 워커만 subscriber.js 로 위임. 폴링 스레드(maple-poll)는 startPolling/stopPolling 가
-// 그대로 관리하며 subscriber.js 의 killOldThreads(WORKER_NAME 만 대상)와 무관하다.
+// 명령 워커는 subscriber.js 가 killOldThreads(WORKER_NAME) 로 정리한다.
+// 폴링 스레드(maple-poll)는 별개로, startPolling 이 직접 killOldPollThreads()(POLL_THREAD_NAME 대상)
+// 로 옛 스레드를 정리하고 thread-registry 에 등록한다 → 재컴파일 시 누수 없음.
 var WORKER_NAME = "MAPLE_BOT_WORKER";
 
 var subscribe = (function() {

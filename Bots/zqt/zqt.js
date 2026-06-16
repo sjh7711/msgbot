@@ -1234,9 +1234,14 @@ function handleAutoRecord(dateArg) {
     timeMap[e.game][e.player] = e.time;
   }
 
+  // rankGroups 는 콜백 밖(출력 루프, 아래)에서도 쓰이므로 handleAutoRecord 스코프에서 선언해야 한다.
+  // (이전엔 transaction 콜백 안에서 var 선언 → 콜백 밖 출력부에서 ReferenceError 로 reply 가 안 나갔음.
+  //  DB 쓰기는 콜백 안에서 이미 커밋돼 "기록은 되는데 출력만 안 나오는" 증상이었음.)
+  // calcRanksFromEntries 는 entries 만 쓰는 순수 계산이라 DB 쓰기 전에 미리 구해도 안전.
+  var rankGroups = calcRanksFromEntries(entries);
+
   DBH.withDB(DB_PATH, function(db){
     DBH.transaction(db, function(db){
-      var rankGroups = calcRanksFromEntries(entries);
       for (var g in rankGroups) {
         if (!rankGroups.hasOwnProperty(g)) continue;
         var groups = rankGroups[g];

@@ -42,6 +42,13 @@ var API_SESSION_TTL_MS = 5 * 60 * 1000;   // 5분 무응답 시 만료
 const ANSWER_WINDOW_MS = 30 * 1000;
 const REVEAL_DELAY_MS  = 30 * 1000;       // 제출 마감과 동시에 정답 공개 (= ANSWER_WINDOW_MS)
 const POST_REVEAL_IGNORE_MS = 2500;       // 정답 공개 직후 이 시간 동안 !상식/!ㅅㅅ+단어 입력 무시
+
+// reveal 타이머 누수 방지 (메이플봇 maple-poll 과 동일 패턴):
+//  - 이름 프리픽스로 재컴파일 시 killOldThreads 가 옛 컨텍스트의 타이머를 interrupt.
+//  - CTX_TOKEN 으로 옛 컨텍스트가 발화시킨 stale reveal 태스크를 processTask 에서 무시.
+//    (재컴파일하면 옛 타이머가 1회 발화해 같은 방의 새 퀴즈를 조기 공개시킬 수 있던 문제)
+var REVEAL_THREAD_PREFIX = "QUIZ_REVEAL_TIMER";
+var CTX_TOKEN = "" + java.lang.System.nanoTime() + "_" + java.lang.System.identityHashCode(new java.lang.Object());
 const MAX_TOTAL_CHARS  = 400;
 
 // 카카오톡 "더보기(접기)" 트리거용 긴 공백(제로폭 공백) 스페이서. 메시지 일부를 접기 위해 끝에 덧붙임.
@@ -1633,10 +1640,18 @@ function startActiveQuiz(room, data, quiz, chanId) {
   var th = new java.lang.Thread(function() {
     try {
       java.lang.Thread.sleep(REVEAL_DELAY_MS);
-      try { msgQueue.put({ type: "reveal", chanId: chanId }); } catch(_) {}
+      // CTX_TOKEN 을 실어 보낸다 → 재컴파일된 새 컨텍스트는 옛 토큰의 reveal 을 무시.
+      try { msgQueue.put({ type: "reveal", chanId: chanId, token: CTX_TOKEN }); } catch(_) {}
     } catch(_) { /* interrupted = 종료 */ }
   });
+  // 이름을 붙여 재컴파일 시 killOldThreads(프리픽스 매칭)가 옛 타이머를 정리할 수 있게 한다.
+  th.setName(REVEAL_THREAD_PREFIX + ":" + chanId);
   quiz.revealThread = th;
+  // 스레드 레지스트리 등록(!스레드 노출/킬 가능). 방별 고유 이름이라 replace=true 가 같은 방 옛 타이머만 교체. 실패 무시.
+  try {
+    var _tregR = require(Packages.android.os.Environment.getExternalStorageDirectory().getAbsolutePath() + "/msgbot/lib/thread-registry.js");
+    _tregR.registerThread(REVEAL_THREAD_PREFIX + ":" + chanId, BOT_NAME, th);
+  } catch(_) {}
   th.start();
 }
 
@@ -1991,7 +2006,9 @@ var WORKER_NAME = "QUIZ_BOT_WORKER";
     for (var i = 0; i < got; i++) {
       var t = arr[i];
       if (!t) continue;
-      if (String(t.getName() || "") === WORKER_NAME) {
+      // 워커 + 옛 컨텍스트의 reveal 타이머(프리픽스 매칭)를 함께 정리한다.
+      var tn = String(t.getName() || "");
+      if (tn === WORKER_NAME || tn.indexOf(REVEAL_THREAD_PREFIX) === 0) {
         try { t.interrupt(); } catch(_) {}
       }
     }
@@ -2055,6 +2072,8 @@ _worker.start();
 function processTask(task) {
   if (!task) return;
   if (task.type === "reveal") {
+    // 옛 JS 컨텍스트(재컴파일 전)의 타이머가 발화한 stale reveal 은 무시 — 같은 방 새 퀴즈 조기공개 방지.
+    if (task.token && task.token !== CTX_TOKEN) return;
     // 이 방(chanId)의 상태만 공개. 다른 방 타이머가 끼어들어 엉뚱한 방을 공개하지 못하게 가드.
     var rq = quizzes[task.chanId];
     if (rq && rq.active) revealAnswer(rq, task.chanId);
