@@ -108,13 +108,15 @@ var REGISTRY = [
   },
   {
     topic: "메이플봇",
-    aliases: ["메알림", "메이플", "이벤트", "공지", "알림", "maple"],
+    aliases: ["메알림", "메이플", "이벤트", "공지", "알림", "maple", "테섭"],
     commands: [
       { display: "!메알림",          triggers: ["!메알림"],        desc: "메이플 이벤트/공지 알림봇 도움말", admin: false },
       { display: "!메알림 시작",      triggers: ["!메알림 시작"],   desc: "현재 방에 이벤트/공지 알림 구독 등록", admin: false },
       { display: "!메알림 중지",      triggers: ["!메알림 중지"],   desc: "현재 방의 알림 구독 해제", admin: false },
       { display: "!메알림 상태",      triggers: ["!메알림 상태"],   desc: "폴링 상태·구독 방 목록 확인", admin: true },
-      { display: "!메알림 확인",      triggers: ["!메알림 확인"],   desc: "현재 이벤트/공지 목록 (최신 10개)", admin: false },
+      { display: "!메알림 이벤트",    triggers: ["!메알림 이벤트"], desc: "현재 이벤트 목록 (최신 10개)", admin: false },
+      { display: "!메알림 공지",      triggers: ["!메알림 공지"],   desc: "현재 공지 목록 (최신 10개)", admin: false },
+      { display: "!메알림 테섭",      triggers: ["!메알림 테섭"],   desc: "현재 테스트서버 공지 목록 (최신 10개)", admin: false },
       { display: "!메알림 초기화",    triggers: ["!메알림 초기화"], desc: "감지 목록 초기화 후 재등록", admin: true },
       { display: "!메알림 디버그 이벤트/공지", triggers: ["!메알림 디버그"], desc: "페이지 링크 샘플 출력 (디버그용)", admin: true }
     ]
@@ -124,6 +126,15 @@ var REGISTRY = [
     aliases: ["제미니", "ㅈㅁㄴ", "gemini", "질문", "ai"],
     commands: [
       { display: "!제미니 [질문] / !ㅈㅁㄴ [질문]", triggers: ["!제미니", "!ㅈㅁㄴ"], desc: "Gemini로 질문에 답변 (키 제공자 무제한, 그 외 1일 10회)", admin: false }
+    ]
+  },
+  {
+    topic: "로그봇",
+    aliases: ["로그", "지운채팅", "삭제채팅", "지운", "삭제", "복구", "log"],
+    commands: [
+      { display: "!지운채팅",               triggers: ["!지운채팅"], desc: "이 방에서 삭제된 채팅 모아보기 (최근 30건, 오래된 순)", admin: false },
+      { display: "!지운채팅 [개수]",          triggers: ["!지운채팅"], desc: "삭제된 채팅 N건 조회 (최대 300)", admin: false },
+      { display: "!지운채팅 [닉패턴] [개수]",  triggers: ["!지운채팅"], desc: "닉 패턴(*=와일드카드) 발신자의 삭제 채팅만 조회", admin: false }
     ]
   },
   {

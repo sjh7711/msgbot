@@ -6,6 +6,9 @@ const bot = BotManager.getCurrentBot();
 // 메시지 수신: ChatManager 의 broadcast 큐 구독 (모든 메시지 처리).
 //   ChatManager 가 켜져 있어야 동작.
 //
+// "!지운채팅" 명령: KakaoTalk.db 에서 삭제된 채팅을 모아 보여줌(온디맨드).
+//   → Bots/로그봇/deletedchat.js + lib/kakao-decrypt.js + lib/kakao-msg-render.js
+//
 // ⚠️ 최근채팅 기능(chat.db 저장 / "!최근채팅" 조회)은 분리되어
 //   /sdcard/msgbot/recentchat.js.bak 에 보관됨 (비활성).
 //
@@ -27,6 +30,18 @@ var subscribe = (function() {
     }
   } catch(_) {}
   return require(libPath);
+})();
+
+// 복호화 모듈(kt) + 지운채팅 뷰어 모듈
+var kt = (function() {
+  var p = "/sdcard/msgbot/lib/kakao-decrypt.js";
+  try { if (typeof bot.getRootPath === "function") p = bot.getRootPath() + "/../../lib/kakao-decrypt.js"; } catch(_) {}
+  return require(p);
+})();
+var deletedChat = (function() {
+  var p = "/sdcard/msgbot/Bots/로그봇/deletedchat.js";
+  try { if (typeof bot.getRootPath === "function") p = bot.getRootPath() + "/deletedchat.js"; } catch(_) {}
+  return require(p);
 })();
 
 // 공용 DB 커넥션 재사용 (메시지마다 open/close 하지 않음).
@@ -94,6 +109,13 @@ function upsertUserHash(hash, name, room) {
 var WORKER_NAME = "LOG_BOT_WORKER";
 
 subscribe(BOT_NAME, WORKER_NAME, function(msg) {
+  // "!지운채팅" 명령 우선 처리 (처리하면 userhash 기록은 건너뜀)
+  try {
+    if (msg.content && String(msg.content).indexOf(deletedChat.CMD) === 0) {
+      if (deletedChat.handle(msg, kt)) return;
+    }
+  } catch (e) {}
+
   // 로그봇은 모든 메시지에 대해 userhash 를 기록한다 (프리필터 없음).
   if (!msg.hash) return;
   upsertUserHash(msg.hash, msg.author.name, msg.room);

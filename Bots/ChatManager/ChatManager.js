@@ -500,20 +500,33 @@ var POLL_MIN_MS  = 150;    // 활성 시 폴링 간격
 var POLL_MAX_MS  = 500;   // 유휴 시 최대 폴링 간격 (유휴 후 첫 메시지 최대 지연)
 var POLL_BACKOFF = 2;    // 빈 폴링마다 간격 ×2 (MAX 까지 단계적 증가)
 
-if (initKakaoDB()) {
-  var _poller = new java.lang.Thread(function() {
-    var interval = POLL_MIN_MS;
-    while (!java.lang.Thread.currentThread().isInterrupted()) {
-      var got = 0;
-      try { got = pollKakaoDB(); } catch(_) {}
-      if (got > 0) interval = POLL_MIN_MS;                                   // 활동 감지 → 즉시 빠르게
-      else interval = Math.min(POLL_MAX_MS, Math.floor(interval * POLL_BACKOFF)); // 유휴 → 점진 백오프
-      try { java.lang.Thread.sleep(interval); } catch(_) { return; }
+// 폴러는 무조건 기동한다. initKakaoDB() 가 (부팅 직후 su 미준비 등으로) 실패해도 죽지 않고
+// 루프 안에서 주기적으로 재시도 → root/DB 가 준비되면 자동 복구(수동 재컴파일 불필요).
+// 단일 초기화 실패가 영구 장애(전 구독봇 무응답)가 되던 단일점을 제거한다.
+var _poller = new java.lang.Thread(function() {
+  var interval = POLL_MIN_MS, initWait = 2000, INIT_MAX = 30000;
+  while (!java.lang.Thread.currentThread().isInterrupted()) {
+    if (!KT_OK) {                                                          // 아직 초기화 전 → 재시도
+      var ok = false;
+      try { ok = initKakaoDB(); } catch(_) { ok = false; }
+      if (!ok) {
+        try { java.lang.Thread.sleep(initWait); } catch(_) { return; }
+        initWait = Math.min(INIT_MAX, initWait * 2);                       // 실패 → 백오프(최대 30s)
+        continue;
+      }
+      initWait = 2000;                                                     // 성공 → 백오프 리셋
+      try { Log.i("[ChatManager] KakaoDB 초기화 성공 — 폴러 가동"); } catch(_) {}
     }
-  }, POLLER_NAME);
-  try { _treg.registerThread(POLLER_NAME, "ChatManager", _poller); } catch(_) {}
-  _poller.start();
-}
+    var got = 0;
+    try { got = pollKakaoDB(); } catch(_) {}
+    if (got > 0) interval = POLL_MIN_MS;                                   // 활동 감지 → 즉시 빠르게
+    else interval = Math.min(POLL_MAX_MS, Math.floor(interval * POLL_BACKOFF)); // 유휴 → 점진 백오프
+    try { java.lang.Thread.sleep(interval); } catch(_) { return; }
+  }
+}, POLLER_NAME);
+_poller.start();
+// 레지스트리 등록은 이 환경서 비신뢰(스캔으로 대체)지만, 혹시 복구될 경우 대비해 best-effort 로 남겨둠.
+try { _treg.registerThread(POLLER_NAME, "ChatManager", _poller); } catch(_) {}
 
 // ── 봇 제어 명령 (!onoff / !compile / !상태) ────────────────
 // 다른 모든 봇의 on/off·컴파일을 ChatManager 에서 대화형으로 수행한다.
@@ -637,20 +650,29 @@ function _fmtAge(ms) {
   var h = Math.floor(m / 60); if (h < 24) return h + "h";
   return Math.floor(h / 24) + "d";
 }
+// 스레드 표시는 JVM 직접 스캔이 진실원(레지스트리 등록은 이 환경서 비신뢰 → 항상 0).
+// 워커/폴러를 이름별로 집계해 생사 + 중복(=재컴파일 누수) 경고를 보여준다.
+var _WORKER_RE = /WORKER|POLLER|maple-poll|QUIZ_REVEAL/;
 function _threadListText() {
-  var rows = _treg.list();
-  var lines = ["[스레드/프로세스] 등록 " + rows.length + "개"];
-  for (var i = 0; i < rows.length; i++) {
-    var r = rows[i];
-    lines.push("#" + r.id + " " + r.name + " [" + r.kind + "] " + (r.alive ? "🟢" : "🔴") +
-               " · " + _fmtAge(r.ageMs) + " · " + r.bot);
-  }
+  var lines = ["[스레드/프로세스] (스캔)"];
   try {
     var en = _treg.enumerateThreads();
-    var unreg = 0; for (var j = 0; j < en.length; j++) if (!en[j].registered) unreg++;
-    lines.push("— JVM 스레드 " + en.length + "개 (미등록 " + unreg + ")");
-  } catch(_) {}
-  lines.push("종료: !스레드킬 <#번호 또는 이름>");
+    var byName = {}, order = [];
+    for (var j = 0; j < en.length; j++) {
+      var nm = en[j].name;
+      if (!_WORKER_RE.test(nm)) continue;
+      if (!byName[nm]) { byName[nm] = { n: 0, alive: 0 }; order.push(nm); }
+      byName[nm].n++; if (en[j].alive) byName[nm].alive++;
+    }
+    order.sort();
+    if (!order.length) lines.push("워커/폴러: 없음 ⚠️");
+    else for (var k = 0; k < order.length; k++) {
+      var c = byName[order[k]];
+      lines.push("• " + order[k] + " " + (c.alive ? "🟢" : "🔴") + (c.n > 1 ? (" ⚠️누수 ×" + c.n) : ""));
+    }
+    lines.push("— JVM 스레드 " + en.length + "개");
+  } catch(e) { lines.push("스캔 오류: " + e); }
+  lines.push("정리(누수): !스레드정리 · 종료: !스레드킬 <이름>");
   return lines.join("\n");
 }
 function _threadKill(arg) {
@@ -663,7 +685,10 @@ function _threadKill(arg) {
            (r.ok ? ((r.kind === "process" ? "destroy" : "interrupt") + " ✅") : "실패");
   }
   var killed = _treg.killByName(arg);
-  return killed.length ? ("'" + arg + "' " + killed.length + "개 종료 ✅") : ("'" + arg + "' 일치 없음");
+  if (killed.length) return "'" + arg + "' " + killed.length + "개 종료 ✅ (등록)";
+  // 등록 맵에 없으면(미등록 스레드) JVM 스캔으로 이름 일치 스레드를 직접 interrupt 한다.
+  var n = 0; try { n = _treg.killByNameScan(arg); } catch(_) {}
+  return n ? ("'" + arg + "' " + n + "개 interrupt ✅ (미등록/스캔)") : ("'" + arg + "' 일치 없음");
 }
 
 // 명령을 처리했으면 true 반환 (이후 룸 학습 로직 건너뜀)
@@ -695,7 +720,10 @@ function handleBotControlCommand(rawMsg) {
     return true;
   }
   if (text === "!스레드정리") {
-    try { rawMsg.reply("죽은 항목 " + _treg.sweep() + "개 정리"); } catch(e) { try { rawMsg.reply("정리 오류: " + e); } catch(_) {} }
+    try {
+      var _rep = _treg.dedupeWorkers(_WORKER_RE);
+      rawMsg.reply(_rep.length ? ("누수 정리 (최신만 유지):\n" + _rep.join("\n")) : "누수 워커 없음 ✅");
+    } catch(e) { try { rawMsg.reply("정리 오류: " + e); } catch(_) {} }
     return true;
   }
 

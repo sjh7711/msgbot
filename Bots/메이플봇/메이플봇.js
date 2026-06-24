@@ -8,7 +8,9 @@ const bot = BotManager.getCurrentBot();
 //  - !메알림 시작   : 현재 방에 알림 등록
 //  - !메알림 중지   : 알림 중지
 //  - !메알림 상태   : 현재 상태 확인
-//  - !메알림 확인   : 현재 이벤트/공지 목록 조회
+//  - !메알림 이벤트 : 현재 이벤트 목록 조회
+//  - !메알림 공지   : 현재 공지 목록 조회
+//  - !메알림 테섭   : 현재 테스트서버 공지 목록 조회
 //  - !메알림 초기화 : 감지 목록 초기화
 //
 // 메시지 수신: ChatManager 의 broadcast 큐 구독.
@@ -557,7 +559,9 @@ function handleMessage(msg) {
             "!메알림 시작 — 이 방에 알림 설정\n" +
             "!메알림 중지 — 알림 중지\n" +
             "!메알림 상태 — 현재 상태 확인\n" +
-            "!메알림 확인 — 현재 이벤트/공지 목록"
+            "!메알림 이벤트 — 현재 이벤트 목록\n" +
+            "!메알림 공지 — 현재 공지 목록\n" +
+            "!메알림 테섭 — 현재 테스트서버 공지 목록"
             // !메알림 초기화        — 감지 목록 초기화
             // !메알림 디버그 이벤트 — 이벤트 페이지 링크 샘플
             // !메알림 디버그 공지   — 공지 페이지 링크 샘플
@@ -648,23 +652,27 @@ function handleMessage(msg) {
         return;
     }
 
-    if (text === "!메알림 확인") {
-        for (var t = 0; t < TARGETS.length; t++) {
-            var tgt    = TARGETS[t];
-            var html   = fetchHtml(tgt.url);
-            if (!html) { msg.reply("[" + tgt.label + "] 페이지 로드 실패"); continue; }
-            var events = parsePage(html, tgt);
-            if (!events.length) { msg.reply("[" + tgt.label + "] 파싱 실패"); continue; }
-            var lines = ["[" + tgt.label + "]"];
-            var limit = Math.min(events.length, 10);
-            for (var i = 0; i < limit; i++) {
-                lines.push("\n• " + events[i].title);
-                // 첫 번째 게시물 URL 뒤에 구분자 삽입
-                lines.push("  " + events[i].url + " " + (i === 0 ? LONG_MSG_SPACER : ""));
-            }
-            if (events.length > 10) lines.push("\n... 외 " + (events.length - 10) + "개");
-            msg.reply(lines.join("\n"));
+    // 타겟별 개별 조회: 이벤트 / 공지 / 테스트서버 공지
+    var checkMap = {
+        "!메알림 이벤트": TARGETS[0],
+        "!메알림 공지":   TARGETS[1],
+        "!메알림 테섭":   TARGETS[2]
+    };
+    if (checkMap[text]) {
+        var ctgt   = checkMap[text];
+        var chtml  = fetchHtml(ctgt.url);
+        if (!chtml) { msg.reply("[" + ctgt.label + "] 페이지 로드 실패"); return; }
+        var cevents = parsePage(chtml, ctgt);
+        if (!cevents.length) { msg.reply("[" + ctgt.label + "] 파싱 실패"); return; }
+        var clines = ["[" + ctgt.label + "]"];
+        var climit = Math.min(cevents.length, 10);
+        for (var ci = 0; ci < climit; ci++) {
+            clines.push("\n• " + cevents[ci].title);
+            // 첫 번째 게시물 URL 뒤에 구분자 삽입
+            clines.push("  " + cevents[ci].url + " " + (ci === 0 ? LONG_MSG_SPACER : ""));
         }
+        if (cevents.length > 10) clines.push("\n... 외 " + (cevents.length - 10) + "개");
+        msg.reply(clines.join("\n"));
         return;
     }
 
