@@ -1,8 +1,0 @@
-{
-  "name": "qwen봇",
-  "version": "1.0.0",
-  "description": "MessengerBot script: 내부망 Qwen 기반 !qwen 질의응답 봇",
-  "main": "qwen봇.js",
-  "type": "commonjs",
-  "dependencies": {}
-}

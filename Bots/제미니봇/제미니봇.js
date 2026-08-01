@@ -1,12 +1,22 @@
 const bot = BotManager.getCurrentBot();
 
 // =====================================================================
-// 제미니봇 — Gemini API 기반 간단 질의응답
+// 제미니봇 — LLM 질의응답 (Gemini 주 API + 내부망 Qwen 서브 API)
 //
 // 명령어:
 //   !제미니 [질문] / !ㅈㅁㄴ [질문]
 //       : 질문을 Gemini 에 보내고 답변을 받아옴. 질문 길이 제한 없음.
 //       : 사용 한도 — API 키 제공자(이 방)는 무제한, 그 외는 1일 10회 (한국시간 자정 리셋).
+//   !qwen [질문]   (구 qwen봇 통합)
+//       : 내부망 Qwen 서버에 직접 질문. 무료라 사용 한도를 세지 않는다.
+//   !대화요약 …    (summary.js)
+//
+// 제미니 → Qwen 폴백:
+//   ① 개인 1일 한도 소진  ② 이 방의 모든 제미니 키가 429
+//   두 경우에만 Qwen 으로 넘긴다. 차단·파싱오류 등 다른 실패는 그대로 오류로 알린다
+//   (진짜 문제가 Qwen 답변 뒤에 숨지 않도록).
+//   Qwen 은 ≈2.4 tok/s 로 느려서 폴백 시 먼저 안내 메시지를 보낸다.
+//   대화요약은 출력이 길어 Qwen 으로는 수 분이 걸리므로 폴백 대상에서 제외한다.
 //
 // API 키:
 //   상식퀴즈봇과 동일한 키 저장소(quiz.db 의 quiz_apikey)를 "읽기"만 한다.
@@ -275,7 +285,47 @@ var summaryMod = (function() {
   return require(p);
 })();
 
+// 내부망 Qwen 클라이언트 (구 qwen봇 통합). "!qwen" 직접 호출 + 제미니 한도 소진 시 폴백.
+var qwen = (function() {
+  var p = "/sdcard/msgbot/Bots/제미니봇/qwen.js";
+  try { if (typeof bot.getRootPath === "function") p = bot.getRootPath() + "/qwen.js"; } catch(_) {}
+  return require(p);
+})();
+
 function isSummaryCommand(text) { return text.indexOf(summaryMod.CMD) === 0; }
+
+function isQwenCommand(text) { return text.indexOf("!qwen") === 0; }
+
+// ── Qwen 답변 전송 (공통) ────────────────────────────────────────────
+// 제미니와 같은 형식: 첫 줄 + 제로폭 스페이서로 카카오톡 미리보기를 채운다.
+function sendQwenAnswer(room, question, header) {
+  var res = qwen.ask(question);
+  if (res && typeof res.text === "string" && res.text) {
+    try { bot.send(room, header + LONG_MSG_SPACER + "\n" + res.text); } catch(_) {}
+    return true;
+  }
+  try { bot.send(room, "⚠ Qwen 답변 실패: " + ((res && res.error) ? res.error : "알 수 없음")); } catch(_) {}
+  return false;
+}
+
+// "!qwen [질문]" — 내부망 서버라 사용 한도를 세지 않는다.
+function handleQwen(msg) {
+  try {
+    var text = String(msg.content || "").trim();
+    var question = text.slice("!qwen".length).trim();
+    if (!question) {
+      msg.reply("사용법: !qwen [질문]\n예) !qwen 광합성이 뭐야?");
+      return;
+    }
+    var room = msg.room;
+    // 생성이 느려(≈2.4 tok/s) 워커 큐를 막지 않도록 별도 스레드에서 처리.
+    new java.lang.Thread(function() {
+      sendQwenAnswer(room, question, "답변입니다. (Qwen)");
+    }).start();
+  } catch(e) {
+    try { msg.reply("오류: " + (e && e.message ? e.message : e)); } catch(_) {}
+  }
+}
 
 // 대화요약 처리: 사용 한도는 제미니와 동일(제공자 무제한 / 그 외 1일 N회). 성공 시 1회 차감.
 function handleSummary(msg) {
@@ -319,9 +369,15 @@ function handleMessage(msg) {
     var isProvider = isApiProvider(msg.author.hash, room);   // 이 방에 키 제공 → 무제한
 
     // 사용 한도: 제공자는 무제한, 그 외는 1일 GEMINI_DAILY_LIMIT 회 (한국시간 자정 리셋).
+    // 한도에 걸리면 거절하지 않고 내부망 Qwen 으로 넘긴다(무료·무제한이라 횟수를 세지 않음).
     if (!isProvider && countTodayUses(hash) >= GEMINI_DAILY_LIMIT) {
-      msg.reply("⚠ " + displayName + "님은 오늘 제미니 사용 한도(" + GEMINI_DAILY_LIMIT + "회)에 도달했습니다.\n" +
-        "상식퀴즈봇과 1:1 채팅에서 !api 로 이 방에 키를 등록하면 무제한으로 사용할 수 있습니다.");
+      var overRoom = room;
+      msg.reply("⚠ " + displayName + "님은 오늘 제미니 한도(" + GEMINI_DAILY_LIMIT + "회)를 다 쓰셨습니다.\n" +
+        "내부망 Qwen 으로 답변을 만드는 중입니다. 조금 오래 걸릴 수 있습니다.\n" +
+        "(상식퀴즈봇과 1:1 채팅에서 !api 로 키를 등록하면 제미니를 무제한 사용할 수 있습니다.)");
+      new java.lang.Thread(function() {
+        sendQwenAnswer(overRoom, question, "답변입니다. (제미니 한도 초과 → Qwen)");
+      }).start();
       return;
     }
 
@@ -333,8 +389,11 @@ function handleMessage(msg) {
         // 요청 형식: "답변입니다." 500회 반복(미리보기 채움) 뒤 줄바꿈 후 실제 답변.
         try { bot.send(room, "답변입니다."+ LONG_MSG_SPACER + "\n" + res.text.trim()); } catch(_) {}
       } else if (res && res.quotaExhausted) {
-        try { bot.send(room, "⚠ 사용 가능한 API 사용량이 모두 소진되었습니다. 잠시 후 다시 시도해주세요.\n" +
-          "(상식퀴즈봇과 1:1 채팅에서 !api 로 이 방에 키를 등록하면 사용량이 늘어납니다.)"); } catch(_) {}
+        // 모든 제미니 키가 429 → Qwen 으로 폴백.
+        // 폴백은 "토큰 소진"일 때만 한다. 차단·파싱오류 같은 건 그대로 오류로 알려야
+        // 진짜 문제가 Qwen 답변 뒤에 숨지 않는다.
+        try { bot.send(room, "⚠ 제미니 API 사용량이 모두 소진되어 내부망 Qwen 으로 답변합니다. 조금 오래 걸릴 수 있습니다."); } catch(_) {}
+        sendQwenAnswer(room, question, "답변입니다. (제미니 소진 → Qwen)");
       } else {
         try { bot.send(room, "⚠ 답변 생성 실패: " + ((res && res.error) ? res.error : "알 수 없음")); } catch(_) {}
       }
@@ -363,6 +422,7 @@ subscribe(BOT_NAME, WORKER_NAME, function(msg) {
   try {
     var text = String(msg.content || "").trim();
     if (isSummaryCommand(text)) { handleSummary(msg); return; }   // !대화요약
+    if (isQwenCommand(text)) { handleQwen(msg); return; }         // !qwen (구 qwen봇)
     if (!isGeminiCommand(text)) return;   // 우리 명령이 아니면 무시 (모든 메시지가 broadcast 됨)
     handleMessage(msg);
   } catch(_) {}
