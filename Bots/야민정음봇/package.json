@@ -1,8 +1,0 @@
-{
-  "name": "야민정음봇",
-  "version": "1.0.0",
-  "description": "MessengerBot script: 모양 유사 규칙으로 텍스트를 야민정음으로 변환",
-  "main": "야민정음봇.js",
-  "type": "commonjs",
-  "dependencies": {}
-}

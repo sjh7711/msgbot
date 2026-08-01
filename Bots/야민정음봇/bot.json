@@ -1,8 +1,0 @@
-{
-    "main": "야민정음봇.js",
-    "option": {
-        "apiLevel": 2,
-        "useConsoleApi": true,
-        "scriptPower": true
-    }
-}
