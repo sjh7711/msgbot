@@ -162,6 +162,13 @@ var REGISTRY = [
     ]
   },
   {
+    topic: "qwen봇",
+    aliases: ["qwen", "큐원", "ㅋㅇ", "내부망", "로컬ai", "llm"],
+    commands: [
+      { display: "!qwen [질문]", triggers: ["!qwen"], desc: "내부망 Qwen 서버에 질문 (길이·횟수 제한 없음, 서버가 켜져 있어야 함)", admin: false }
+    ]
+  },
+  {
     topic: "로그봇",
     aliases: ["로그", "지운채팅", "삭제채팅", "지운", "삭제", "복구", "log"],
     commands: [

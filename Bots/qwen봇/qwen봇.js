@@ -1,7 +1,7 @@
 const bot = BotManager.getCurrentBot();
 
 // =====================================================================
-// test 봇 — 내부망 Qwen(llama.cpp) 기반 간단 질의응답
+// qwen봇 — 내부망 Qwen(llama.cpp) 기반 간단 질의응답
 //
 // 명령어:
 //   !qwen [질문]
@@ -21,7 +21,7 @@ const bot = BotManager.getCurrentBot();
 // RhinoJS-safe: var / function 만 사용.
 // =====================================================================
 
-const BOT_NAME = "test";
+const BOT_NAME = "qwen봇";   // ChatManager broadcast 레지스트리 등록 키 — 폴더명과 같아야 한다
 
 // ── 설정 ─────────────────────────────────────────────────────────────
 const QWEN_BASE_URL = "http://192.168.0.55:18080/v1";
@@ -139,7 +139,7 @@ function handleMessage(msg) {
 
 // ── 메시지 큐 + 워커 스레드 (공유 subscriber 모듈로 위임) ──────────────
 // 큐에는 ChatManager broadcast 메시지(java.util.HashMap)만 들어온다.
-var WORKER_NAME = "TEST_BOT_WORKER";
+var WORKER_NAME = "QWEN_BOT_WORKER";
 
 var subscribe = (function() {
   var libPath = "/sdcard/msgbot/lib/subscriber.js";
@@ -170,7 +170,7 @@ bot.addListener(Event.COMMAND, onCommand);
 
 function onCreate(savedInstanceState, activity) {
   var tv = new Packages.android.widget.TextView(activity);
-  tv.setText("test");
+  tv.setText("qwen봇");
   tv.setTextColor(Packages.android.graphics.Color.DKGRAY);
   activity.setContentView(tv);
 }
