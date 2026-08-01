@@ -3,6 +3,6 @@
     "option": {
         "apiLevel": 2,
         "useConsoleApi": true,
-        "scriptPower": false
+        "scriptPower": true
     }
 }
