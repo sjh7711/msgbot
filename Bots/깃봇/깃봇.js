@@ -25,6 +25,9 @@ var bot = BotManager.getCurrentBot();
 //
 //  한계: 새 봇 폴더는 앱이 인식하지 못하므로 !깃풀 만으로 추가되지 않는다.
 //        앱에서 같은 이름의 봇을 한 번 만들어 주면 그 다음부터 내용이 채워진다.
+//        (이때 앱이 만드는 기본 골격 .js 는 충돌로 보지 않고 덮어쓴다 —
+//         isFreshBotScaffold 참고. 예전엔 이것 때문에 새 봇이 빈 골격인 채로
+//         남아 !깃풀 강제 를 써야 했다.)
 //
 //  명령: !깃확인 / !깃풀 [강제] / !깃롤백 / !깃봇
 //
@@ -332,9 +335,59 @@ function isExcluded(path) {
 
 function isBotJson(path) { return /(^|\/)bot\.json$/.test(path); }
 
+// =====================================================================
+// 앱이 만든 기본 스크립트(골격) 예외
+//
+//  깃봇은 새 봇을 앱에 등록할 수 없어서, 새 봇은 반드시 앱에서 먼저 만들어야
+//  한다. 그런데 그때 앱이 주석만 있는 골격 .js 를 만들어 둔다. 이 파일은
+//  매니페스트에 없으므로 아래 판정에서 "태블릿에서 직접 작성한 코드"로 분류돼
+//  충돌 처리되고, 깃풀이 영영 건너뛴다.
+//  실제로 야민정음봇이 이것 때문에 빈 골격인 채로 컴파일됐다(2026-08-02).
+//
+//  그래서 다음 두 조건을 모두 만족하면 충돌로 보지 않고 덮어쓴다.
+//    ① 이 봇에 대해 매니페스트가 추적 중인 파일이 하나도 없다 (= 깃봇이 처음 다루는 봇)
+//    ② 로컬 파일이 앱 골격의 특징을 갖고 있다 (주석 마커 + 작은 크기)
+//  ①이 있어서, 깃봇이 한 번이라도 배포한 봇의 로컬 수정은 여전히 보호된다.
+// =====================================================================
+
+// 앱 골격에만 있는 주석 문구 (사람이 직접 쓸 일이 없는 문자열)
+var APP_TEMPLATE_MARKS = [
+  "(string) msg.content:",
+  "msg.author.avatar.getBase64()",
+  "(boolean) msg.isDebugRoom"
+];
+var APP_TEMPLATE_MAX = 8000;   // 앱 골격은 3KB 안팎. 실제 봇 코드는 이보다 크다.
+
+function looksLikeAppTemplate(absPath) {
+  var text = readTextFile(absPath);
+  if (text === null || text.length > APP_TEMPLATE_MAX) return false;
+  var hits = 0;
+  for (var i = 0; i < APP_TEMPLATE_MARKS.length; i++) {
+    if (text.indexOf(APP_TEMPLATE_MARKS[i]) !== -1) hits++;
+  }
+  return hits >= 2;
+}
+
+// 이 봇에 대해 매니페스트가 추적 중인 파일이 하나라도 있는가
+function botIsTracked(manifestFiles, botName) {
+  var prefix = "Bots/" + botName + "/";
+  for (var p in manifestFiles) {
+    if (manifestFiles.hasOwnProperty(p) && p.indexOf(prefix) === 0) return true;
+  }
+  return false;
+}
+
+// "깃봇이 처음 다루는 봇의, 앱이 만든 골격 파일" 인가
+function isFreshBotScaffold(rel, manifestFiles) {
+  var b = botOfPath(rel);
+  if (!b) return false;                              // Bots/<봇>/ 아래만 해당
+  if (botIsTracked(manifestFiles, b)) return false;  // 이미 다룬 봇 → 로컬 수정 보호
+  return looksLikeAppTemplate(String(fileOf(rel).getAbsolutePath()));
+}
+
 // 계획 수립. manifest 는 "최신 확인된 파일"에 대해 그 자리에서 갱신된다.
 function buildPlan(remoteFiles, manifest) {
-  var plan = { create: [], update: [], conflict: [], keptBotJson: [], same: 0, removed: [] };
+  var plan = { create: [], update: [], scaffold: [], conflict: [], keptBotJson: [], same: 0, removed: [] };
   var seen = {};
 
   for (var i = 0; i < remoteFiles.length; i++) {
@@ -360,6 +413,8 @@ function buildPlan(remoteFiles, manifest) {
     var base = manifest.files[rf.path];
     if (base && base === local) {
       plan.update.push(rf);           // 마지막 pull 이후 로컬 변경 없음 → 안전
+    } else if (!base && isFreshBotScaffold(rf.path, manifest.files)) {
+      plan.scaffold.push(rf);         // 앱이 만든 골격 → 덮어써도 잃을 게 없다
     } else {
       plan.conflict.push({
         path: rf.path, sha: rf.sha,
@@ -378,6 +433,8 @@ function planTargets(plan, force) {
   var t = [];
   for (var i = 0; i < plan.create.length; i++) t.push(plan.create[i]);
   for (var j = 0; j < plan.update.length; j++) t.push(plan.update[j]);
+  // 앱 골격 덮어쓰기는 강제 옵션 없이도 적용한다 (잃을 내용이 없으므로)
+  for (var s = 0; s < plan.scaffold.length; s++) t.push(plan.scaffold[s]);
   if (force) {
     for (var k = 0; k < plan.conflict.length; k++) {
       t.push({ path: plan.conflict[k].path, sha: plan.conflict[k].sha });
@@ -615,7 +672,7 @@ function handleCheck(room) {
   if (r.error) { bot.send(room, "[깃확인] ⚠ " + r.error); return; }
 
   var p = r.plan;
-  var changed = p.create.length + p.update.length;
+  var changed = p.create.length + p.update.length + p.scaffold.length;
   var lines = ["[깃확인] " + commitLine(r.commit)];
 
   if (!changed && !p.conflict.length) {
@@ -625,6 +682,7 @@ function handleCheck(room) {
   }
   lines = lines.concat(listBlock("[수정]", pathsOf(p.update), 20));
   lines = lines.concat(listBlock("[신규]", pathsOf(p.create), 20));
+  lines = lines.concat(listBlock("[앱 골격 덮어쓰기]", pathsOf(p.scaffold), 10));
   lines = lines.concat(listBlock("[충돌 — 건너뜀]", conflictLines(p.conflict), 10));
   lines = lines.concat(listBlock("[bot.json 보존]", p.keptBotJson, 5));
   lines = lines.concat(listBlock("[레포에서 삭제됨 — 태블릿 유지]", p.removed, 10));
@@ -675,6 +733,7 @@ function handlePull(room, force) {
   lines = lines.concat(listBlock("[수정]", res.replaced, 20));
   lines = lines.concat(listBlock("[신규]", res.created, 20));
   lines = lines.concat(listBlock("[실패]", res.failed, 10));
+  lines = lines.concat(listBlock("[앱 골격 덮어씀]", pathsOf(p.scaffold), 10));
   lines = lines.concat(listBlock("[충돌 — 건너뜀]", conflictLines(force ? [] : p.conflict), 10));
   lines = lines.concat(listBlock("[bot.json 보존]", p.keptBotJson, 5));
   lines = lines.concat(listBlock("[앱에 없는 봇 — 앱에서 먼저 생성 필요]", rc.unknown, 5));
