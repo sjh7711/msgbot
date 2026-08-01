@@ -30,6 +30,8 @@ DebugRoom/
 zqt_history/
 maple_state.json
 channel_rooms.json
+# 깃봇이 태블릿에 기록하는 pull 추적 파일 (기기 로컬 상태)
+.gitpull.json
 
 # ===== Secrets =====
 qwen_key

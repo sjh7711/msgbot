@@ -153,6 +153,17 @@ var REGISTRY = [
     ]
   },
   {
+    topic: "깃봇",
+    aliases: ["깃", "git", "깃허브", "github", "배포", "업데이트", "풀"],
+    commands: [
+      { display: "!깃확인",    triggers: ["!깃확인"], desc: "GitHub 최신 커밋과 비교해 무엇이 바뀌는지 미리보기 (적용 안 함)", admin: true },
+      { display: "!깃풀",      triggers: ["!깃풀"],   desc: "바뀐 봇 소스를 GitHub 에서 내려받아 반영하고 해당 봇 재컴파일", admin: true },
+      { display: "!깃풀 강제", triggers: ["!깃풀"],   desc: "태블릿에서 직접 수정한 파일까지 덮어쓰며 반영", admin: true },
+      { display: "!깃롤백",    triggers: ["!깃롤백"], desc: "직전 !깃풀 을 백업에서 되돌리고 재컴파일", admin: true },
+      { display: "!깃봇",      triggers: ["!깃봇"],   desc: "깃봇 설명서 + 마지막 pull 상태 + 내 hash/방 이름", admin: true }
+    ]
+  },
+  {
     topic: "도움말봇",
     aliases: ["도움말", "도움", "검색", "help", "명령어"],
     commands: [

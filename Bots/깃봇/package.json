@@ -1,0 +1,8 @@
+{
+  "name": "깃봇",
+  "version": "1.0.0",
+  "description": "MessengerBot script: 깃봇",
+  "main": "깃봇.js",
+  "type": "commonjs",
+  "dependencies": {}
+}
