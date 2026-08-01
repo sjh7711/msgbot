@@ -3,9 +3,6 @@
     "option": {
         "apiLevel": 2,
         "useConsoleApi": true,
-        "scriptPower": false,
-        "targetMessengers": {
-            "com.linkedin.android": false
-        }
+        "scriptPower": false
     }
 }

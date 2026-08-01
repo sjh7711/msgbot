@@ -5,10 +5,6 @@
         "useConsoleApi": true,
         "scriptPower": true,
         "allowEval": true,
-        "targetMessengers": {
-            "com.linkedin.android": true,
-            "com.kakao.talk": true
-        },
         "debugRoom": {
             "name": "신종화",
             "sender": "신종화",
