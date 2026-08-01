@@ -17,6 +17,34 @@ var WORKER_NAME = "HELP_BOT_WORKER";
 // 긴 설명 접기용 제로폭 공백 스페이서 (카카오톡 "더보기")
 var LONG_MSG_SPACER = "​".repeat(500);
 
+// ─── 관리자 명령 노출 제어 ──────────────────────────────────────────────────
+//  admin:true 명령은 기본적으로 추천에도, !도움 결과에도 나오지 않는다.
+//  예외는 아래 방에서 슈퍼관리자가 물었을 때뿐.
+//
+//  ⚠ 방을 먼저 확인하는 순서가 중요하다.
+//    ① 추천은 인식 안 되는 "!명령" 마다 호출되므로, 공개방에서는 문자열 비교
+//       한 번으로 끝나고 admin.db 를 아예 열지 않는다.
+//    ② 추천/도움말 응답은 그 방 전체가 보는 공개 메시지다. 보낸 사람만 보고
+//       판단하면 단톡방에서 오타 한 번에 관리자 명령이 전부 노출된다.
+var ADMIN_ROOMS = ["신쫑"];   // 관리자 명령을 보여줘도 되는 방 (1:1 개인톡)
+
+var _admin = null;
+try {
+  var _adminPath = "/sdcard/msgbot/lib/admin.js";
+  try {
+    if (typeof bot.getRootPath === "function") _adminPath = bot.getRootPath() + "/../../lib/admin.js";
+  } catch(_) {}
+  _admin = require(_adminPath);
+} catch(_) { _admin = null; }   // 못 불러오면 항상 숨김(안전한 실패)
+
+function canSeeAdmin(msg) {
+  try {
+    if (!_admin) return false;
+    if (ADMIN_ROOMS.indexOf(String(msg && msg.room)) === -1) return false;
+    return _admin.isSuper(msg && msg.hash);
+  } catch(_) { return false; }
+}
+
 // ─── 명령어 레지스트리 (단일 진실원) ────────────────────────────────────────
 //  topic   : 봇 이름
 //  aliases : !도움 으로 이 주제를 찾을 때 쓰는 키워드
@@ -100,8 +128,8 @@ var REGISTRY = [
       { display: "!완승기록 [이름]",                triggers: ["!완승기록"],   desc: "모든 게임 1등(완승) 횟수", admin: false },
       { display: "!등수통계 [이름]",                triggers: ["!등수통계"],   desc: "유저의 등수 통계 (1~4등 횟수)", admin: false },
       { display: "!월간종합등수 [기간]",            triggers: ["!월간종합등수"], desc: "종합등수의 일평균 순위", admin: false },
-      { display: "!유저등록 [이름]",                triggers: ["!유저등록"],   desc: "한글 1글자 유저 이름 등록", admin: false },
-      { display: "!게임등록 [게임키]",              triggers: ["!게임등록"],   desc: "영문 1글자 게임키 등록", admin: false },
+      { display: "!유저등록 [이름]",                triggers: ["!유저등록"],   desc: "한글 1글자 유저 이름 등록", admin: true },
+      { display: "!게임등록 [게임키]",              triggers: ["!게임등록"],   desc: "영문 1글자 게임키 등록", admin: true },
       { display: "!자동기록 [날짜]",                triggers: ["!자동기록"],   desc: "알림 파일 파싱하여 자동 기록", admin: false },
       { display: "!실격 [날짜] [게임키] [이름]",     triggers: ["!실격"],       desc: "힌트 사용 등 실격 처리 — 시간 무관 5등 고정, 재기록해도 유지", admin: false },
       { display: "!실격취소 [날짜] [게임키] [이름]", triggers: ["!실격취소"],   desc: "실격 해제 후 순위 재계산 (시간 기록 있으면 시간순 복귀)", admin: false },
@@ -147,9 +175,9 @@ var REGISTRY = [
     topic: "백업봇",
     aliases: ["백업", "backup"],
     commands: [
-      { display: "!백업",     triggers: ["!백업"],     desc: "msgbot 폴더 전체를 지금 즉시 zip 백업 (자동: 매일 오전 6시, 보관: 최근 7일 + 일요일 4주)", admin: false },
-      { display: "!백업목록", triggers: ["!백업목록"], desc: "백업 파일 목록 조회 (/sdcard/msgbot_backups)", admin: false },
-      { display: "!백업봇",   triggers: ["!백업봇"],   desc: "백업봇 명령어 설명서", admin: false }
+      { display: "!백업",     triggers: ["!백업"],     desc: "msgbot 폴더 전체를 지금 즉시 zip 백업 (자동: 매일 오전 6시, 보관: 최근 7일 + 일요일 4주)", admin: true },
+      { display: "!백업목록", triggers: ["!백업목록"], desc: "백업 파일 목록 조회 (/sdcard/msgbot_backups)", admin: true },
+      { display: "!백업봇",   triggers: ["!백업봇"],   desc: "백업봇 명령어 설명서", admin: true }
     ]
   },
   {
@@ -283,34 +311,49 @@ function isKnownCommand(text) {
 // ─── 검색 ────────────────────────────────────────────────────────────────────
 function helpHeader() { return "명령어와 관련된 설명입니다." + LONG_MSG_SPACER + "\n"; }
 
-function topicListLine() {
+// 이 사람에게 보이는 명령이 하나라도 있는 주제인가
+// (백업봇·깃봇·ChatManager 처럼 전부 admin 인 주제는 통째로 숨긴다 —
+//  이름만 남고 내용이 비면 그 자체가 존재를 알리는 힌트가 된다)
+function hasVisibleCommand(topic, canSee) {
+  for (var i = 0; i < topic.commands.length; i++) {
+    if (canSee || !topic.commands[i].admin) return true;
+  }
+  return false;
+}
+
+function topicListLine(canSee) {
   var ts = [];
-  for (var i = 0; i < REGISTRY.length; i++) ts.push(REGISTRY[i].topic);
+  for (var i = 0; i < REGISTRY.length; i++) {
+    if (hasVisibleCommand(REGISTRY[i], canSee)) ts.push(REGISTRY[i].topic);
+  }
   return ts.join(", ");
 }
 
-function findTopic(q) {
+function findTopic(q, canSee) {
   var ql = String(q).toLowerCase();
   // 정확 일치 우선 (topic 또는 alias)
   for (var i = 0; i < REGISTRY.length; i++) {
     var t = REGISTRY[i];
+    if (!hasVisibleCommand(t, canSee)) continue;
     if (t.topic.toLowerCase() === ql) return t;
     for (var j = 0; j < t.aliases.length; j++) if (t.aliases[j].toLowerCase() === ql) return t;
   }
   // 부분 일치 (topic/alias 가 질의를 포함)
   for (var k = 0; k < REGISTRY.length; k++) {
     var t2 = REGISTRY[k];
+    if (!hasVisibleCommand(t2, canSee)) continue;
     if (t2.topic.toLowerCase().indexOf(ql) !== -1) return t2;
     for (var m = 0; m < t2.aliases.length; m++) if (t2.aliases[m].toLowerCase().indexOf(ql) !== -1) return t2;
   }
   return null;
 }
 
-function findCommands(q) {
+function findCommands(q, canSee) {
   var ql = String(q).toLowerCase();
   var out = [], seen = {};
   for (var i = 0; i < FLAT_CMDS.length; i++) {
     var c = FLAT_CMDS[i];
+    if (c.admin && !canSee) continue;
     var hit = (c.display.toLowerCase().indexOf(ql) !== -1);
     if (!hit) {
       for (var j = 0; j < c.triggers.length; j++) {
@@ -322,12 +365,15 @@ function findCommands(q) {
   return out;
 }
 
-function formatTopic(topic) {
+function formatTopic(topic, canSee) {
   var lines = ["[" + topic.topic + " 명령어]"];
   var admins = [];
   for (var i = 0; i < topic.commands.length; i++) {
     var c = topic.commands[i];
-    if (c.admin) { admins.push("• " + c.display + "\n   └ " + c.desc); continue; }
+    if (c.admin) {
+      if (canSee) admins.push("• " + c.display + "\n   └ " + c.desc);
+      continue;                                    // 권한 없으면 존재 자체를 알리지 않는다
+    }
     lines.push("• " + c.display + "\n   └ " + c.desc);
   }
   if (admins.length) { lines.push(""); lines.push("[관리자 전용]"); for (var k = 0; k < admins.length; k++) lines.push(admins[k]); }
@@ -343,22 +389,22 @@ function formatCommands(cmds) {
   return lines.join("\n");
 }
 
-function handleSearch(arg) {
+function handleSearch(arg, canSee) {
   arg = String(arg || "").trim();
   if (!arg) {
     return helpHeader() +
       "사용법: !도움 [명령어 또는 주제]\n" +
       "예) !도움 상식   !도움 zqt   !도움 출제\n\n" +
-      "[검색 가능한 주제]\n" + topicListLine();
+      "[검색 가능한 주제]\n" + topicListLine(canSee);
   }
   var q = arg.replace(/^!+/, "");
-  var topic = findTopic(q);
-  if (topic) return helpHeader() + formatTopic(topic);
-  var cmds = findCommands(q);
+  var topic = findTopic(q, canSee);
+  if (topic) return helpHeader() + formatTopic(topic, canSee);
+  var cmds = findCommands(q, canSee);
   if (cmds.length) return helpHeader() + formatCommands(cmds);
-  var sg = suggestSimilar("!" + q);
+  var sg = suggestSimilar("!" + q, canSee);
   if (sg) return "검색 결과가 없습니다.\n\n" + sg;
-  return "검색 결과가 없습니다.\n\n[검색 가능한 주제]\n" + topicListLine();
+  return "검색 결과가 없습니다.\n\n[검색 가능한 주제]\n" + topicListLine(canSee);
 }
 
 // 입력이 "초성만"인가? (예: !ㅁㅇㅍ) — 완성 음절·모음이 없고 자음 호환자모만 있을 때.
@@ -375,7 +421,7 @@ function isChosungQuery(token) {
 
 // ─── 유사 명령 제안 (A: 자모 단위 편집거리, B: 초성 매칭) ─────────────────────
 var JAMO_MAX = 2;   // 자모 단위 편집거리 임계값(1~2 = 한글 1~2키 오타). 필요시 조정.
-function suggestSimilar(token) {
+function suggestSimilar(token, canSee) {
   token = String(token || "");
   if (token.length < 2) return null;                 // "!" 단독 등 무시
   // 기호/문장부호만 있는 입력(!!!, !?!, !! 등)은 명령 추천 대상 아님 — 약어 명령과 자모 편집거리로 오매칭됨
@@ -399,7 +445,7 @@ function suggestSimilar(token) {
       if (!topicHit) continue;
       for (var ci = 0; ci < topic.commands.length && lines.length < 6; ci++) {
         var cc = topic.commands[ci];
-        if (cc.admin || seen[cc.display]) continue;
+        if ((cc.admin && !canSee) || seen[cc.display]) continue;
         seen[cc.display] = true;
         lines.push(cc.display + " : " + cc.desc);
       }
@@ -407,7 +453,7 @@ function suggestSimilar(token) {
     // 2) 명령 트리거 초성 일치도 추가
     for (var f = 0; f < FLAT_CMDS.length && lines.length < 6; f++) {
       var fc = FLAT_CMDS[f];
-      if (fc.admin || seen[fc.display]) continue;
+      if ((fc.admin && !canSee) || seen[fc.display]) continue;
       var hit = false;
       for (var g = 0; g < fc.triggers.length; g++) {
         if (chosung(fc.triggers[g]) === tokC) { hit = true; break; }
@@ -423,7 +469,7 @@ function suggestSimilar(token) {
   var cand = [];
   for (var i = 0; i < FLAT_CMDS.length; i++) {
     var c = FLAT_CMDS[i];
-    if (c.admin) continue;                           // 관리자/숨김 명령은 제안하지 않음
+    if (c.admin && !canSee) continue;                // 관리자/숨김 명령은 제안하지 않음
     var best = 999;
     for (var j = 0; j < c.triggers.length; j++) {
       var tr = c.triggers[j];
@@ -463,17 +509,18 @@ function handleHelp(msg) {
   var text = String(msg.content || "").trim();
   if (text.indexOf("!") !== 0) return;               // 명령 아님
   // 도움말 호출 (!도움 / !ㄷㅇ / !기능 / !ㄱㄴ)
+  var canSee = canSeeAdmin(msg);   // 메시지당 1회만 판정
   if (isHelpTrigger(text)) {
     var arg = "";
     var sp = text.indexOf(" ");
     if (sp !== -1) arg = text.substring(sp + 1);
-    try { msg.reply(handleSearch(arg)); } catch(_) {}
+    try { msg.reply(handleSearch(arg, canSee)); } catch(_) {}
     return;
   }
   // 그 외 !명령: 알려진 명령이면 다른 봇이 처리 → 침묵
   if (isKnownCommand(text)) return;
   // 모르는 명령이면 유사 명령 제안 (없으면 침묵)
-  var sg = suggestSimilar(leadToken(text));
+  var sg = suggestSimilar(leadToken(text), canSee);
   if (sg) { try { msg.reply(sg); } catch(_) {} }
 }
 
