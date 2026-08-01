@@ -393,8 +393,11 @@ function planTargets(plan, force) {
 function applyTargets(targets, commitSha, manifest) {
   var stamp = nowStr("yyyyMMdd_HHmmss");
   var backupDir = BACKUP_ROOT + "/gitpull_" + stamp;
+  // 같은 초에 두 번 pull 하면 폴더 이름이 겹친다. 이미 있던 폴더면 아래 정리 단계에서
+  // 건드리지 않는다 — 앞선 pull 의 백업/매니페스트를 지워 롤백을 깨뜨리기 때문.
+  var dirExisted = new java.io.File(backupDir).exists();
   new java.io.File(backupDir).mkdirs();
-  copyFile(MANIFEST, backupDir + "/.gitpull.json");   // 롤백 시 매니페스트도 되돌린다
+  if (!dirExisted) copyFile(MANIFEST, backupDir + "/.gitpull.json");   // 롤백 시 매니페스트도 되돌린다
 
   var replaced = [], created = [], failed = [];
 
@@ -430,7 +433,8 @@ function applyTargets(targets, commitSha, manifest) {
       replaced: replaced,
       created: created
     }, null, 2));
-  } else {
+  } else if (!dirExisted) {
+    // 이번 호출에서 만든 빈 백업 폴더만 치운다
     try { new java.io.File(backupDir + "/.gitpull.json")["delete"](); } catch (_) {}
     try { new java.io.File(backupDir)["delete"](); } catch (_) {}
   }
