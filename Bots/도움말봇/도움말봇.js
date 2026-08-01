@@ -103,13 +103,16 @@ var REGISTRY = [
       { display: "!유저등록 [이름]",                triggers: ["!유저등록"],   desc: "한글 1글자 유저 이름 등록", admin: false },
       { display: "!게임등록 [게임키]",              triggers: ["!게임등록"],   desc: "영문 1글자 게임키 등록", admin: false },
       { display: "!자동기록 [날짜]",                triggers: ["!자동기록"],   desc: "알림 파일 파싱하여 자동 기록", admin: false },
+      { display: "!실격 [날짜] [게임키] [이름]",     triggers: ["!실격"],       desc: "힌트 사용 등 실격 처리 — 시간 무관 5등 고정, 재기록해도 유지", admin: false },
+      { display: "!실격취소 [날짜] [게임키] [이름]", triggers: ["!실격취소"],   desc: "실격 해제 후 순위 재계산 (시간 기록 있으면 시간순 복귀)", admin: false },
       { display: "!zqt",                           triggers: ["!zqt"],       desc: "zqt 봇 명령어 설명서", admin: false }
     ]
   },
   {
     topic: "메이플봇",
-    aliases: ["메알림", "메이플", "이벤트", "공지", "알림", "maple", "테섭"],
+    aliases: ["메알림", "메이플", "이벤트", "공지", "알림", "maple", "테섭", "선데이", "썬데이"],
     commands: [
+      { display: "!선데이 / !썬데이",  triggers: ["!선데이", "!썬데이"], desc: "이번 주 선데이메이플 안내 이미지를 사진으로 전송", admin: false },
       { display: "!메알림",          triggers: ["!메알림"],        desc: "메이플 이벤트/공지 알림봇 도움말", admin: false },
       { display: "!메알림 시작",      triggers: ["!메알림 시작"],   desc: "현재 방에 이벤트/공지 알림 구독 등록", admin: false },
       { display: "!메알림 중지",      triggers: ["!메알림 중지"],   desc: "현재 방의 알림 구독 해제", admin: false },
@@ -123,9 +126,12 @@ var REGISTRY = [
   },
   {
     topic: "제미니봇",
-    aliases: ["제미니", "ㅈㅁㄴ", "gemini", "질문", "ai"],
+    aliases: ["제미니", "ㅈㅁㄴ", "gemini", "질문", "ai", "대화요약", "요약", "채팅요약"],
     commands: [
-      { display: "!제미니 [질문] / !ㅈㅁㄴ [질문]", triggers: ["!제미니", "!ㅈㅁㄴ"], desc: "Gemini로 질문에 답변 (키 제공자 무제한, 그 외 1일 10회)", admin: false }
+      { display: "!제미니 [질문] / !ㅈㅁㄴ [질문]", triggers: ["!제미니", "!ㅈㅁㄴ"], desc: "Gemini로 질문에 답변 (키 제공자 무제한, 그 외 1일 10회)", admin: false },
+      { display: "!대화요약",             triggers: ["!대화요약"], desc: "이 방 최근 3시간(기본) 대화를 시간대별로 요약", admin: false },
+      { display: "!대화요약 [N]",          triggers: ["!대화요약"], desc: "최근 N시간(최대 12) 대화 요약. 길면 자동 분할요약(map-reduce)", admin: false },
+      { display: "!대화요약 [N] [관심사]",  triggers: ["!대화요약"], desc: "특정 키워드/사람 관련 주제를 더 상세히 요약", admin: false }
     ]
   },
   {
@@ -135,6 +141,15 @@ var REGISTRY = [
       { display: "!지운채팅",               triggers: ["!지운채팅"], desc: "이 방에서 삭제된 채팅 모아보기 (최근 30건, 오래된 순)", admin: false },
       { display: "!지운채팅 [개수]",          triggers: ["!지운채팅"], desc: "삭제된 채팅 N건 조회 (최대 300)", admin: false },
       { display: "!지운채팅 [닉패턴] [개수]",  triggers: ["!지운채팅"], desc: "닉 패턴(*=와일드카드) 발신자의 삭제 채팅만 조회", admin: false }
+    ]
+  },
+  {
+    topic: "백업봇",
+    aliases: ["백업", "backup"],
+    commands: [
+      { display: "!백업",     triggers: ["!백업"],     desc: "msgbot 폴더 전체를 지금 즉시 zip 백업 (자동: 매일 오전 6시, 보관: 최근 7일 + 일요일 4주)", admin: false },
+      { display: "!백업목록", triggers: ["!백업목록"], desc: "백업 파일 목록 조회 (/sdcard/msgbot_backups)", admin: false },
+      { display: "!백업봇",   triggers: ["!백업봇"],   desc: "백업봇 명령어 설명서", admin: false }
     ]
   },
   {
@@ -341,6 +356,8 @@ var JAMO_MAX = 2;   // 자모 단위 편집거리 임계값(1~2 = 한글 1~2키 
 function suggestSimilar(token) {
   token = String(token || "");
   if (token.length < 2) return null;                 // "!" 단독 등 무시
+  // 기호/문장부호만 있는 입력(!!!, !?!, !! 등)은 명령 추천 대상 아님 — 약어 명령과 자모 편집거리로 오매칭됨
+  if (!/[0-9A-Za-z가-힣ㄱ-ㅣ]/.test(token)) return null;
   var tokC = chosung(token);                         // 입력의 초성열
   var lines = [], seen = {};
 

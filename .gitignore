@@ -31,6 +31,9 @@ zqt_history/
 maple_state.json
 channel_rooms.json
 
+# ===== Secrets =====
+qwen_key
+
 # ===== OS / editor cruft =====
 .DS_Store
 Thumbs.db

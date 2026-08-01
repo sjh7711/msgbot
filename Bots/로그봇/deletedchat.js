@@ -17,6 +17,7 @@
 // =====================================================================
 
 var CMD = "!지운채팅";
+var LONG_MSG_SPACER = "​".repeat(500);
 
 var _render = (function(){
   var p = Packages.android.os.Environment.getExternalStorageDirectory()
@@ -122,7 +123,7 @@ function handle(msg, kt){
 
   if (!rows.length){ msg.reply("지워진 채팅이 없습니다."); return true; }
 
-  var header = CMD + " (" + rows.length + "건)\n—";
+  var header = CMD + " (" + rows.length + "건)" + LONG_MSG_SPACER + "\n—";
   var out = header + "\n";
   for (var i = 0; i < rows.length; i++){
     var r = rows[i];

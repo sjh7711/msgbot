@@ -114,8 +114,11 @@ var KT_FRIENDS_ID_COL = "id";
 var KT_FRIENDS_NAME_COL = "name";
 var _myIdCache = {};
 var _keyCache = {};
-var _userNameCache = {};            // user_id -> { name, ts } (ts 기준 TTL 만료)
+var _userNameCache = {};            // user_id -> { name, ts, miss? } (ts 기준 TTL 만료)
 var USER_NAME_TTL_MS = 5 * 60 * 1000; // 닉네임 캐시 수명 5분 — 만료 시 open_chat_member 재조회
+// 조회 실패(placeholder "user_<id>") 는 짧게만 캐시한다. 5분씩 캐싱하면 su 셸이 잠깐 바빠
+// 첫 조회가 실패한 사용자가 5분 내내 user_<id> 로 표시되던 버그가 있었다(일시 실패를 빠르게 회복).
+var USER_NAME_MISS_TTL_MS = 15 * 1000;
 // channelId(=chat_id) ↔ room 이름 매핑. 라이브 onMessage 에서 rawMsg.channelId + rawMsg.room 을
 // "동시에·정확히" 받아 채운다 (과거의 '최신 행 추측' 학습 제거 → 레이스/오매핑 없음).
 // channelId 는 불변이라 파일로 영속화하고 시작 시 로드한다 (재시작 후 즉시 사용).
@@ -318,13 +321,16 @@ function initKakaoDB() {
 
 // ── 사용자 이름 조회 (캐시) ──────────────────────────────────────
 function getUserName(user_id) {
-  // 캐시 적중: 단 TTL(5분) 이내일 때만. 만료됐으면 아래로 떨어져 재조회 → 닉네임 변경 반영.
+  // 캐시 적중: 실제 이름은 5분, 실패 placeholder 는 15초 TTL. 만료 시 재조회 → 닉변/일시실패 회복.
   var cached = _userNameCache[user_id];
-  if (cached && (Date.now() - cached.ts) < USER_NAME_TTL_MS) return cached.name;
+  if (cached) {
+    var ttl = cached.miss ? USER_NAME_MISS_TTL_MS : USER_NAME_TTL_MS;
+    if ((Date.now() - cached.ts) < ttl) return cached.name;
+  }
 
   if (!KT_FRIENDS_TABLE) {
     var fallback = "user_" + user_id;
-    _userNameCache[user_id] = { name: fallback, ts: Date.now() };
+    _userNameCache[user_id] = { name: fallback, ts: Date.now(), miss: true };
     return fallback;
   }
   try {
@@ -345,7 +351,7 @@ function getUserName(user_id) {
     }
   } catch(_) {}
   var anon = "user_" + user_id;
-  _userNameCache[user_id] = { name: anon, ts: Date.now() };
+  _userNameCache[user_id] = { name: anon, ts: Date.now(), miss: true };
   return anon;
 }
 
@@ -361,6 +367,10 @@ var _registry = (function() {
   }
   return r;
 })();
+
+// 구독봇 큐별 연속 offer 실패 횟수 (소비자 정지 감지용)
+var _deadQueueFails = {};
+var DEAD_QUEUE_DROP_AT = 3;   // 이만큼 연속 실패하면 레지스트리에서 제거(재구독 시 자동 재등록)
 
 function broadcast(name, hash, channelId, room, text) {
   var base = new java.util.HashMap();
@@ -380,7 +390,17 @@ function broadcast(name, hash, channelId, room, text) {
     var q = e.getValue();
     if (!q) continue;
     try {
-      q.put(m);
+      // put() 대신 offer(): 죽은 구독봇의 유계 큐가 가득 차면 블로킹/무한증가 대신 드롭.
+      // 살아있는 소비자는 큐를 즉시 비우므로 정상 상황에선 항상 성공한다.
+      // (레거시 무계 큐가 아직 등록돼 있어도 offer 는 항상 성공 → 안전)
+      if (q.offer(m) === false) {
+        // 큐가 가득 = 소비자 정지 추정. 누적 실패 시 레지스트리에서 제거해 메모리 회수.
+        var fails = (_deadQueueFails[e.getKey()] || 0) + 1;
+        _deadQueueFails[e.getKey()] = fails;
+        if (fails >= DEAD_QUEUE_DROP_AT) { it.remove(); delete _deadQueueFails[e.getKey()]; }
+      } else {
+        if (_deadQueueFails[e.getKey()]) delete _deadQueueFails[e.getKey()];
+      }
     } catch(_) {}
   }
 }
@@ -434,42 +454,56 @@ function pollKakaoDB() {
 
     for (var i = 0; i < rows.length; i++) {
       var r = rows[i];
-      if (r.length < 5) continue;
-      var _id = parseInt(r[0], 10);
-      var chat_id = r[1];
-      var user_id = r[2];
-      var encMsg = r[3];
-      var vStr = r[4] || "{}";
-
-      _lastProcessedId = _id;
-
-      var v = null;
-      try { v = JSON.parse(vStr); } catch(_) { v = {}; }
-      if (v.isMine === true || v.origin === "WRITE") continue;
-      if (v.enc == null) continue;
-
-      var cacheKey = user_id + "_" + v.enc;
-      var key = _keyCache[cacheKey];
-      if (!key) { key = _deriveKey(user_id, v.enc); _keyCache[cacheKey] = key; }
-      var text = String(_decrypt(key, encMsg) || "").trim();
-      if (!text) continue;
-
-      var name = getUserName(user_id);
-
-      var roomName = _channelRooms[String(chat_id)];
-      if (!roomName) {
-        // 아직 channelId↔room 미매핑(브랜드뉴 채널): 보관 후 onMessage 매핑 시 flush
-        var buf = _pendingByChannel[String(chat_id)];
-        if (!buf) { buf = []; _pendingByChannel[String(chat_id)] = buf; }
-        buf.push({ name: name, userId: user_id, text: text });
-        while (buf.length > PENDING_MAX) buf.shift();
-        continue;
+      var rid = parseInt(r[0], 10);
+      try {
+        _processRow(r);
+      } catch(rowErr) {
+        // 이 행 처리 실패(복호화/broadcast 등): _lastProcessedId 를 전진시키지 않고 중단.
+        // 다음 폴링에서 rid 부터 재시도 → 나머지 배치 메시지가 유실되지 않는다.
+        // (예전엔 _id 를 루프 선두에서 커밋해, 한 행 예외 시 그 뒤 배치가 영구 유실됐다.)
+        Log.e("[ChatManager] row " + rid + " 처리 실패, 다음 폴링 재시도: " +
+              (rowErr && rowErr.message ? rowErr.message : rowErr));
+        return i;   // 여기까지(성공한 i개)만 처리됨
       }
-
-      broadcast(name, user_id, chat_id, roomName, text);
+      _lastProcessedId = rid;   // 정상 처리(broadcast 또는 정상 skip) 후에만 전진
     }
     return rows.length;
   } catch(_) { return 0; }
+}
+
+// 한 chat_logs 행 처리: skip 이면 조용히 return, 처리 대상이면 복호화 후 broadcast.
+// 예외는 던져서 pollKakaoDB 가 _lastProcessedId 전진을 막고 재시도하도록 한다.
+function _processRow(r) {
+  if (r.length < 5) return;   // 형식 미달 행은 스킵(정상 처리로 간주 → 전진)
+  var chat_id = r[1];
+  var user_id = r[2];
+  var encMsg = r[3];
+  var vStr = r[4] || "{}";
+
+  var v = null;
+  try { v = JSON.parse(vStr); } catch(_) { v = {}; }
+  if (v.isMine === true || v.origin === "WRITE") return;
+  if (v.enc == null) return;
+
+  var cacheKey = user_id + "_" + v.enc;
+  var key = _keyCache[cacheKey];
+  if (!key) { key = _deriveKey(user_id, v.enc); _keyCache[cacheKey] = key; }
+  var text = String(_decrypt(key, encMsg) || "").trim();
+  if (!text) return;
+
+  var name = getUserName(user_id);
+
+  var roomName = _channelRooms[String(chat_id)];
+  if (!roomName) {
+    // 아직 channelId↔room 미매핑(브랜드뉴 채널): 보관 후 onMessage 매핑 시 flush
+    var buf = _pendingByChannel[String(chat_id)];
+    if (!buf) { buf = []; _pendingByChannel[String(chat_id)] = buf; }
+    buf.push({ name: name, userId: user_id, text: text });
+    while (buf.length > PENDING_MAX) buf.shift();
+    return;
+  }
+
+  broadcast(name, user_id, chat_id, roomName, text);
 }
 
 // ── 폴링 스레드 ──────────────────────────────────────────────────

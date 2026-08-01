@@ -1,5 +1,5 @@
 {
-    "main": "제미니봇.js",
+    "main": "백업봇.js",
     "option": {
         "apiLevel": 2,
         "useConsoleApi": true,

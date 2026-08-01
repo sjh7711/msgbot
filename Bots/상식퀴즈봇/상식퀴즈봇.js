@@ -674,15 +674,20 @@ function callGemini(prompt, room) {
   // 직전 currentProviderIndex 이상인 첫 eligible 부터 시작 (소진된 키 재시도 최소화, 방이 바뀌면 자동 보정)
   var start = 0;
   for (var s = 0; s < elig.length; s++) { if (elig[s] >= currentProviderIndex) { start = s; break; } }
+  var lastKeyErr = null;
   for (var tried = 0; tried < elig.length; tried++) {
     var idx = elig[(start + tried) % elig.length];
-    currentProviderIndex = idx;
     var res = _callGeminiOnce(prompt, API_KEYS[idx]);
-    if (res.quota429) continue;   // 이 provider 는 쿼터 소진 — 다음 eligible provider 로
-    return res;                   // 정상 응답 또는 429 외 오류 → 즉시 반환
+    // 키-레벨 오류(429 쿼터초과 / 401·403 / 400-잘못된키)면 다음 eligible 키로 넘어간다.
+    // (예전엔 429 만 넘기고 403 등은 즉시 반환 → 폐기된 키에 커서가 고착돼 정상 키로 폴백 못했음)
+    if (res.keyError) { lastKeyErr = res; continue; }
+    currentProviderIndex = idx;   // 살아있는 키(정상 응답 또는 키무관 오류)에서만 커서 고정
+    return res;
   }
-  // 이 방의 모든 eligible provider 가 429
-  return { quotaExhausted: true, error: "모든 API 사용량 한도 초과" };
+  // 모든 eligible 키가 키-레벨 오류. 커서를 죽은 키에 남기지 않도록 첫 eligible 로 되돌린다.
+  currentProviderIndex = elig[0];
+  return lastKeyErr ? { quotaExhausted: true, error: lastKeyErr.error }
+                    : { quotaExhausted: true, error: "모든 API 사용량 한도 초과" };
 }
 
 function _callGeminiOnce(prompt, provider) {
@@ -725,10 +730,20 @@ function _callGeminiOnce(prompt, provider) {
     }
 
     if (code < 200 || code >= 300) {
+      // keyError=true 면 callGemini 가 다음 키로 회전한다.
       if (code === 429) {
-        // 사용량 한도 초과 — callGemini 가 다음 provider 로 전환하도록 플래그 반환
-        return { quota429: true, error: "HTTP 429" };
+        // 사용량 한도 초과
+        return { quota429: true, keyError: true, error: "HTTP 429" };
       }
+      if (code === 401 || code === 403) {
+        // 인증/권한 오류(폐기·비활성 키) → 이 키는 버리고 다음 키로
+        return { keyError: true, error: "HTTP " + code + ": " + raw.slice(0, 300) };
+      }
+      if (code === 400 && /api[\s_-]*key/i.test(raw)) {
+        // "API key not valid" 류 → 키 문제로 취급
+        return { keyError: true, error: "HTTP 400(키): " + raw.slice(0, 300) };
+      }
+      // 그 외(요청/콘텐츠 문제)는 키를 바꿔도 동일 → 즉시 반환
       return { error: "HTTP " + code + ": " + raw.slice(0, 300) };
     }
 
@@ -830,9 +845,12 @@ function getRecentRoundAnswers(limit) {
   return DBH.withDB(DB_PATH, function(db){
     var cur = null; var out = [];
     try {
+      // GROUP BY + MAX(created): 같은 답이 여러 번 출제됐으면 "가장 최근" 출제 시각으로 정렬한다.
+      // (예전 DISTINCT ... ORDER BY created 는 중복 답을 임의 행의 시각으로 정렬해, 오래전+최근에
+      //  쓰인 답이 최근 N개에서 누락되어 중복방지가 뚫리던 버그가 있었다.)
       cur = db.rawQuery(
-        "SELECT DISTINCT answer FROM quiz_round WHERE answer != '' " +
-        "ORDER BY created DESC LIMIT " + (limit || 1000), []
+        "SELECT answer FROM quiz_round WHERE answer != '' " +
+        "GROUP BY answer ORDER BY MAX(created) DESC LIMIT " + (limit || 1000), []
       );
       while (cur.moveToNext()) {
         var a = cur.getString(0);
@@ -908,6 +926,21 @@ function recordAppeal(hash) {
     stmt.bindLong(2, nowMs());
     stmt.execute(); stmt.close();
   } finally { }
+  });
+}
+
+// 이의신청이 실제로 처리되지 못했을 때(전 키 소진·검토 실패) 방금 차감한 일일 한도 1건을 되돌린다.
+// (예전엔 실패해도 차감이 남아, 검토 한 번 못 받고도 20/일 한도가 소진됐음)
+function refundAppeal(hash) {
+  if (!hash) return;
+  DBH.withDB(DB_PATH, function(db){
+  try {
+    db.execSQL(
+      "DELETE FROM quiz_appeal_request WHERE rowid = " +
+      "(SELECT rowid FROM quiz_appeal_request WHERE hash=? ORDER BY created DESC, rowid DESC LIMIT 1)",
+      [hash]
+    );
+  } catch(_) {}
   });
 }
 
@@ -1109,9 +1142,10 @@ function recordParticipation(hash, name, isWinner, wrongCount, room) {
   var r = room || "";
   var nm = name || "";
   DBH.withDB(DB_PATH, function(db){
+  var cur = null;
   try {
-    var cur = db.rawQuery("SELECT 1 FROM quiz_user WHERE hash=? AND room=?", [hash, r]);
-    var exists = cur.moveToFirst(); cur.close();
+    cur = db.rawQuery("SELECT 1 FROM quiz_user WHERE hash=? AND room=?", [hash, r]);
+    var exists = cur.moveToFirst(); cur.close(); cur = null;
 
     if (!exists) {
       var ins = db.compileStatement(
@@ -1136,7 +1170,7 @@ function recordParticipation(hash, name, isWinner, wrongCount, room) {
     upd.bindString(5, hash);
     upd.bindString(6, r);
     upd.execute(); upd.close();
-  } finally { }
+  } finally { if (cur) cur.close(); }
   });
 }
 
@@ -1204,13 +1238,14 @@ function resetQuiz(quiz, chanId) {
 // 난이도 1~5 기준(생성·감사 프롬프트 공용)
 var DIFFICULTY_SCALE = "1=고등학생도 아는 쉬운 상식, 2=성인 대부분 아는 상식, 3=성인이 잠깐 생각하면 맞히는 수준, 4=관심 있는 사람이 아는 수준, 5=전공자/대학원 석사 수준";
 
-// 목표 난이도 가중 추첨: 1=10%, 2=25%, 3=25%, 4=25%, 5=15%
+// 목표 난이도 가중 추첨: 1=10%, 2=25%, 3=53%, 4=8%, 5=4%
+// (예전 임계값은 실제로 1=15%,2=40%,3=33% 로 주석과 어긋나 2번이 과다·3번이 과소 출제됐음)
 function pickDifficulty() {
   var r = Math.random();
   if (r < 0.10) return 1;
   if (r < 0.35) return 2;
-  if (r < 0.60) return 3;
-  if (r < 0.85) return 4;
+  if (r < 0.88) return 3;
+  if (r < 0.96) return 4;
   return 5;
 }
 
@@ -1869,7 +1904,7 @@ function handleAppeal(msg, numArg) {
     try { result = verifyQuizAnswer(round, submittedAnswers, room); }
     catch(e) { error = (e && e.message) ? e.message : String(e); }
     try {
-      msgQueue.put({ type: "appeal_result", room: room, num: round.num, result: result, error: error, reviewees: reviewees });
+      msgQueue.put({ type: "appeal_result", room: room, num: round.num, result: result, error: error, reviewees: reviewees, appealerHash: hash });
     } catch(_) {}
   }).start();
 }
@@ -2108,7 +2143,7 @@ function processTask(task) {
     return;
   }
   if (task.type === "appeal_result") {
-    processAppealResult(task.room, task.num, task.result, task.error, task.reviewees);
+    processAppealResult(task.room, task.num, task.result, task.error, task.reviewees, task.appealerHash);
     return;
   }
   if (task.type === "api_test_result") {
@@ -2131,10 +2166,11 @@ function processTask(task) {
   }
 }
 
-function processAppealResult(room, num, result, error, reviewees) {
+function processAppealResult(room, num, result, error, reviewees, appealerHash) {
   // 모든 API 사용량 한도 초과 → 상태 복원 후 안내
   if (result && result._quotaExhausted) {
     setAppealState(room, num, 0);  // 재신청 가능하도록 되돌림
+    refundAppeal(appealerHash);    // 검토 못 했으므로 일일 한도 차감분 환불
     bot.send(room,
       "사용가능 API [0/" + API_KEYS.length + "]\n#" + num + " 회차 이의신청 일시적으로 사용 불가\n\n" +
       "👉 https://aistudio.google.com/api-keys 에서 API 키를 만들고 \n" +
@@ -2145,6 +2181,7 @@ function processAppealResult(room, num, result, error, reviewees) {
   // API 실패 → 상태 복원 후 안내
   if (!result || result._error) {
     setAppealState(room, num, 0);  // 재신청 가능하도록 되돌림
+    refundAppeal(appealerHash);    // 검토 실패 → 일일 한도 차감분 환불
     bot.send(room, "❗ #" + num + " 회차 이의신청 검토 실패\n사유: " + (error || (result && result._error) || "알 수 없음") + "\n다시 시도해보세요.");
     return;
   }
@@ -2240,6 +2277,9 @@ function handleApiSession(msg) {
   var text = String(msg.content || "").trim();
   if (text.indexOf("!api ") === 0) { delete apiSessions[sk]; return false; }  // 새 등록 → 일반 핸들러가 재시작
   if (text === "취소" || text === "!취소") { delete apiSessions[sk]; msg.reply("API 키 등록을 취소했습니다."); return true; }
+  // 세션 입력(방이름/닉네임/번호)은 '!'로 시작하지 않는다. '!'로 시작하면 봇 명령이므로
+  // 세션이 삼키지 말고 일반 핸들러로 넘긴다 → 등록 세션 중에도 !상식·!ㅈㄷ 등을 계속 쓸 수 있다.
+  if (text.indexOf("!") === 0) { return false; }
   if (!text) return true;
   s.ts = nowMs();
 
@@ -2328,9 +2368,17 @@ function handleMessage(msg) {
 
     if (text === "!상식종료") {
       if (quiz.active && msg.room === quiz.room) {
-        var ans = quiz.answer;
+        // 객관식이면 quiz.answer 는 인덱스 문자열이므로 보기 텍스트로 변환해 보여준다.
+        var ans;
+        if (quiz.type === "multi") {
+          var ci = quiz.correctIndex - 1;
+          var at = (ci >= 0 && quiz.choices && ci < quiz.choices.length) ? quiz.choices[ci] : "";
+          ans = quiz.correctIndex + "번" + (at ? ". " + at : "");
+        } else {
+          ans = "\"" + quiz.answer + "\"";
+        }
         resetQuiz(quiz, chanId);
-        msg.reply("퀴즈를 종료합니다. 정답은 \"" + ans + "\" 였습니다.");
+        msg.reply("퀴즈를 종료합니다. 정답은 " + ans + " 였습니다.");
       } else {
         msg.reply("진행 중인 퀴즈가 없습니다.");
       }

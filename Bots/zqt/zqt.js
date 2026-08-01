@@ -26,6 +26,9 @@ VIEW_FMT.setTimeZone(PDT_TZ);
 
 var LONG_MSG_SPACER = "​".repeat(500);
 
+// 실격자(힌트 사용 등)는 시간과 무관하게 고정 꼴찌 등수
+var DISQ_RANK = 5;
+
 function todayStr(){ return DATE_FMT.format(new java.util.Date()); }
 function parseDateStr(s){ try{ return DATE_FMT.parse(s); }catch(e){ return null; } }
 function toDateStr(d){ return DATE_FMT.format(d); }
@@ -72,7 +75,7 @@ function initDatabase(){
     );
 
     var cur = db.rawQuery("SELECT COUNT(1) FROM games", []);
-    var empty = false; if (cur.moveToFirst()) empty = cur.getInt(0) === 0; cur.close();
+    var empty = false; try { if (cur.moveToFirst()) empty = cur.getInt(0) === 0; } finally { cur.close(); }
     if (empty){
       var ins = db.compileStatement("INSERT OR IGNORE INTO games(key, ord) VALUES(?,?)");
       var G = ["z","q","t","s"];
@@ -81,10 +84,16 @@ function initDatabase(){
     }
 
     var colCur = db.rawQuery("PRAGMA table_info(records_v2)", []);
-    var hasTimeCol = false;
-    while (colCur.moveToNext()){ if (colCur.getString(1) === "time"){ hasTimeCol = true; break; } }
-    colCur.close();
+    var hasTimeCol = false, hasDisqCol = false;
+    try {
+      while (colCur.moveToNext()){
+        var colName = colCur.getString(1);
+        if (colName === "time") hasTimeCol = true;
+        if (colName === "disq") hasDisqCol = true;
+      }
+    } finally { colCur.close(); }
     if (!hasTimeCol) db.execSQL("ALTER TABLE records_v2 ADD COLUMN time INTEGER");
+    if (!hasDisqCol) db.execSQL("ALTER TABLE records_v2 ADD COLUMN disq INTEGER NOT NULL DEFAULT 0");
   });
 }
 initDatabase();
@@ -370,7 +379,105 @@ function overallRankForPlayer(fromStr, toStr, player){
 }
 
 // === 보기 포맷 ===
-function prettyRankLineFromGroups(groups){ var out=[]; for (var i=0;i<groups.length;i++){ var g=groups[i]; out.push(g.length>1? ("("+g.join("")+")") : g[0]); } return out.join(" "); }
+function prettyRankLineFromGroups(groups){ var out=[]; for (var i=0;i<groups.length;i++){ var g=groups[i]; if (!g || !g.length) continue; out.push(g.length>1? ("("+g.join("")+")") : g[0]); } return out.join(" "); }
+
+function rankLineWithDisq(groups, disqNames){
+  var line = prettyRankLineFromGroups(groups || []);
+  if (disqNames && disqNames.length) line += (line ? " " : "") + "실격:" + disqNames.join("");
+  return line || "(기록 없음)";
+}
+
+// === 실격 반영 재계산 ===
+// 해당 (날짜, 게임)의 등수를 다시 매긴다.
+// - disq=0: 현재 저장된 rank 순서(동순위=동점)를 유지한 채 1등부터 압축 부여.
+//   preferTime=true 이고 전원 time 이 있으면 time 순으로 재정렬(실격취소 복귀용).
+// - disq=1: 시간과 무관하게 DISQ_RANK(5등) 고정.
+// 반환: { groups: [[player,...],...], disq: [player,...] } — 출력용
+function recalcDayGame(db, dateStr, game, preferTime){
+  var active = [], disqd = [];
+  var cur = null;
+  try {
+    cur = db.rawQuery(
+      "SELECT player, rank, time, disq FROM records_v2 WHERE play_date=? AND game=? ORDER BY rank, player",
+      [dateStr, game]
+    );
+    while (cur.moveToNext()){
+      var row = { player: cur.getString(0), rank: cur.getInt(1), time: cur.isNull(2) ? null : cur.getInt(2) };
+      if (cur.getInt(3) === 1) disqd.push(row); else active.push(row);
+    }
+  } finally { if (cur) cur.close(); }
+
+  var byTime = false;
+  if (preferTime && active.length){
+    byTime = true;
+    for (var i=0;i<active.length;i++){ if (active[i].time == null){ byTime = false; break; } }
+  }
+  if (byTime) active.sort(function(a,b){ if (a.time!==b.time) return a.time-b.time; return a.player.localeCompare(b.player); });
+
+  var groups = [];
+  for (var i=0;i<active.length;i++){
+    var sameAsPrev = i>0 && (byTime ? active[i].time === active[i-1].time : active[i].rank === active[i-1].rank);
+    if (sameAsPrev) groups[groups.length-1].push(active[i].player);
+    else groups.push([active[i].player]);
+  }
+
+  var st = db.compileStatement("UPDATE records_v2 SET rank=? WHERE play_date=? AND game=? AND player=?");
+  var currentRank = 1;
+  for (var r=0;r<groups.length;r++){
+    for (var k=0;k<groups[r].length;k++){
+      st.bindLong(1, currentRank); st.bindString(2, dateStr); st.bindString(3, game); st.bindString(4, groups[r][k]);
+      st.executeUpdateDelete();
+    }
+    currentRank += groups[r].length;
+  }
+  var disqNames = [];
+  for (var i=0;i<disqd.length;i++){
+    st.bindLong(1, DISQ_RANK); st.bindString(2, dateStr); st.bindString(3, game); st.bindString(4, disqd[i].player);
+    st.executeUpdateDelete();
+    disqNames.push(disqd[i].player);
+  }
+  st.close();
+  disqNames.sort();
+  return { groups: groups, disq: disqNames };
+}
+
+// === 핸들러: 실격 / 실격취소 ===
+function handleDisq(argText, undo){
+  var label = undo ? "!실격취소" : "!실격";
+  var parts = trim(argText||"").split(/\s+/).filter(Boolean);
+  var dateStr = todayStr();
+  if (parts.length && /^(\d{8}|\d{4}-\d{2}-\d{2})$/.test(parts[0])){
+    dateStr = parts[0].replace(/-/g, "");
+    parts = parts.slice(1);
+  }
+  if (parts.length !== 2) return "형식: " + label + " [yyyyMMdd] [게임키] [이름]\n예) " + label + " z 먐";
+  var gameKey = parts[0].toLowerCase();
+  var player = parts[1];
+  if (!gameExists(gameKey)) return "미등록 게임입니다: " + gameKey;
+  if (!userExists(player)) return "미등록 유저입니다: " + player;
+
+  var res = null;
+  DBH.withDB(DB_PATH, function(db){
+    DBH.transaction(db, function(db){
+      var st = db.compileStatement("UPDATE records_v2 SET disq=? WHERE play_date=? AND game=? AND player=?");
+      st.bindLong(1, undo ? 0 : 1); st.bindString(2, dateStr); st.bindString(3, gameKey); st.bindString(4, player);
+      var changed = st.executeUpdateDelete(); st.close();
+      if (changed === 0){
+        if (undo){ res = { error: toViewStr(dateStr) + " " + gameKey + " " + player + " 기록이 없습니다." }; return; }
+        // 기록이 아직 없어도 선실격 가능 — 이후 !자동기록 이 시간만 채우고 실격은 유지된다.
+        var st2 = db.compileStatement("INSERT INTO records_v2(play_date, game, player, rank, time, disq) VALUES(?,?,?,?,NULL,1)");
+        st2.bindString(1, dateStr); st2.bindString(2, gameKey); st2.bindString(3, player); st2.bindLong(4, DISQ_RANK);
+        st2.execute(); st2.close();
+      }
+      // 실격취소 복귀는 시간 기록이 전부 있으면 시간순으로 자리를 되찾는다.
+      res = { r: recalcDayGame(db, dateStr, gameKey, !!undo) };
+    });
+  });
+
+  if (res && res.error) return res.error;
+  return "[" + (undo ? "실격 취소" : "실격 처리") + "] " + toViewStr(dateStr) + " " + gameKey + " " + player +
+         "\n" + gameKey + " " + rankLineWithDisq(res.r.groups, res.r.disq);
+}
 
 // === 기간 파싱 ===
 function getFullRangeFromDB(){
@@ -445,7 +552,15 @@ function handleRecord(msg){
   var parsed = parseGameLines(body, allowedUsers, allowedGames); if (parsed.error) return parsed.error;
   saveV2(day, parsed.data);
 
-  var order = getAllGamesOrdered(); var show=[]; for (var i=0;i<order.length;i++){ var g=order[i]; if (parsed.data[g]) show.push(g+" "+prettyRankLineFromGroups(parsed.data[g])); }
+  // 수동 기록도 실격자는 5등 고정으로 재조정 (수동 입력 순서는 유지, 실격 해제는 !실격취소 로)
+  var finalByGame = {};
+  DBH.withDB(DB_PATH, function(db){
+    DBH.transaction(db, function(db){
+      for (var g in parsed.data){ if (parsed.data.hasOwnProperty(g)) finalByGame[g] = recalcDayGame(db, day, g); }
+    });
+  });
+
+  var order = getAllGamesOrdered(); var show=[]; for (var i=0;i<order.length;i++){ var g=order[i]; if (finalByGame[g]) show.push(g+" "+rankLineWithDisq(finalByGame[g].groups, finalByGame[g].disq)); }
   return "[저장 완료] "+toViewStr(day)+"\n"+show.join("\n");
 }
 
@@ -487,7 +602,8 @@ function handleRank(arg){
 }
 
 // === 핸들러: 일자 상세 ===
-function loadDayV2(dateStr){ return DBH.withDB(DB_PATH, function(db){ var cur=null; var map={}; try{ cur=db.rawQuery("SELECT game, player, rank FROM records_v2 WHERE play_date=? ORDER BY game, rank", [dateStr]); while (cur.moveToNext()){ var g=cur.getString(0), p=cur.getString(1), r=cur.getInt(2); if(!map[g]) map[g]=[]; while (map[g].length<r) map[g].push([]); map[g][r-1].push(p); } } finally { if (cur) cur.close(); } return map; }); }
+// 반환: { game: { groups:[[p,...],...], disq:[p,...] } } — 실격자는 groups 에서 빼고 따로 담는다
+function loadDayV2(dateStr){ return DBH.withDB(DB_PATH, function(db){ var cur=null; var map={}; try{ cur=db.rawQuery("SELECT game, player, rank, disq FROM records_v2 WHERE play_date=? ORDER BY game, rank", [dateStr]); while (cur.moveToNext()){ var g=cur.getString(0), p=cur.getString(1), r=cur.getInt(2), dq=cur.getInt(3); if(!map[g]) map[g]={groups:[],disq:[]}; if (dq===1){ map[g].disq.push(p); continue; } while (map[g].groups.length<r) map[g].groups.push([]); map[g].groups[r-1].push(p); } } finally { if (cur) cur.close(); } return map; }); }
 function handleDetail(argText){
   var range = getRangeFromArg(trim(argText||""));
   if (range.error) return range.error;
@@ -516,7 +632,7 @@ function handleDetail(argText){
     for (var i = 0; i < order.length; i++) {
       var gk = order[i];
       if (!dayMap[gk]) continue;
-      gameLines.push(gk + " " + prettyRankLineFromGroups(dayMap[gk]));
+      gameLines.push(gk + " " + rankLineWithDisq(dayMap[gk].groups, dayMap[gk].disq));
     }
 
     // 종합순위 점수: 미참가 패널티(=그날 참가 인원 수) 반영
@@ -556,14 +672,14 @@ function buildTimeSection(dateStr) {
     var cur = null; var gd = {};
     try {
       cur = db.rawQuery(
-        "SELECT game, player, rank, time FROM records_v2 WHERE play_date=? ORDER BY game, rank",
+        "SELECT game, player, rank, time, disq FROM records_v2 WHERE play_date=? ORDER BY game, rank",
         [dateStr]
       );
       while (cur.moveToNext()) {
         var g = cur.getString(0), p = cur.getString(1), r = cur.getInt(2);
         var t = cur.isNull(3) ? null : cur.getInt(3);
         if (!gd[g]) gd[g] = [];
-        gd[g].push({ player: p, rank: r, time: t });
+        gd[g].push({ player: p, rank: r, time: t, disq: cur.getInt(4) === 1 });
       }
     } finally { if (cur) cur.close(); }
     return gd;
@@ -579,7 +695,8 @@ function buildTimeSection(dateStr) {
   for (var i = 0; i < usedGames.length; i++) {
     var rows = gameData[usedGames[i]];
     for (var j = 0; j < rows.length; j++) {
-      if (rows[j].time === null) return null;
+      // 선실격(!실격 먼저) 행은 time 이 없을 수 있으므로 섹션 표시를 막지 않는다
+      if (rows[j].time === null && !rows[j].disq) return null;
     }
   }
 
@@ -590,7 +707,8 @@ function buildTimeSection(dateStr) {
     lines.push(gk);
     var rows = gameData[gk];
     for (var j = 0; j < rows.length; j++) {
-      lines.push(rows[j].rank + " " + rows[j].player + " " + formatTime(rows[j].time));
+      var head = rows[j].disq ? "실격" : ("" + rows[j].rank);
+      lines.push(head + " " + rows[j].player + (rows[j].time === null ? "" : " " + formatTime(rows[j].time)));
     }
   }
   return lines.join("\n");
@@ -687,27 +805,13 @@ function handleRankStats(player){
   if (!userExists(player)) return "미등록 유저입니다: " + player;
 
   var rg = getFullRangeFromDB();
-  var dayMap = DBH.withDB(DB_PATH, function(db){
-    var cur=null;
-    var dm = {};
-    try {
-      cur = db.rawQuery(
-        "SELECT play_date, player, rank FROM records_v2 ORDER BY play_date, player",
-        []
-      );
-      while (cur.moveToNext()){
-        var d = cur.getString(0);
-        var p = cur.getString(1);
-        var r = cur.getInt(2);
-        if (!dm[d]) dm[d] = {};
-        if (!dm[d][p]) dm[d][p] = 0;
-        dm[d][p] += r;
-      }
-    } finally { if (cur) cur.close(); }
-    return dm;
-  });
+  // 일자 종합순위(handleDetail)·월간종합등수와 동일 기준: 미참가 패널티 포함 집계.
+  var dayMap = loadDailyOverallScores(rg.from, rg.to);
 
-  var rankCount = {1:0, 2:0, 3:0, 4:0};
+  // 등수별 횟수를 고정 1~4등이 아니라 실제 도달한 등수까지 동적으로 집계한다.
+  // (유저가 5명이고 실격=5등 고정도 있어 5등 이상이 정상적으로 발생 → 예전엔 누락됐음)
+  var rankCount = {};
+  var maxRank = 0;
   var totalDays = 0;
 
   for (var d in dayMap){
@@ -728,8 +832,8 @@ function handleRankStats(player){
       if (i>0 && players[i].score !== players[i-1].score)
         currentRank = i + 1;
       if (players[i].name === player){
-        if (currentRank >=1 && currentRank <=4)
-          rankCount[currentRank] = (rankCount[currentRank]||0)+1;
+        rankCount[currentRank] = (rankCount[currentRank]||0)+1;
+        if (currentRank > maxRank) maxRank = currentRank;
         break;
       }
     }
@@ -740,10 +844,9 @@ function handleRankStats(player){
   var lines=[];
   lines.push(rg.view);
   lines.push(player + " 종합등수통계");
-  lines.push("1등 : " + (rankCount[1]||0) + "회");
-  lines.push("2등 : " + (rankCount[2]||0) + "회");
-  lines.push("3등 : " + (rankCount[3]||0) + "회");
-  lines.push("4등 : " + (rankCount[4]||0) + "회");
+  for (var rk = 1; rk <= maxRank; rk++){
+    lines.push(rk + "등 : " + (rankCount[rk]||0) + "회");
+  }
   return lines.join("\n");
 }
 
@@ -919,36 +1022,18 @@ function handleUnifiedRank(argText){
   return handleMultiGameRank(defaultMultiGameKeys(), txt);
 }
 
+// 일자별 종합점수(플레이어→그날 rank 합). 미참가 패널티(그날 참가 인원 수)를 포함해
+// handleDetail 의 일자 종합순위와 동일 기준으로 집계한다 (예전엔 raw rank 합이라 불일치했음).
 function loadDailyOverallScores(fromStr, toStr){
-  return DBH.withDB(DB_PATH, function(db){
-    var cur = null;
-    var dayMap = {};
-
-    try {
-      cur = db.rawQuery(
-        "SELECT play_date, player, rank " +
-        "FROM records_v2 " +
-        "WHERE play_date BETWEEN ? AND ? " +
-        "ORDER BY play_date, player",
-        [fromStr, toStr]
-      );
-
-      while (cur.moveToNext()){
-        var d = cur.getString(0);
-        var p = cur.getString(1);
-        var r = cur.getInt(2);
-
-        if (!dayMap[d]) dayMap[d] = {};
-        if (!dayMap[d][p]) dayMap[d][p] = 0;
-
-        dayMap[d][p] += r;
-      }
-    } finally {
-      if (cur) cur.close();
-    }
-
-    return dayMap;
-  });
+  var recs = loadAugmentedRecords(fromStr, toStr, null);
+  var dayMap = {};
+  for (var i = 0; i < recs.length; i++){
+    var d = recs[i].date, p = recs[i].player, r = recs[i].rank;
+    if (!dayMap[d]) dayMap[d] = {};
+    if (!dayMap[d][p]) dayMap[d][p] = 0;
+    dayMap[d][p] += r;
+  }
+  return dayMap;
 }
 
 function calcDailyOverallRanks(dayScores){
@@ -1074,9 +1159,10 @@ function readNotificationsFile(notifyDateStr) {
   if (!file.exists()) return { path: filePath, content: null };
   var sb = new java.lang.StringBuilder();
   var br = new java.io.BufferedReader(new java.io.InputStreamReader(new java.io.FileInputStream(file), "UTF-8"));
-  var line;
-  while ((line = br.readLine()) !== null) { sb.append(line).append("\n"); }
-  br.close();
+  try {
+    var line;
+    while ((line = br.readLine()) !== null) { sb.append(line).append("\n"); }
+  } finally { try { br.close(); } catch(_) {} }
   return { path: filePath, content: sb.toString() };
 }
 
@@ -1234,12 +1320,12 @@ function handleAutoRecord(dateArg) {
     timeMap[e.game][e.player] = e.time;
   }
 
-  // rankGroups 는 콜백 밖(출력 루프, 아래)에서도 쓰이므로 handleAutoRecord 스코프에서 선언해야 한다.
-  // (이전엔 transaction 콜백 안에서 var 선언 → 콜백 밖 출력부에서 ReferenceError 로 reply 가 안 나갔음.
-  //  DB 쓰기는 콜백 안에서 이미 커밋돼 "기록은 되는데 출력만 안 나오는" 증상이었음.)
-  // calcRanksFromEntries 는 entries 만 쓰는 순수 계산이라 DB 쓰기 전에 미리 구해도 안전.
   var rankGroups = calcRanksFromEntries(entries);
 
+  // finalByGame 은 콜백 밖(출력 루프, 아래)에서도 쓰이므로 handleAutoRecord 스코프에서 선언해야 한다.
+  // (이전엔 transaction 콜백 안에서 var 선언 → 콜백 밖 출력부에서 ReferenceError 로 reply 가 안 나갔음.
+  //  DB 쓰기는 콜백 안에서 이미 커밋돼 "기록은 되는데 출력만 안 나오는" 증상이었음.)
+  var finalByGame = {};
   DBH.withDB(DB_PATH, function(db){
     DBH.transaction(db, function(db){
       for (var g in rankGroups) {
@@ -1254,6 +1340,12 @@ function handleAutoRecord(dateArg) {
           }
           currentRank += grp.length;
         }
+        // preferTime=true: 그날 그 게임의 비실격 참가자 전원을 시간 기준으로 다시 정렬한다.
+        // 파일에 일부만 있고 DB 에 이미 다른(직전 자동기록) 참가자가 있어도, 모두 time 이 있으면
+        // 시간순으로 올바르게 합쳐진다(예전엔 저장된 rank 가 겹쳐 허위 공동순위가 생겼음).
+        // 실격자는 시간과 무관하게 5등 고정. (수동기록으로 time 이 없는 참가자가 섞이면
+        //  time 비교가 불가능하므로 저장된 rank 순서로 폴백 — 이 조합은 드물다.)
+        finalByGame[g] = recalcDayGame(db, dbDateStr, g, true);
       }
     });
   });
@@ -1264,8 +1356,8 @@ function handleAutoRecord(dateArg) {
   var allGames = getAllGamesOrdered();
   for (var i = 0; i < allGames.length; i++) {
     var gk = allGames[i];
-    if (!rankGroups[gk]) continue;
-    lines.push(gk + " " + prettyRankLineFromGroups(rankGroups[gk]));
+    if (!finalByGame[gk]) continue;
+    lines.push(gk + " " + rankLineWithDisq(finalByGame[gk].groups, finalByGame[gk].disq));
   }
 
   return lines.join("\n");
@@ -1300,6 +1392,8 @@ function handleMessage(msg) {
     return;
   }
   if (text === "!자동기록" || /^!자동기록\s+\S/.test(text)){ var autoArg = trim(text.replace(/^!자동기록/, "")) || null; msg.reply(handleAutoRecord(autoArg)); return; }
+  if (/^!실격취소(\s+.*)?$/.test(text)){ msg.reply(handleDisq(trim(text.replace(/^!실격취소/, "")), true)); return; }
+  if (/^!실격(\s+.*)?$/.test(text)){ msg.reply(handleDisq(trim(text.replace(/^!실격/, "")), false)); return; }
   if (/^!유저등록\s+.+$/.test(text)){ var name=trim(text.replace(/^!유저등록\s+/, "")); msg.reply(registerUser(name)); return; }
   if (/^!게임등록\s+.+$/.test(text)){ var key=trim(text.replace(/^!게임등록\s+/, "")); msg.reply(registerGame(key)); return; }
   if (/^!게임기록(\s+\d{8})?(\n|$)/.test(text)){ msg.reply(handleRecord(text)); return; }
@@ -1314,7 +1408,9 @@ function handleMessage(msg) {
       "\n"+
       "!게임순위 [게임키] [전체|오늘|어제|이번주|저번주|이번달|저번달|n월|올해|작년|yyyyMMdd|yyyyMMdd~yyyyMMdd]\n"+
       "!완승기록 [이름]\n"+
-      "!등수통계 [이름]"
+      "!등수통계 [이름]\n"+
+      "!실격 [yyyyMMdd] [게임키] [이름] — 힌트 사용 등 실격, 시간 무관 5등 고정\n"+
+      "!실격취소 [yyyyMMdd] [게임키] [이름]"
     );
     return;
   }

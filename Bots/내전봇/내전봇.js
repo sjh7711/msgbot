@@ -119,11 +119,18 @@ function getNicknameFromHash(hash) {
 }
 
 // 카카오이름으로 hash 조회 (userhash DB 참조)
-function getHashByKakaoName(kakaoName) {
+// userhash 는 (사람,방)당 1행이고 이름은 방마다 겹칠 수 있으므로 현재 방 우선, 없으면 전역 폴백.
+// (예전엔 방 필터가 없어 동명이인이 있으면 임의의 다른 사람 hash 가 잡혔음)
+function getHashByKakaoName(kakaoName, room) {
     var HASH_DB_PATH = Packages.android.os.Environment.getExternalStorageDirectory().getAbsolutePath() + "/msgbot/userhash.db";
     return DBH.withDB(HASH_DB_PATH, function(db){
     var cur = null;
     try {
+        if (room) {
+            cur = db.rawQuery("SELECT hash FROM userhash WHERE name=? AND room=? LIMIT 1", [kakaoName, room]);
+            if (cur.moveToFirst()) return cur.getString(0);
+            cur.close(); cur = null;
+        }
         cur = db.rawQuery("SELECT hash FROM userhash WHERE name=? LIMIT 1", [kakaoName]);
         if (cur.moveToFirst()) return cur.getString(0);
         return null;
@@ -133,8 +140,8 @@ function getHashByKakaoName(kakaoName) {
 }
 
 // 카카오이름(@sender) → 롤닉네임
-function getNicknameFromKakaoName(kakaoName) {
-    var h = getHashByKakaoName(kakaoName);
+function getNicknameFromKakaoName(kakaoName, room) {
+    var h = getHashByKakaoName(kakaoName, room);
     if (!h) return null;
     return getNicknameFromHash(h);
 }
@@ -157,6 +164,8 @@ function getHashCountByLolNickname(lolNickname) {
 // - 같은 hash로 다른 lol_nickname: UPDATE users + players 연쇄 업데이트
 // - lol_nickname hash 2개 초과 시 거부
 function insertNickname(hash, lolNickname, room) {
+    // 팀은 쉼표로 join/split 되어 저장되므로 닉네임에 쉼표가 있으면 팀 파싱이 깨진다.
+    if (lolNickname.indexOf(",") !== -1) return { success: false, message: "닉네임에 쉼표(,)는 사용할 수 없습니다." };
     return DBH.withDB(DB_PATH, function(db){
     var cur = null;
     try {
@@ -190,9 +199,28 @@ function insertNickname(hash, lolNickname, room) {
                     "SELECT ?, wins, losses, total_games, win_rate, created_at FROM players WHERE lol_nickname=?",
                     [lolNickname, oldNick]
                 );
+            } else {
+                // 새 닉네임 행이 이미 있으면 옛 닉 전적을 병합(예전엔 병합 없이 옛 행을 지워 전적이 증발했음)
+                var oldStats = { wins:0, losses:0, total:0 };
+                var scur = db.rawQuery("SELECT wins, losses, total_games FROM players WHERE lol_nickname=?", [oldNick]);
+                try { if (scur.moveToFirst()) { oldStats.wins=scur.getInt(0); oldStats.losses=scur.getInt(1); oldStats.total=scur.getInt(2); } }
+                finally { scur.close(); }
+                if (oldStats.total > 0) {
+                    db.execSQL(
+                        "UPDATE players SET wins=wins+?, losses=losses+?, total_games=total_games+?, " +
+                        "win_rate=CASE WHEN (total_games+?)>0 THEN ((wins+?)*100.0/(total_games+?)) ELSE 0 END, " +
+                        "updated_at=CURRENT_TIMESTAMP WHERE lol_nickname=?",
+                        [oldStats.wins, oldStats.losses, oldStats.total,
+                         oldStats.total, oldStats.wins, oldStats.total, lolNickname]
+                    );
+                }
             }
-            // game_participants, games 의 닉네임 연쇄 업데이트
+            // game_participants, games, hiding_players 의 닉네임 연쇄 업데이트
             db.execSQL("UPDATE game_participants SET lol_nickname=? WHERE lol_nickname=?", [lolNickname, oldNick]);
+            // 숨김 상태도 새 닉으로 이전 (예전엔 옛 닉이 남아 숨김이 풀리고 !숨김해제도 안 먹었음).
+            // 새 닉이 이미 숨김이면 옛 행은 중복이므로 삭제.
+            db.execSQL("DELETE FROM hiding_players WHERE lol_nickname=? AND EXISTS(SELECT 1 FROM hiding_players WHERE lol_nickname=?)", [oldNick, lolNickname]);
+            db.execSQL("UPDATE hiding_players SET lol_nickname=? WHERE lol_nickname=?", [lolNickname, oldNick]);
             var gcur = db.rawQuery("SELECT id, left_team, right_team FROM games", []);
             while (gcur.moveToNext()) {
                 var gid = gcur.getInt(0);
@@ -236,6 +264,7 @@ function insertNickname(hash, lolNickname, room) {
 // - 새 hash가 이미 다른 닉네임에 등록되어 있으면 거부
 // - 기존 hash를 새 hash로 교체
 function reRegisterNickname(newHash, lolNickname, room) {
+    if (lolNickname.indexOf(",") !== -1) return { success: false, message: "닉네임에 쉼표(,)는 사용할 수 없습니다." };
     return DBH.withDB(DB_PATH, function(db){
     var cur = null;
     try {
@@ -296,8 +325,14 @@ function isValidDateTime(str) {
     var parts = str.split(" ");
     var d = parts[0].split("-").map(Number);
     var t = parts[1].split(":").map(Number);
-    var date = new Date(d[0], d[1]-1, d[2], t[0], t[1]);
-    return date instanceof Date && !isNaN(date);
+    var y=d[0], mo=d[1], da=d[2], h=t[0], mi=t[1];
+    // new Date 는 범위를 넘는 값을 롤오버(2월30일→3월2일, 25시→익일1시)하므로 명시 검증 필요.
+    if (mo<1||mo>12||da<1||da>31||h>23||mi>59) return false;
+    var date = new Date(y, mo-1, da, h, mi);
+    if (isNaN(date)) return false;
+    // 롤오버 검출: 파싱 결과가 입력과 다르면 존재하지 않는 날짜(예: 2025-02-30)
+    return date.getFullYear()===y && date.getMonth()===mo-1 && date.getDate()===da &&
+           date.getHours()===h && date.getMinutes()===mi;
 }
 
 // =====================================================================
@@ -673,16 +708,16 @@ function formatEloRankings(playerStats, excludedPlayers) {
         var p=filtered[i];
         var sc=db.rawQuery("SELECT wins,losses,win_rate FROM players WHERE lol_nickname=?",[p.nickname]);
         var w=0,l=0,wr=0;
-        if (sc.moveToFirst()) { w=sc.getInt(0); l=sc.getInt(1); wr=sc.getFloat(2); }
-        sc.close();
+        try { if (sc.moveToFirst()) { w=sc.getInt(0); l=sc.getInt(1); wr=sc.getFloat(2); } } finally { sc.close(); }
         res += (i+1)+". "+p.nickname+"\n   ELO: "+p.elo+"\n   "+p.games+"전 "+w+"승 "+l+"패 ("+wr.toFixed(1)+"%)";
         if (i<filtered.length-1) res+="\n";
     }
     return res;
     });
+    // 평균은 표시된(제외 안 된) 인원 기준. 인원 0명이면 NaN 대신 생략.
     var tot=0, cnt=0;
-    for (var n in playerStats) { tot+=playerStats[n].elo; cnt++; }
-    result += "\n===================\n평균 ELO: "+(tot/cnt).toFixed(1);
+    for (var fi=0; fi<filtered.length; fi++) { tot+=filtered[fi].elo; cnt++; }
+    if (cnt>0) result += "\n===================\n평균 ELO: "+(tot/cnt).toFixed(1);
     return result;
 }
 
@@ -730,8 +765,11 @@ function formatGameDate(originalDate) {
         if (dp.length!==2) return originalDate+" (형식 오류)";
         var d=dp[0].split("-"), t=dp[1].split(":");
         if (d.length!==3||t.length<2) return originalDate+" (변환 실패)";
+        // 자동저장 게임은 CURRENT_TIMESTAMP(UTC, 초 포함)라 +9h 로 KST 변환해야 하지만,
+        // 수동기록(!기록 날짜)은 사용자가 이미 KST "yyyy-MM-dd HH:mm"(초 없음)로 넣으므로 변환 금지.
+        var isUtc = (t.length >= 3);   // 초가 있으면 CURRENT_TIMESTAMP = UTC
         var gd=new Date(+d[0],+d[1]-1,+d[2],+t[0],+t[1]);
-        var kd=new Date(gd.getTime()+(9*60*60*1000));
+        var kd = isUtc ? new Date(gd.getTime()+(9*60*60*1000)) : gd;
         var mo=kd.getMonth()+1, dy=kd.getDate(), hr=kd.getHours(), mi=kd.getMinutes();
         return kd.getFullYear()+"-"+(mo<10?"0"+mo:mo)+"-"+(dy<10?"0"+dy:dy)+" "+(hr<10?"0"+hr:hr)+":"+(mi<10?"0"+mi:mi);
     } catch(e) { return originalDate+" (오류: "+e.message+")"; }
@@ -792,7 +830,8 @@ function handleMessage(msg) {
         }
 
         // ── 이전게임 ─────────────────────────────────────────────
-        else if (text === "!이전게임") {
+        //   모집/진행 중에는 현재 party·게임 상태를 덮어쓰지 않도록 막는다(!초기화 후 사용).
+        else if (text === "!이전게임" && !st.partygathering && !st.gamestart) {
             if (st.lastgameparty.length === 0) { msg.reply("이전 게임에 참가한 사람이 없습니다."); return; }
             st.partygathering = true; st.party = [];
             for (var i=0; i<st.lastgameparty.length; i++) {
@@ -898,8 +937,11 @@ function handleMessage(msg) {
             return;
         }
 
-        // ── 챔프 (롤닉네임으로 판별 — 다른 방 등록도 인식) ───────
-        else if (text.startsWith("!챔프") && st.gamestart && !st.partygathering) {
+        // ── 챔프 (롤닉네임으로 판별 — 개인톡 포함 어느 방에서든 인식) ───────
+        //   게임 상태는 방(채널)별로 저장되므로, 개인톡에서 !챔프 하면 그 방의 상태엔 게임이 없다.
+        //   따라서 발신자의 롤닉이 속한 "진행 중인 게임"을 모든 방 상태에서 찾아 응답한다.
+        //   (공개방에서는 챔프가 노출되지 않도록 개인톡으로 유도)
+        else if (text.startsWith("!챔프")) {
             if (room === "명동(공공장소에서열지마세요)") {
                 msg.reply("개인챗으로 !챔프 를 통해 챔피언을 확인하세요."); return;
             }
@@ -913,13 +955,21 @@ function handleMessage(msg) {
             } finally { if (cur2) cur2.close(); }
             return out;
             });
-            var matched = null;
-            for (var i=0; i<nicks.length; i++) {
-                if (st.leftTeam.indexOf(nicks[i])!==-1 || st.rightTeam.indexOf(nicks[i])!==-1) { matched=nicks[i]; break; }
+            // 모든 방의 진행 중(gamestart && !partygathering) 게임에서 이 사람이 속한 팀 탐색
+            var found = null;
+            for (var cid in rooms) {
+                if (!rooms.hasOwnProperty(cid)) continue;
+                var g = rooms[cid];
+                if (!g.gamestart || g.partygathering) continue;
+                for (var i=0; i<nicks.length; i++) {
+                    if (g.leftTeam.indexOf(nicks[i])!==-1) { found={team:"left", state:g}; break; }
+                    if (g.rightTeam.indexOf(nicks[i])!==-1) { found={team:"right", state:g}; break; }
+                }
+                if (found) break;
             }
-            if (!matched) { msg.reply("현재 게임 참가자 목록에 없습니다.\n닉네임 등록: !닉네임등록 롤닉네임"); return; }
-            if (st.leftTeam.indexOf(matched)!==-1) msg.reply("왼쪽 팀 챔피언\n"+st.leftteamchamplist.join(", "));
-            else msg.reply("오른쪽 팀 챔피언\n"+st.rightteamchamplist.join(", "));
+            if (!found) { msg.reply("현재 진행 중인 게임 참가자 목록에 없습니다.\n닉네임 등록: !닉네임등록 롤닉네임"); return; }
+            if (found.team==="left") msg.reply("왼쪽 팀 챔피언\n"+found.state.leftteamchamplist.join(", "));
+            else msg.reply("오른쪽 팀 챔피언\n"+found.state.rightteamchamplist.join(", "));
             return;
         }
 
@@ -939,7 +989,7 @@ function handleMessage(msg) {
                 if (!targetNick) { msg.reply("닉네임을 등록하세요.\n!닉네임등록 롤닉네임"); return; }
             } else if (input.startsWith("@")) {
                 var kakaoName = input.replace("@","").trim();
-                targetNick = getNicknameFromKakaoName(kakaoName);
+                targetNick = getNicknameFromKakaoName(kakaoName, room);
                 if (!targetNick) { msg.reply(kakaoName+" 님이 닉네임을 등록하지 않았습니다."); return; }
             } else {
                 targetNick = input;
@@ -1007,7 +1057,7 @@ function handleMessage(msg) {
                 if (!baseNick) { msg.reply("닉네임을 등록하세요."); return; }
             } else if (input.startsWith("@")) {
                 var kakaoName = input.replace("@","").trim();
-                baseNick = getNicknameFromKakaoName(kakaoName);
+                baseNick = getNicknameFromKakaoName(kakaoName, room);
                 if (!baseNick) { msg.reply(kakaoName+" 님이 닉네임을 등록하지 않았습니다."); return; }
             } else {
                 baseNick = input;
@@ -1348,11 +1398,6 @@ function handleMessage(msg) {
             h+="!내전기록 - 마지막 게임 기록\n";
             h+="!내전기록 게임ID - 게임 회차 기록 조회";
             msg.reply(h); return;
-        }
-
-        // ── 리로드 ───────────────────────────────────────────────
-        else if ((msg.author.name === "신쫑" || msg.author.name === "신종화") && text.startsWith("!리로드")) {
-            Api.reload(); msg.reply("봇이 리로드되었습니다."); return;
         }
 
     } catch(e) {

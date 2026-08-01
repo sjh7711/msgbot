@@ -248,16 +248,29 @@ function parseEventPage(html) {
 function parseNoticePage(html) {
     var events     = [];
     var seenInPage = {};
+    // 가능하면 news_board 컨테이너 안으로 스코프를 좁혀, 사이드바·"관련 공지" 위젯 등
+    // 게시판 밖의 공지형 링크가 잘못 잡혀 허위 알림이 나가는 것을 막는다.
+    // 컨테이너 마커를 못 찾으면 전체 html 에서 매칭(기존 동작)하여 회귀를 피한다.
+    var scope = html;
+    var boardIdx = html.indexOf('class="news_board"');
+    if (boardIdx !== -1) {
+        var end = html.indexOf("</table>", boardIdx);
+        if (end === -1) end = html.indexOf("</section>", boardIdx);
+        if (end === -1) end = html.indexOf("</ul>", boardIdx);
+        if (end === -1) end = Math.min(html.length, boardIdx + 20000);
+        else end = end + 8;
+        scope = html.substring(boardIdx, end);
+    }
     // 카테고리(영문) + 숫자 ID 형식만 매칭
     var re = /href="(\/News\/Notice\/[A-Za-z][A-Za-z0-9]*\/(\d{4,})[^"]*)"/g;
     var m;
-    while ((m = re.exec(html)) !== null) {
+    while ((m = re.exec(scope)) !== null) {
         var path = m[1];
         var id   = m[2];
         if (seenInPage[id]) continue;
         seenInPage[id] = true;
         var url     = BASE_URL + path;
-        var snippet = html.substring(m.index, Math.min(html.length, m.index + 600));
+        var snippet = scope.substring(m.index, Math.min(scope.length, m.index + 600));
         var aEnd    = snippet.indexOf("</a>");
         var aBlock  = aEnd > 0 ? snippet.substring(0, aEnd + 4) : snippet.substring(0, 500);
 
@@ -341,10 +354,15 @@ function debugHrefs(html, keyword, limit) {
 // =====================================================================
 // 알림 전송 — 상태 파일의 notifyTargets 기준으로 전송 (스레드 안전)
 // =====================================================================
+// 반환: 하나 이상 방에 전달됐으면(또는 대상이 없으면) true, 모든 방 전송이 실패하면 false.
+// checkAndNotify 가 이 값으로 "성공 시에만 seen 처리"를 해서 일시적 전송 실패 시 알림 유실을 막는다.
 function sendNotify(message, targets) {
+    if (!targets || !targets.length) return true;   // 알릴 대상 없음 = 유실 아님
+    var delivered = 0;
     for (var i = 0; i < targets.length; i++) {
         try {
             bot.send(targets[i].room, message);
+            delivered++;
         } catch (e) {
             try {
                 var msg = String(e);
@@ -373,6 +391,7 @@ function sendNotify(message, targets) {
             } catch (le) {}
         }
     }
+    return delivered > 0;
 }
 
 // =====================================================================
@@ -386,9 +405,9 @@ function checkAndNotify() {
     var seenIds  = _seenIds;
     var targets  = notifyTargets;   // 커맨드 핸들러가 갱신하는 전역
     var needSave = false;
-    var toNotify = [];
+    var interrupted = false;
 
-    for (var t = 0; t < TARGETS.length; t++) {
+    for (var t = 0; t < TARGETS.length && !interrupted; t++) {
         var target = TARGETS[t];
 
         // ETag / Last-Modified 조건부 GET
@@ -396,14 +415,16 @@ function checkAndNotify() {
         var resp = fetchHtmlConditional(target.url, cacheEntry);
         if (resp.status === 304) continue;        // 변경 없음 → 파싱/알림 생략
         if (resp.status !== 200) continue;        // 실패 → 기존 동작대로 건너뜀
-        // 200: 새 etag/lastMod 를 인메모리 캐시에 반영
-        _httpCache[target.key] = { etag: resp.etag, lastMod: resp.lastMod };
-        needSave = true;
-        var html   = resp.body;
+        var html = resp.body;
         if (!html) continue;
 
         var events = parsePage(html, target);
-        if (!events.length) continue;
+        if (!events.length) {
+            // 이벤트가 없으면 안전하게 etag 갱신 (재검출할 새 글이 없음)
+            _httpCache[target.key] = { etag: resp.etag, lastMod: resp.lastMod };
+            needSave = true;
+            continue;
+        }
 
         // 이 카테고리의 첫 폴링 여부 판단
         var isFirst = true;
@@ -414,26 +435,58 @@ function checkAndNotify() {
             }
         }
 
+        // 알림 없이 seen 만 갱신할 것(첫폴링 시드/점검중 수정/구버전승격)과
+        // 실제 알림 대상을 분리 수집한다. 알림 대상은 "전송 성공 후"에만 seen 처리.
+        var localNotify = [];
         for (var i = 0; i < events.length; i++) {
             var ev     = events[i];
             var key    = target.key + ":" + ev.id;
             var stored = seenIds[key];
 
             if (!stored) {
-                if (!isFirst) toNotify.push({ label: target.label, ev: ev, type: "new" });
-                seenIds[key] = { title: ev.title };
-                needSave = true;
+                if (isFirst) { seenIds[key] = { title: ev.title }; needSave = true; }  // 시드(알림 없음)
+                else { localNotify.push({ key: key, ev: ev, type: "new" }); }
             } else {
                 var prevTitle = (stored === true) ? null : stored.title;
                 if (prevTitle !== null && prevTitle !== ev.title) {
-                    toNotify.push({ label: target.label, ev: ev, type: "updated", prevTitle: prevTitle });
-                    seenIds[key] = { title: ev.title };
-                    needSave = true;
+                    if (ev.title.indexOf("점검중") === -1) {
+                        localNotify.push({ key: key, ev: ev, type: "updated", prevTitle: prevTitle });
+                    } else {
+                        seenIds[key] = { title: ev.title }; needSave = true;   // 점검중 수정: 알림없이 seen
+                    }
                 } else if (stored === true) {
-                    seenIds[key] = { title: ev.title };
-                    needSave = true;
+                    seenIds[key] = { title: ev.title }; needSave = true;
                 }
             }
+        }
+
+        // 알림 전송 — 성공한 항목만 seen 처리한다. 전송 실패한 항목은 seen 하지 않고,
+        // 이 타깃의 etag 도 갱신하지 않아 다음 폴링에서 재fetch→재검출→재전송된다(유실 방지).
+        var allDelivered = true;
+        for (var j = 0; j < localNotify.length; j++) {
+            var item = localNotify[j];
+            var out;
+            if (item.type === "updated") {
+                out = "[" + target.label + "] (제목 수정)\n" +
+                      item.prevTitle + "\n→ " + item.ev.title + "\n" + item.ev.url;
+            } else {
+                out = "[" + target.label + "]\n" + item.ev.title + "\n" + item.ev.url;
+            }
+            var ok = sendNotify(out, targets);
+            if (ok) { seenIds[item.key] = { title: item.ev.title }; needSave = true; }
+            else    { allDelivered = false; }   // 미전달 → seen 보류, 다음 폴링 재시도
+
+            if (j < localNotify.length - 1) {
+                // 재컴파일 정리(interrupt) 신호를 삼키지 말 것: 남은 전송 중단 + 바깥 루프도 종료.
+                try { java.lang.Thread.sleep(1000); }
+                catch (e) { java.lang.Thread.currentThread().interrupt(); interrupted = true; break; }
+            }
+        }
+
+        // 이 타깃의 모든 알림이 전달됐을 때만 etag 전진(하나라도 미전달이면 다음에 재fetch).
+        if (allDelivered && !interrupted) {
+            _httpCache[target.key] = { etag: resp.etag, lastMod: resp.lastMod };
+            needSave = true;
         }
     }
 
@@ -441,26 +494,6 @@ function checkAndNotify() {
         // saveState 가 인메모리 권위본(notifyTargets/_seenIds/_httpCache)을
         // 병합 저장하므로 빈 객체만 넘기면 됨 (동시 쓰기 충돌 방지)
         saveState({});
-    }
-
-    if (!targets.length) return;
-
-    for (var j = 0; j < toNotify.length; j++) {
-        var item = toNotify[j];
-        var out;
-        if (item.type === "updated") {
-            out = "[" + item.label + "] (제목 수정)\n" +
-                  item.prevTitle + "\n→ " + item.ev.title + "\n" + item.ev.url;
-        } else {
-            out = "[" + item.label + "]\n" + item.ev.title + "\n" + item.ev.url;
-        }
-        sendNotify(out, targets);
-        if (j < toNotify.length - 1) {
-            // 재컴파일 정리(interrupt) 신호를 삼키지 말 것: 플래그를 되살리고 남은 알림
-            // 전송을 중단해야 옛 스레드가 즉시 종료된다 (run 루프 while 조건/하단 sleep 가 감지).
-            try { java.lang.Thread.sleep(1000); }
-            catch (e) { java.lang.Thread.currentThread().interrupt(); break; }
-        }
     }
 }
 
@@ -534,6 +567,66 @@ function stopPolling() {
 }
 
 // =====================================================================
+// 선데이메이플 — !선데이 커맨드
+//   이벤트 목록에서 "썬데이/선데이 메이플" 글을 찾아 상세 페이지의 board 이미지를
+//   추출, MediaSender 로 현재 방에 사진 전송.
+//   이벤트 ID·이미지 URL 모두 매주 바뀌므로 매번 동적으로 긁는다.
+// =====================================================================
+
+// 상세 페이지 본문 board 이미지 URL 추출.
+//   패턴: https://lwi.nexon.com/maplestory/2026/0628_board/HASH.png
+//   /maplestory/{년}/{MMDD}_board/ 형식이라 공통 아이콘(common/...)과 안 섞인다.
+function extractBoardImage(html) {
+    var re = /https?:\/\/lwi\.nexon\.com\/maplestory\/\d{4}\/\d{4}_board\/[^"'\s)]+\.(?:png|jpg|jpeg|gif)/i;
+    var m = html.match(re);
+    return m ? m[0] : null;
+}
+
+function handleSunday(msg) {
+    // 1) 이벤트 목록에서 썬데이/선데이 메이플 글 찾기 (parseEventPage 재사용)
+    var listHtml = fetchHtml(TARGETS[0].url);
+    if (!listHtml) { msg.reply("이벤트 페이지 로드 실패"); return; }
+    var events = parseEventPage(listHtml);
+    var sunday = null;
+    for (var i = 0; i < events.length; i++) {
+        var ti = events[i].title || "";
+        if (ti.indexOf("썬데이") !== -1 || ti.indexOf("선데이") !== -1) {
+            sunday = events[i];
+            break;
+        }
+    }
+    if (!sunday) { msg.reply("현재 진행 중인 선데이메이플 이벤트가 없습니다."); return; }
+
+    // 2) 상세 페이지에서 board 이미지 URL 추출
+    var detailHtml = fetchHtml(sunday.url);
+    if (!detailHtml) { msg.reply("선데이 상세 페이지 로드 실패\n" + sunday.url); return; }
+    var imgUrl = extractBoardImage(detailHtml);
+    if (!imgUrl) {
+        // 이미지 추출 실패 → 제목+링크 텍스트 폴백
+        msg.reply("[" + sunday.title + "]\n" + sunday.url + "\n(이미지 추출 실패)");
+        return;
+    }
+
+    // 3) URL 직접 전송.
+    //    글로벌 MediaSender 는 java.lang.Class 객체이고 send 는 인스턴스 메서드라,
+    //    무인자 생성자로 인스턴스를 만들어 호출한다. media 에 URL 을 직접 넘기면
+    //    내부에서 네트워크 리소스로 다운로드해 전송한다(isNetworkResource).
+    //    방 식별은 room 이름 우선, 실패하면 channelId(Long) 로 폴백.
+    var sender;
+    try { sender = new MediaSender(); }
+    catch (e) { msg.reply("MediaSender 생성 오류: " + e + "\n" + imgUrl); return; }
+
+    var sent = false;
+    try { sent = sender.send(msg.room, imgUrl); } catch (e) {}
+
+    if (!sent && msg.channelId) {
+        try { sent = sender.send(java.lang.Long.valueOf(String(msg.channelId)), imgUrl); } catch (e) {}
+    }
+
+    if (!sent) msg.reply("이미지 전송 실패\n" + imgUrl);
+}
+
+// =====================================================================
 // 초기화
 // =====================================================================
 (function init() {
@@ -552,6 +645,8 @@ function stopPolling() {
 // =====================================================================
 function handleMessage(msg) {
     var text = (msg.content || "").replace(/^\s+|\s+$/g, "");
+
+    if (text === "!선데이" || text === "!썬데이") { handleSunday(msg); return; }
 
     if (text === "!메알림") {
         msg.reply(
@@ -588,7 +683,7 @@ function handleMessage(msg) {
         return;
     }
 
-    if (text === "!메알림 시작") {
+    if (text === "!메알림 시작" || text === "!메알림 구독" || text === "!메알림 설정") {
         // 이미 구독 중인 방이면 중복 추가 방지
         var alreadyIn = false;
         for (var i = 0; i < notifyTargets.length; i++) {
@@ -610,7 +705,7 @@ function handleMessage(msg) {
         return;
     }
 
-    if (text === "!메알림 중지") {
+    if (text === "!메알림 중지" || text === "!메알림 중단" || text === "!메알림 정지" || text === "!메알림 해제") {
         var before = notifyTargets.length;
         notifyTargets = notifyTargets.filter(function(tgt) {
             return !(tgt.room === msg.room && tgt.packageName === msg.packageName);
@@ -639,12 +734,16 @@ function handleMessage(msg) {
             else if (k.indexOf("testnotice:") === 0) tnCnt++;
             else if (k.indexOf("notice:") === 0) ntCnt++;
         }
-        var roomLines = notifyTargets.length
-            ? notifyTargets.map(function(tgt) { return "  • " + tgt.room; }).join("\n")
-            : "  (없음)";
+        var subscribed = false;
+        for (var si = 0; si < notifyTargets.length; si++) {
+            if (notifyTargets[si].room === msg.room && notifyTargets[si].packageName === msg.packageName) {
+                subscribed = true;
+                break;
+            }
+        }
         msg.reply(
+            "이 방 구독 상태: " + (subscribed ? "구독 중" : "미구독") + "\n" +
             "폴링 상태: " + status + "\n" +
-            "구독 방 (" + notifyTargets.length + "개):\n" + roomLines + "\n" +
             "감지된 이벤트: " + evCnt + "개\n" +
             "감지된 공지: " + ntCnt + "개\n" +
             "감지된 테스트서버 공지: " + tnCnt + "개"
@@ -695,7 +794,7 @@ function handleMessage(msg) {
 function isMyCommand(text) {
     if (!text) return false;
     var t = text.replace(/^\s+|\s+$/g, "");
-    return t.indexOf("!메알림") === 0;
+    return t.indexOf("!메알림") === 0 || t === "!선데이" || t === "!썬데이";
 }
 
 // ─── 메시지 큐 + 워커 스레드 (ChatManager 구독, 공용 subscriber 모듈) ─────────

@@ -451,7 +451,8 @@ function _wg_isGridLine(ln) {
   if (!/[\uD83D][\uDFE5-\uDFEB]|[⬛⬜]/.test(ln)) return false;
   return ln.replace(/[\uD83D][\uDFE5-\uDFEB]|[⬛⬜]/g, '').replace(/\s/g, '').length === 0;
 }
-// attachment(복호화 JSON) → { success, attempts, streak, date }; 단어맞히기 아니면 null
+// attachment(복호화 JSON) → { success, attempts, streak, date, mode }; 단어맞히기 아니면 null
+//   mode: 'normal'(오늘의 단어🧠, .../word-guessing) | 'hard'(오늘의 챌린지🔥, .../word-guessing/bonus)
 function _wg_parse(attStr) {
   var P = {}, C = {};
   try { var o = JSON.parse(attStr); P = o.P || {}; C = o.C || {}; } catch(_) { return null; }
@@ -459,6 +460,10 @@ function _wg_parse(attStr) {
   // 단어맞히기 게임 카드 식별: attachment 에 word-guessing 식별자가 있으면
   // "성공!"/"실패!"/"🎉 N번째 정답자입니다!" 카드 모두 포함 (ME 문구에 의존 안 함)
   if (String(attStr).indexOf("word-guessing") === -1) return null;
+  // 하드(오늘의 챌린지🔥)는 URL 경로가 word-guessing/bonus. 복호화 JSON 안에서는
+  // kakaotalk:// 링크가 URL 인코딩되어 있어 %2F 형태로 나타나므로 둘 다 검사.
+  var _s = String(attStr);
+  var isHard = _s.indexOf("word-guessing%2Fbonus") !== -1 || _s.indexOf("word-guessing/bonus") !== -1;
   var D = "";
   try { D = String(C.TI.TD.D || ""); } catch(_) {}
   var lines = D.split("\n");
@@ -471,7 +476,8 @@ function _wg_parse(attStr) {
     if (!date) { var dm = t.match(/(\d{4}\s*년.*?일)/); if (dm) date = dm[1]; }
   }
   // "실패!" 카드만 실패. "성공!"·"🎉 N번째 정답자입니다!"(1~1000)는 정답을 맞힌 것이므로 성공
-  return { success: me.indexOf("실패") === -1, attempts: attempts, streak: streak, date: date };
+  return { success: me.indexOf("실패") === -1, attempts: attempts, streak: streak, date: date,
+           mode: isHard ? "hard" : "normal" };
 }
 // 오늘 0시(로컬) epoch 초 (created_at 은 초 단위)
 function _wg_todayStart() {
@@ -491,7 +497,9 @@ function handleTodayWord(msg) {
     "SELECT user_id, message, attachment, v FROM chat_logs WHERE " + where + " ORDER BY created_at ASC;");
   if (rows == null) { msg.reply("⚠️ 조회 실패 (sqlite3 오류)"); return; }
 
-  var byUid = {}, dateHeader = "";
+  // 모드별 집계: normal(일반) / hard(하드=오늘의 챌린지). dedup 은 모드별로 독립이라
+  // 같은 사람이 일반+하드를 각각 올리면 양쪽에 다 잡힌다(예전엔 user_id 하나로 묶여 하나만 집계됨).
+  var byMode = { normal: {}, hard: {} }, dateHeader = "";
   for (var i = 0; i < rows.length; i++) {
     var r = rows[i], enc = null;
     try { enc = (JSON.parse(r.v || "{}")).enc; } catch(_) {}
@@ -501,35 +509,54 @@ function handleTodayWord(msg) {
     var p = _wg_parse(r.attachment ? String(kt.decrypt(key, r.attachment) || "") : "");
     if (!p) continue;
     if (!dateHeader && p.date) dateHeader = p.date;
-    // 같은 사람이 2번 이상 올려도(재공유/포워딩 등) 최초 1건(정식 자동게시)만 집계
-    if (!byUid[r.user_id])
-      byUid[r.user_id] = { uid: r.user_id, attempts: p.attempts, success: p.success, streak: p.streak };
+    var bucket = byMode[p.mode] || byMode.normal;
+    // 같은 사람이 같은 모드를 2번 이상 올려도(재공유/포워딩 등) 최초 1건만 집계
+    if (!bucket[r.user_id])
+      bucket[r.user_id] = { uid: r.user_id, attempts: p.attempts, success: p.success, streak: p.streak };
   }
 
+  var nNormal = 0, nHard = 0;
+  for (var _k in byMode.normal) nNormal++;
+  for (var _k in byMode.hard)   nHard++;
+  if (!nNormal && !nHard) { msg.reply("오늘 참가한 '단어 맞히기' 기록이 없습니다."); return; }
+
+  // 닉네임은 양쪽 uid 를 합쳐 1회만 조회
   var uids = [];
-  for (var k in byUid) uids.push(k);
-  if (!uids.length) { msg.reply("오늘 참가한 '단어 맞히기' 기록이 없습니다."); return; }
+  for (var k in byMode.normal) uids.push(k);
+  for (var k in byMode.hard)   uids.push(k);
   var names = kt.getUserNames(uids);
 
-  var list = [];
-  for (var k in byUid) { byUid[k].name = names[k] || ("user_" + k); list.push(byUid[k]); }
-  list.sort(function(a, b) {                                    // 성공 우선 → 시도 적은 순
-    if (a.success !== b.success) return a.success ? -1 : 1;
-    return (a.attempts || 99) - (b.attempts || 99);
-  });
-
-  var nSuccess = 0;
-  for (var i = 0; i < list.length; i++) if (list[i].success) nSuccess++;
-
-  var out = ["📋 오늘의 단어 맞히기\n" + (dateHeader ? " (" + dateHeader + ")" : "")];
-  out.push("참가 " + list.length + "명 · 성공 " + nSuccess + " / 실패 " + (list.length - nSuccess));
-  out.push("──────────────");
-  for (var i = 0; i < list.length; i++) {
-    var x = list[i];
-    var line = (i + 1) + ". " + x.name + " — " + (x.success ? "✅ " + x.attempts + "회" : "❌ 실패 " + x.attempts + "회");
-    if (x.success && x.streak != null) line += " · 🔥" + x.streak + "연승";
-    out.push(line);
+  // bucket → 정렬된 배열(성공 우선 → 시도 적은 순)
+  function buildList(bucket) {
+    var list = [];
+    for (var k in bucket) { bucket[k].name = names[k] || ("user_" + k); list.push(bucket[k]); }
+    list.sort(function(a, b) {
+      if (a.success !== b.success) return a.success ? -1 : 1;
+      return (a.attempts || 99) - (b.attempts || 99);
+    });
+    return list;
   }
+  function nSucc(list) { var n = 0; for (var i = 0; i < list.length; i++) if (list[i].success) n++; return n; }
+  function section(title, list) {
+    var lines = ["─────" + title + "─────"];
+    if (!list.length) { lines.push("(기록 없음)"); return lines; }
+    for (var i = 0; i < list.length; i++) {
+      var x = list[i];
+      var line = (i + 1) + ". " + x.name + " — " + (x.success ? "✅ " + x.attempts + "회" : "❌ 실패 " + x.attempts + "회");
+      if (x.success && x.streak != null) line += " · 🔥" + x.streak + "연승";
+      lines.push(line);
+    }
+    return lines;
+  }
+
+  var normalList = buildList(byMode.normal);
+  var hardList   = buildList(byMode.hard);
+
+  var out = ["📋 오늘의 단어 맞히기"];
+  out.push("일반: 성공 " + nSucc(normalList) + " / 실패 " + (normalList.length - nSucc(normalList)));
+  out.push("하드: 성공 " + nSucc(hardList)   + " / 실패 " + (hardList.length   - nSucc(hardList)));
+  out = out.concat(section("일반", normalList));
+  out = out.concat(section("하드", hardList));
   msg.reply(out.join("\n"));
 }
 

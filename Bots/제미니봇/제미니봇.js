@@ -268,6 +268,36 @@ var kt = (function() {
   return require(libPath);
 })();
 
+// "!대화요약 N" 모듈 (같은 봇 디렉터리). chat_logs → 주제별 요약(Gemini 재사용).
+var summaryMod = (function() {
+  var p = "/sdcard/msgbot/Bots/제미니봇/summary.js";
+  try { if (typeof bot.getRootPath === "function") p = bot.getRootPath() + "/summary.js"; } catch(_) {}
+  return require(p);
+})();
+
+function isSummaryCommand(text) { return text.indexOf(summaryMod.CMD) === 0; }
+
+// 대화요약 처리: 사용 한도는 제미니와 동일(제공자 무제한 / 그 외 1일 N회). 성공 시 1회 차감.
+function handleSummary(msg) {
+  try {
+    var room = msg.room;
+    var who = (function(){ try { return kt.resolveSender(msg); } catch(_) { return null; } })();
+    var displayName = (who && who.name) ? who.name : (msg.author.name || "익명");
+    var hash = msg.author.hash || ("noname:" + (msg.author.name || "익명"));
+    var isProvider = isApiProvider(msg.author.hash, room);
+    if (!isProvider && countTodayUses(hash) >= GEMINI_DAILY_LIMIT) {
+      msg.reply("⚠ " + displayName + "님은 오늘 제미니 사용 한도(" + GEMINI_DAILY_LIMIT + "회)에 도달했습니다.\n" +
+        "상식퀴즈봇과 1:1 채팅에서 !api 로 이 방에 키를 등록하면 무제한으로 사용할 수 있습니다.");
+      return;
+    }
+    summaryMod.handle(msg, kt, callGemini, bot, function onSuccess(){
+      if (!isProvider) { try { recordUse(hash); } catch(_){} }
+    });
+  } catch(e) {
+    try { msg.reply("오류: " + (e && e.message ? e.message : e)); } catch(_){}
+  }
+}
+
 function handleMessage(msg) {
   try {
     var text = String(msg.content || "").trim();
@@ -332,6 +362,7 @@ var subscribe = (function() {
 subscribe(BOT_NAME, WORKER_NAME, function(msg) {
   try {
     var text = String(msg.content || "").trim();
+    if (isSummaryCommand(text)) { handleSummary(msg); return; }   // !대화요약
     if (!isGeminiCommand(text)) return;   // 우리 명령이 아니면 무시 (모든 메시지가 broadcast 됨)
     handleMessage(msg);
   } catch(_) {}

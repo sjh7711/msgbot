@@ -1,0 +1,8 @@
+{
+  "name": "백업봇",
+  "version": "1.0.0",
+  "description": "MessengerBot script: 백업봇",
+  "main": "백업봇.js",
+  "type": "commonjs",
+  "dependencies": {}
+}
