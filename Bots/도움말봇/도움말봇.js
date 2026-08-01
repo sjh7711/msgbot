@@ -164,6 +164,17 @@ var REGISTRY = [
     ]
   },
   {
+    topic: "eval",
+    aliases: ["eval", "이발", "권한", "관리자", "실행", "코드"],
+    commands: [
+      { display: "!내권한",              triggers: ["!내권한"],     desc: "내 권한 등급과 이 방에서의 hash 확인 (누구나)", admin: false },
+      { display: "]코드",                triggers: ["]"],           desc: "JS 실행. 슈퍼관리자는 제한 없음, 일반관리자는 샌드박스(계산·문자열·정규식·JSON)", admin: true },
+      { display: "!관리자",              triggers: ["!관리자"],     desc: "관리자 목록 조회", admin: true },
+      { display: "!관리자추가 [닉네임]", triggers: ["!관리자추가"], desc: "그 닉네임의 모든 hash 를 일반관리자로 등록 (슈퍼관리자 전용, 2단계 확인)", admin: true },
+      { display: "!관리자삭제 [사람]",   triggers: ["!관리자삭제"], desc: "관리자 권한 회수 (슈퍼관리자 전용, 2단계 확인)", admin: true }
+    ]
+  },
+  {
     topic: "도움말봇",
     aliases: ["도움말", "도움", "검색", "help", "명령어"],
     commands: [
