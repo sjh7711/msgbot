@@ -1394,6 +1394,13 @@ function generateQuiz(customTopic, room) {
       continue;
     }
 
+    // 주관식인데 보기를 딸려 보내는 경우가 있다(프롬프트는 빈 배열을 요구).
+    // 그대로 두면 "보기는 5개인데 answer 는 번호가 아닌 단어"인 상태가 되어
+    // 출제 화면과 채점이 어긋난다. 주관식이면 보기를 무조건 비운다.
+    if (!wantMulti && data.choices && data.choices.length) {
+      data.choices = [];
+    }
+
     // 길이 검증
     var totalLen = String(data.question).length;
     if (data.choices && data.choices.length) {
@@ -1526,13 +1533,15 @@ function auditQuiz(data, topic, wantMulti, answerText, isLastAttempt, room) {
     "해설: " + String(data.explanation || "") + "\n\n" +
     "각 항목을 true(위반)/false(정상)로 판정:\n" +
     "- answer_leak: 정답 단어·그 변형·한자/영문표기·핵심 일부·대명사 위장이 본문에 노출됨 (정답의 정의·뜻을 풀어쓴 것은 노출이 아니므로 false). 또는 정답이 분야명('" + topic + "') 자체인 경우.\n" +
+    "  ※ answer_leak 을 true 로 판정했다면 leak_text 에 **문제 본문에 실제로 들어있는 문자열을 그대로 복사해** 적으세요.\n" +
+    "     본문에 없는 말을 지어내면 판정이 무시됩니다. 노출이 아니면 leak_text 는 빈 문자열.\n" +
     "- fact_conflict: 문제의 단서·정답·해설 셋 사이에 사실관계 충돌이 있음. 예) 문제는 '중력으로 빛이 휘는 현상'(→일반상대성이론)을 가리키는데 해설은 '특수상대성이론이 설명한다'고 적음.\n" +
     "- wrong_choice: (객관식) answer 번호가 가리키는 보기가 실제 정답과 다름. (주관식이면 항상 false)\n" +
     "- field_mismatch: 서로 무관한 분야를 억지로 비교·비유·연결해야만 풀리는 문제임(예: 정치와 IT를 엮음). 단, 가까운 하위 분야끼리의 연결(예: 과학 안에서 물리·화학)이나 다른 분야를 배경·예시로 잠깐 언급한 정도는 위반이 아님(false). \n" +
     "- placeholder_text: 보기/정답/해설에 '보기1','정답','본 정답 명칭','<정답>' 같은 자리표시자·메타텍스트가 실제 명칭 대신 남아 있음.\n" +
     "- insufficient_clue: 본문 단서만으로 정답을 합리적으로 추론할 수 없음(단서 부족·모호).\n\n" +
     "응답은 아래 JSON 형식만 출력(다른 텍스트 금지):\n" +
-    "{\"answer_leak\":false,\"fact_conflict\":false,\"wrong_choice\":false,\"field_mismatch\":false,\"placeholder_text\":false,\"insufficient_clue\":false}";
+    "{\"answer_leak\":false,\"leak_text\":\"\",\"fact_conflict\":false,\"wrong_choice\":false,\"field_mismatch\":false,\"placeholder_text\":false,\"insufficient_clue\":false}";
 
   var res = callGemini(prompt, room);
   if (res.quotaExhausted || res.error) return { ok: true };   // 감사를 못 돌리면 통과(fail-open)
@@ -1542,6 +1551,18 @@ function auditQuiz(data, topic, wantMulti, answerText, isLastAttempt, room) {
     v = JSON.parse(raw);
   } catch(e) { return { ok: true }; }                          // 감사 응답 파싱 실패 → 통과
   if (!v || typeof v !== "object") return { ok: true };
+
+  // answer_leak 은 근거를 검증한다.
+  //   코드단 하드 검사가 "정답과 정확히 같은 문자열"은 이미 걸러내므로, 감사의 역할은
+  //   변형·부분 노출을 잡는 것이다. 그런 노출이라면 그 문자열이 본문에 실제로 있어야 한다.
+  //   모델이 본문에 없는 말을 지어내며 true 를 주는 경우(관찰됨: 매 시도 반려)가 있어,
+  //   지목한 문자열이 본문에 없으면 환각으로 보고 무시한다.
+  if (v.answer_leak === true) {
+    var leakText = normalize(String(v.leak_text || ""));
+    if (!leakText || leakText.length < 2 || normalize(data.question).indexOf(leakText) === -1) {
+      v.answer_leak = false;
+    }
+  }
 
   // 플래그 → hard/soft 위반 사유 수집 (코드에서 최종 판정)
   var hardReasons = [], softReasons = [];

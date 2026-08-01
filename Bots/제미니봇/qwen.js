@@ -18,7 +18,9 @@
 // =====================================================================
 
 var BASE_URL = "http://192.168.0.55:18080/v1";
-var MODEL    = "qwen3.5-9b-q4_k_m";
+// 서버에 올라간 모델 ID. 서버(llama.cpp)가 이 필드를 무시하므로 틀려도 당장은 동작하지만,
+// 진단할 때 헷갈리므로 교체할 때마다 맞춰 둔다. 확인: GET {BASE_URL}/models
+var MODEL    = "qwen3.6-35b-a3b-ud-q5_k_m";
 var KEY_PATH = Packages.android.os.Environment
     .getExternalStorageDirectory().getAbsolutePath() + "/msgbot/qwen_key";
 
