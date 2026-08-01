@@ -294,6 +294,18 @@ var qwen = (function() {
 
 function isSummaryCommand(text) { return text.indexOf(summaryMod.CMD) === 0; }
 
+// URL 요약 모듈 (내부망 별도 엔드포인트). "!qwen" 에 URL 이 섞이면 이쪽으로 보낸다.
+// 못 불러오면 null → URL 라우팅만 꺼지고 일반 !qwen 은 그대로 동작한다
+// (이 파일 하나 때문에 봇 전체가 컴파일 실패하지 않도록).
+var urlsum = (function() {
+  try {
+    var p = "/sdcard/msgbot/Bots/제미니봇/urlsummary.js";
+    try { if (typeof bot.getRootPath === "function") p = bot.getRootPath() + "/urlsummary.js"; } catch(_) {}
+    var m = require(p);
+    return (m && typeof m.extractUrl === "function") ? m : null;
+  } catch(_) { return null; }
+})();
+
 function isQwenCommand(text) { return text.indexOf("!qwen") === 0; }
 
 // ── Qwen 답변 전송 (공통) ────────────────────────────────────────────
@@ -308,17 +320,46 @@ function sendQwenAnswer(room, question, header) {
   return false;
 }
 
+// URL 요약 결과를 카톡 형식으로 전송
+function sendUrlSummary(room, url, style) {
+  var res = urlsum.summarize(url, style);
+  if (res && res.error) {
+    try { bot.send(room, "⚠ 요약 실패: " + res.error); } catch(_) {}
+    return;
+  }
+  var head = "요약입니다." + (res.style === "detailed" ? " (상세)" : "");
+  var lines = [];
+  if (res.title) lines.push("📄 " + res.title);
+  lines.push(res.url);
+  lines.push("");
+  lines.push(res.summary);
+  if (res.truncated) lines.push("\n※ 문서가 길어 일부만 반영됐습니다.");
+  try { bot.send(room, head + LONG_MSG_SPACER + "\n" + lines.join("\n")); } catch(_) {}
+}
+
 // "!qwen [질문]" — 내부망 서버라 사용 한도를 세지 않는다.
+//   뒤에 URL 이 섞여 있으면(어디에 있든) 자동으로 URL 요약 API 로 넘긴다.
+//   "!qwen <URL> 요약해줘" / "!qwen 요약좀 <URL>" / "!qwen <URL>" 전부 동작.
 function handleQwen(msg) {
   try {
     var text = String(msg.content || "").trim();
     var question = text.slice("!qwen".length).trim();
     if (!question) {
-      msg.reply("사용법: !qwen [질문]\n예) !qwen 광합성이 뭐야?");
+      msg.reply("사용법: !qwen [질문]  또는  !qwen [URL] (요약)\n예) !qwen 광합성이 뭐야?");
       return;
     }
     var room = msg.room;
-    // 생성이 느려(≈2.4 tok/s) 워커 큐를 막지 않도록 별도 스레드에서 처리.
+
+    var url = urlsum ? urlsum.extractUrl(question) : null;
+    if (url) {
+      var style = urlsum.styleFor(urlsum.stripUrl(question, url));
+      // 요약은 30초~1분 걸리므로 기다리는 줄 알 수 있게 먼저 알린다.
+      try { msg.reply("링크를 읽고 " + (style === "detailed" ? "상세히 " : "") + "요약하는 중입니다. 잠시만요."); } catch(_) {}
+      new java.lang.Thread(function() { sendUrlSummary(room, url, style); }).start();
+      return;
+    }
+
+    // 생성에 시간이 걸리므로 워커 큐를 막지 않도록 별도 스레드에서 처리.
     new java.lang.Thread(function() {
       sendQwenAnswer(room, question, "답변입니다. (Qwen)");
     }).start();
