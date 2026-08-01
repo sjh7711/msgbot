@@ -113,46 +113,157 @@ function handleList(msg) {
 }
 
 // =====================================================================
-// !관리자추가 [닉네임] [확인]
+// !관리자추가 — 방 선택 → 사람 다중 선택 (관리 전용 방에서만)
+//
+//   닉네임을 직접 타이핑하던 방식은 정확히 일치해야 해서
+//   "숨밥(숨어서 鴨肉飯먹기)" 같은 이름을 못 쓴다. 번호 선택으로 바꿨다.
+//   ChatManager 의 !onoff / !compile 과 같은 조작감.
 // =====================================================================
 
-function handleAdd(msg, arg) {
-  if (!admin.isSuper(msg.hash)) { msg.reply("슈퍼관리자만 관리자를 등록할 수 있습니다."); return; }
+var PENDING_TTL_MS = 180000;   // 3분
+var pending = null;            // { stage:"room"|"user", hash, room, rooms|users, targetRoom, ts }
 
-  var confirm = false;
-  var name = trim(arg);
-  if (/\s확인$/.test(name)) { confirm = true; name = trim(name.replace(/\s확인$/, "")); }
+function nowMs() { return java.lang.System.currentTimeMillis(); }
 
-  if (!name) {
-    msg.reply("사용법: !관리자추가 [닉네임]\n예) !관리자추가 마히로");
+function pendingAlive() {
+  if (!pending) return false;
+  if (nowMs() - pending.ts > PENDING_TTL_MS) { pending = null; return false; }
+  return true;
+}
+
+// 대기 중인 선택이 이 메시지 주인의 것인가 (같은 사람 + 같은 방일 때만 숫자를 가로챈다)
+function pendingMatches(msg) {
+  return pendingAlive() &&
+         pending.hash === String(msg && msg.hash) &&
+         pending.room === String(msg && msg.room);
+}
+
+function isSelectionInput(text) { return /^[0-9]+([\s,]+[0-9]+)*$/.test(text); }
+
+// "1 3 5" / "1,3,5" → [0,2,4] (1-기반 → 0-기반, 중복 제거, 입력 순서 유지)
+function parseSelection(text, max) {
+  var parts = trim(text).split(/[\s,]+/);
+  var out = [], seen = {}, bad = [];
+  for (var i = 0; i < parts.length; i++) {
+    if (!parts[i]) continue;
+    var n = parseInt(parts[i], 10);
+    if (isNaN(n) || n < 1 || n > max) { bad.push(parts[i]); continue; }
+    if (seen[n]) continue;
+    seen[n] = true;
+    out.push(n - 1);
+  }
+  return { indices: out, bad: bad };
+}
+
+function startRoomSelection(msg) {
+  var rooms = admin.listRooms();
+  if (!rooms.length) { msg.reply("userhash 에 방 기록이 없습니다."); return; }
+
+  pending = { stage: "room", hash: String(msg.hash), room: String(msg.room), rooms: rooms, ts: nowMs() };
+
+  var lines = ["[관리자 등록] 어느 방에서 고를까요?"];
+  for (var i = 0; i < rooms.length; i++) {
+    lines.push((i + 1) + ". " + rooms[i].room + " (" + rooms[i].count + "명)");
+  }
+  lines.push("");
+  lines.push("번호 하나를 입력하세요. (취소: !관리자취소)");
+  msg.reply(lines.join("\n"));
+}
+
+function showUserSelection(msg, targetRoom) {
+  var users = admin.listUsersInRoom(targetRoom);
+  if (!users.length) {
+    pending = null;
+    msg.reply("'" + targetRoom + "' 에 기록된 사람이 없습니다.");
     return;
   }
+  var owned = admin.listAdminHashes();   // hash → person (한 번에 조회)
 
-  var rows = admin.findHashesByName(name);
-  if (!rows.length) {
-    msg.reply("userhash 에서 '" + name + "' 을(를) 찾지 못했습니다.\n" +
-              "그 사람이 봇이 보는 방에서 한 번 이상 말한 적이 있어야 합니다.");
-    return;
+  pending = { stage: "user", hash: String(msg.hash), room: String(msg.room),
+              targetRoom: targetRoom, users: users, ts: nowMs() };
+
+  var lines = ["[관리자 등록] " + targetRoom + " — 누구를 등록할까요?"];
+  for (var i = 0; i < users.length; i++) {
+    var who = owned[String(users[i].hash)];
+    lines.push((i + 1) + ". " + String(users[i].name) + (who ? "  (이미 " + who + ")" : ""));
+  }
+  lines.push("");
+  lines.push("번호를 입력하세요. 여러 명은 공백/쉼표로 구분 (예: 1 3 5). (취소: !관리자취소)");
+  msg.reply(lines.join("\n"));
+}
+
+function applyUserSelection(msg, text) {
+  var users = pending.users, targetRoom = pending.targetRoom;
+  var sel = parseSelection(text, users.length);
+
+  if (!sel.indices.length) {
+    msg.reply("번호를 알아볼 수 없습니다" + (sel.bad.length ? " (" + sel.bad.join(", ") + ")" : "") +
+              ".\n1~" + users.length + " 사이 번호를 입력하세요. (취소: !관리자취소)");
+    return;                                  // 대기 상태는 유지 — 다시 입력할 수 있게
+  }
+  pending = null;
+
+  var ok = [], failed = [];
+  for (var i = 0; i < sel.indices.length; i++) {
+    var u = users[sel.indices[i]];
+    var person = String(u.name);
+    var res = admin.grant(person, admin.LEVEL_ADMIN,
+                          [{ hash: u.hash, name: u.name, room: u.room }], msg.hash);
+    if (res && res.error) failed.push(person + " — " + res.error);
+    else ok.push(person);
   }
 
-  if (!confirm) {
-    var lines = ["[관리자 등록 확인] '" + name + "' — hash " + rows.length + "개"];
-    for (var i = 0; i < rows.length; i++) {
-      var owner = admin.personOf(rows[i].hash);
-      lines.push("• " + String(rows[i].room || "?") +
-                 (owner ? "  ⚠ 이미 '" + owner + "' 에 등록됨" : ""));
-    }
+  var lines = ["[관리자 등록] " + targetRoom];
+  if (ok.length) lines.push("일반관리자로 등록: " + ok.join(", "));
+  if (failed.length) {
     lines.push("");
-    lines.push("닉네임은 누구나 바꿀 수 있으니 위 방 목록이 맞는지 확인하세요.");
-    lines.push("등록하려면: !관리자추가 " + name + " 확인");
-    msg.reply(lines.join("\n"));
+    lines.push("실패:");
+    for (var f = 0; f < failed.length; f++) lines.push("  " + failed[f]);
+  }
+  if (sel.bad.length) lines.push("무시된 입력: " + sel.bad.join(", "));
+  lines.push("");
+  lines.push("이 방의 hash 만 등록했습니다. 다른 방에서도 쓰게 하려면 그 방을 골라 다시 등록하세요.");
+  msg.reply(lines.join("\n"));
+}
+
+function handleSelection(msg, text) {
+  if (pending.stage === "room") {
+    var sel = parseSelection(text, pending.rooms.length);
+    if (sel.indices.length !== 1) {
+      msg.reply("방은 하나만 고를 수 있습니다. 번호 하나를 입력하세요. (취소: !관리자취소)");
+      return;
+    }
+    showUserSelection(msg, pending.rooms[sel.indices[0]].room);
     return;
   }
+  applyUserSelection(msg, text);
+}
 
-  var res = admin.grant(name, admin.LEVEL_ADMIN, rows, msg.hash);
-  if (res && res.error) { msg.reply("[관리자 등록 실패] " + res.error); return; }
-  msg.reply("[관리자 등록] " + res.person + " — 일반관리자(1)\n" +
-            "hash " + res.total + "개 연결 (신규 " + res.added + ", 이전 소유 " + res.moved + ")");
+function handleCancel(msg) {
+  if (pendingMatches(msg)) { pending = null; msg.reply("[관리자 등록] 취소했습니다."); }
+  else msg.reply("취소할 작업이 없습니다.");
+}
+
+// 관리 명령 공통 가드: 관리 전용 방 + 슈퍼관리자
+function guardManage(msg, what) {
+  if (!admin.isAdminRoom(msg.room)) {
+    msg.reply(what + "은(는) '" + admin.adminRoomsLabel() + "' 방에서만 할 수 있습니다.");
+    return false;
+  }
+  if (!admin.isSuper(msg.hash)) {
+    msg.reply("슈퍼관리자만 " + what + "을(를) 할 수 있습니다.");
+    return false;
+  }
+  return true;
+}
+
+function handleAdd(msg, arg) {
+  if (!guardManage(msg, "관리자 등록")) return;
+  if (trim(arg)) {
+    msg.reply("사용법: !관리자추가\n인자 없이 입력하면 방 목록이 나옵니다.");
+    return;
+  }
+  startRoomSelection(msg);
 }
 
 // =====================================================================
@@ -160,7 +271,7 @@ function handleAdd(msg, arg) {
 // =====================================================================
 
 function handleRemove(msg, arg) {
-  if (!admin.isSuper(msg.hash)) { msg.reply("슈퍼관리자만 관리자를 회수할 수 있습니다."); return; }
+  if (!guardManage(msg, "관리자 회수")) return;
 
   var confirm = false;
   var name = trim(arg);
@@ -192,21 +303,26 @@ function handleMessage(msg) {
 
   if (text.indexOf("]") === 0) { handleEval(msg); return; }
   if (text === "!내권한")      { handleMyLevel(msg); return; }
+  if (text === "!관리자취소")  { handleCancel(msg); return; }
   if (text === "!관리자")      { handleList(msg); return; }
   if (text.indexOf("!관리자추가") === 0) { handleAdd(msg, text.substring("!관리자추가".length)); return; }
   if (text.indexOf("!관리자삭제") === 0) { handleRemove(msg, text.substring("!관리자삭제".length)); return; }
+  if (isSelectionInput(text) && pendingMatches(msg)) { handleSelection(msg, text); return; }
 }
 
-function isMyCommand(text) {
+function isMyCommand(text, msg) {
   var t = trim(text);
-  return !!t && (t.indexOf("]") === 0 || t.indexOf("!관리자") === 0 || t === "!내권한");
+  if (!t) return false;
+  if (t.indexOf("]") === 0 || t.indexOf("!관리자") === 0 || t === "!내권한") return true;
+  // 번호 선택 대기 중일 때만 숫자 입력을 가로챈다 (같은 사람·같은 방)
+  return isSelectionInput(t) && pendingMatches(msg);
 }
 
 // ─── 메시지 큐 + 워커 스레드 (ChatManager 구독, 공용 subscriber 모듈) ───
 var subscribe = require(libPath("subscriber.js"));
 
 subscribe(BOT_NAME, WORKER_NAME, function (msg) {
-  if (!isMyCommand(msg.content)) return;
+  if (!isMyCommand(msg.content, msg)) return;
   try { handleMessage(msg); }
   catch (e) {
     try { msg.reply("[eval] ⚠ 오류: " + ((e && e.message) ? e.message : e)); } catch (_) {}

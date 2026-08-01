@@ -26,8 +26,7 @@ var LONG_MSG_SPACER = "​".repeat(500);
 //       한 번으로 끝나고 admin.db 를 아예 열지 않는다.
 //    ② 추천/도움말 응답은 그 방 전체가 보는 공개 메시지다. 보낸 사람만 보고
 //       판단하면 단톡방에서 오타 한 번에 관리자 명령이 전부 노출된다.
-var ADMIN_ROOMS = ["신쫑"];   // 관리자 명령을 보여줘도 되는 방 (1:1 개인톡)
-
+//  방 목록은 lib/admin.js 의 ADMIN_ROOMS 한 곳에서만 관리한다(관리 명령 허용 방과 동일).
 var _admin = null;
 try {
   var _adminPath = "/sdcard/msgbot/lib/admin.js";
@@ -40,7 +39,7 @@ try {
 function canSeeAdmin(msg) {
   try {
     if (!_admin) return false;
-    if (ADMIN_ROOMS.indexOf(String(msg && msg.room)) === -1) return false;
+    if (!_admin.isAdminRoom(msg && msg.room)) return false;   // 방 먼저 (DB 조회 회피)
     return _admin.isSuper(msg && msg.hash);
   } catch(_) { return false; }
 }
@@ -198,8 +197,9 @@ var REGISTRY = [
       { display: "!내권한",              triggers: ["!내권한"],     desc: "내 권한 등급과 이 방에서의 hash 확인 (누구나)", admin: false },
       { display: "]코드",                triggers: ["]"],           desc: "JS 실행. 슈퍼관리자는 제한 없음, 일반관리자는 샌드박스(계산·문자열·정규식·JSON)", admin: true },
       { display: "!관리자",              triggers: ["!관리자"],     desc: "관리자 목록 조회", admin: true },
-      { display: "!관리자추가 [닉네임]", triggers: ["!관리자추가"], desc: "그 닉네임의 모든 hash 를 일반관리자로 등록 (슈퍼관리자 전용, 2단계 확인)", admin: true },
-      { display: "!관리자삭제 [사람]",   triggers: ["!관리자삭제"], desc: "관리자 권한 회수 (슈퍼관리자 전용, 2단계 확인)", admin: true }
+      { display: "!관리자추가",          triggers: ["!관리자추가"], desc: "방 선택 → 사람 번호 선택(여러 명 가능)으로 일반관리자 등록. 관리 전용 방에서 슈퍼관리자만", admin: true },
+      { display: "!관리자삭제 [사람]",   triggers: ["!관리자삭제"], desc: "관리자 권한 회수 (관리 전용 방에서 슈퍼관리자만, 2단계 확인)", admin: true },
+      { display: "!관리자취소",          triggers: ["!관리자취소"], desc: "진행 중인 관리자 등록 선택 취소", admin: true }
     ]
   },
   {
