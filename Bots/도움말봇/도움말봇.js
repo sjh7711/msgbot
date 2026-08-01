@@ -181,7 +181,8 @@ var REGISTRY = [
     topic: "백업봇",
     aliases: ["백업", "backup"],
     commands: [
-      { display: "!백업",     triggers: ["!백업"],     desc: "msgbot 폴더 전체를 지금 즉시 zip 백업 (자동: 매일 오전 6시, 보관: 최근 7일 + 일요일 4주)", admin: true },
+      { display: "!백업",      triggers: ["!백업"],     desc: "지금 즉시 백업 — GitHub 에 없는 런타임 데이터만 (자동: 매일 오전 6시, 보관: 최근 7일 + 일요일 4주)", admin: true },
+      { display: "!백업 전체", triggers: ["!백업"],     desc: "msgbot 폴더를 통째로 백업 (봇 소스·사전 db·apk 포함)", admin: true },
       { display: "!백업목록", triggers: ["!백업목록"], desc: "백업 파일 목록 조회 (/sdcard/msgbot_backups)", admin: true },
       { display: "!백업봇",   triggers: ["!백업봇"],   desc: "백업봇 명령어 설명서", admin: true }
     ]

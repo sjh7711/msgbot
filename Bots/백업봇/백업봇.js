@@ -1,16 +1,22 @@
 const bot = BotManager.getCurrentBot();
 
 // =====================================================================
-// 백업봇.js — /sdcard/msgbot 전체를 매일 오전 6시(KST)에 zip 백업
+// 백업봇.js — /sdcard/msgbot 의 "GitHub 에 없는 것"만 매일 오전 6시(KST)에 zip 백업
 //
 //  - 압축: java.util.zip.ZipOutputStream (외부 바이너리·root 불필요)
-//  - 대상: /sdcard/msgbot 전체 → /sdcard/msgbot_backups/msgbot_yyyyMMdd_HHmmss.zip
+//  - 대상: /sdcard/msgbot 중 레포가 소유하지 않은 파일만
+//          → /sdcard/msgbot_backups/msgbot_data_yyyyMMdd_HHmmss.zip
+//    봇 소스는 GitHub 에 있으니 백업할 이유가 없다. 실제로 태블릿 12.8MB 중
+//    10.1MB(apk 5.7 + stdict.db 2.3 + freq.db 2.1)가 레포 파일이라, 이걸 빼면
+//    백업 하나가 7.4MB → 1MB 대로 줄고 보관 기간을 늘려도 부담이 없다.
+//    복구가 불가능한 런타임 데이터(각종 .db, 로그, 상태 json, qwen_key)만 남긴다.
+//  - "!백업 전체" 로 예전처럼 통째 백업도 가능 (msgbot_full_... 이름)
 //  - 보관: 최근 KEEP_DAYS 일치 + 일요일 백업 KEEP_SUNDAYS 주치, 나머지 자동 삭제
 //  - 스케줄러: BACKUP_POLLER 스레드 (메이플봇 maple-poll 과 동일한
 //    killOld-by-name → spawn → registerThread 재컴파일-안전 패턴.
 //    이름에 POLLER 를 넣어 ChatManager !스레드 스캔에 노출)
 //  - 기동 캐치업: 재시작 시점이 오늘 6시 이후인데 오늘자 백업이 없으면 즉시 1회
-//  - 명령: !백업(수동 실행) / !백업목록 / !백업봇(도움말)
+//  - 명령: !백업(수동) / !백업 전체 / !백업목록 / !백업봇(도움말)
 //  - 결과는 /sdcard/msgbot_backups/backup.log 에 한 줄씩 기록
 //
 // 메시지 수신: ChatManager 의 broadcast 큐 구독. ChatManager 가 켜져 있어야 동작.
@@ -28,7 +34,59 @@ var KEEP_DESC = "최근 " + KEEP_DAYS + "일 + 일요일 " + KEEP_SUNDAYS + "주
 var BACKUP_HOUR = 6;        // 매일 이 시각(KST)에 실행
 var KST_TZ = java.util.TimeZone.getTimeZone("Asia/Seoul");
 
-var BACKUP_NAME_RE = /^msgbot_\d{8}_\d{6}\.zip$/;
+// msgbot_data_20260801_060000.zip / msgbot_full_... / 옛 형식 msgbot_20260801_060000.zip
+var BACKUP_NAME_RE = /^msgbot_(?:data_|full_)?(\d{8})_(\d{6})\.zip$/;
+
+// =====================================================================
+// "레포가 소유하는 파일" 판정 — 여기 걸리면 백업에서 제외
+//
+//  ① 깃봇이 .gitpull.json 으로 추적 중인 파일 (Bots/, lib/ 소스)
+//  ② 아래 루트 파일 목록 (매니페스트가 안 다루는 범위)
+//  ③ 매니페스트가 없어도 동작하도록 하는 정적 규칙:
+//     Bots/·lib/ 아래의 *.js, bot.json, package.json
+//
+//  ②③ 이 있어서 .gitpull.json 이 없거나 깨져도 안전하게 동작한다.
+//  판정에서 빠진 건 전부 백업된다 = 데이터를 잃는 쪽으로는 실패하지 않는다.
+// =====================================================================
+
+var MANIFEST_PATH = BACKUP_SRC + "/.gitpull.json";
+
+var ROOT_REPO_FILES = [
+  "README.md", "legacy_default.js", "editor_shortcuts.txt", "qwen api.md",
+  "stdict.db", "freq.db", "linkedin history.apk", ".gitignore", ".gitattributes"
+];
+
+function loadManifestFiles() {
+  var f = new java.io.File(MANIFEST_PATH);
+  if (!f.exists()) return {};
+  var is = null;
+  try {
+    is = new java.io.FileInputStream(f);
+    var bos = new java.io.ByteArrayOutputStream();
+    var buf = java.lang.reflect.Array.newInstance(java.lang.Byte.TYPE, 16384);
+    var n;
+    while ((n = is.read(buf)) !== -1) if (n > 0) bos.write(buf, 0, n);
+    var j = JSON.parse(String(new java.lang.String(bos.toByteArray(), "UTF-8")));
+    return (j && j.files) ? j.files : {};
+  } catch (e) {
+    return {};
+  } finally {
+    if (is) try { is.close(); } catch(_) {}
+  }
+}
+
+function makeSkipFn(manifestFiles) {
+  return function (rel, isDir) {
+    if (isDir) return /(^|\/)node_modules$/.test(rel);
+    if (manifestFiles[rel]) return true;
+    if (ROOT_REPO_FILES.indexOf(rel) !== -1) return true;
+    if (/^(?:Bots|lib)\//.test(rel)) {
+      var base = rel.substring(rel.lastIndexOf("/") + 1);
+      if (/\.js$/.test(base) || base === "bot.json" || base === "package.json") return true;
+    }
+    return false;
+  };
+}
 
 function trim(s){ return (s||"").replace(/^\s+|\s+$/g, ""); }
 
@@ -42,15 +100,20 @@ function tsFmt(pattern){
 // zip 압축
 // =====================================================================
 
-function addToZip(zos, file, entryPath, buf, stats){
-  if (file.isDirectory()){
+// rel: BACKUP_SRC 기준 상대경로 (루트는 ""), entryPath: zip 안의 경로
+function addToZip(zos, file, rel, entryPath, buf, stats, skipFn){
+  var isDir = file.isDirectory();
+  if (rel && skipFn && skipFn(rel, isDir)){ stats.skipped++; return; }
+
+  if (isDir){
     var kids = file.listFiles();
     if (kids == null || kids.length === 0){
       try { zos.putNextEntry(new java.util.zip.ZipEntry(entryPath + "/")); zos.closeEntry(); } catch(_) {}
       return;
     }
     for (var i = 0; i < kids.length; i++){
-      addToZip(zos, kids[i], entryPath + "/" + kids[i].getName(), buf, stats);
+      var nm = String(kids[i].getName());
+      addToZip(zos, kids[i], rel ? (rel + "/" + nm) : nm, entryPath + "/" + nm, buf, stats, skipFn);
     }
     return;
   }
@@ -71,15 +134,15 @@ function addToZip(zos, file, entryPath, buf, stats){
   }
 }
 
-function zipDirectory(srcPath, destZipPath){
+function zipDirectory(srcPath, destZipPath, skipFn){
   var srcDir = new java.io.File(srcPath);
   var zos = new java.util.zip.ZipOutputStream(
     new java.io.BufferedOutputStream(new java.io.FileOutputStream(destZipPath))
   );
   var buf = java.lang.reflect.Array.newInstance(java.lang.Byte.TYPE, 65536);
-  var stats = { files: 0, errors: 0 };
+  var stats = { files: 0, errors: 0, skipped: 0 };
   try {
-    addToZip(zos, srcDir, srcDir.getName(), buf, stats);
+    addToZip(zos, srcDir, "", srcDir.getName(), buf, stats, skipFn);
   } finally {
     try { zos.close(); } catch(_) {}
   }
@@ -90,23 +153,34 @@ function zipDirectory(srcPath, destZipPath){
 // 백업 실행 / 보관 정리 / 로그
 // =====================================================================
 
+// 파일명에서 "YYYYMMDD_HHMMSS" 추출 (msgbot_ / msgbot_data_ / msgbot_full_ 모두 대응)
+function stampOf(fileName){
+  var m = BACKUP_NAME_RE.exec(String(fileName));
+  return m ? (m[1] + "_" + m[2]) : null;
+}
+
 function listBackupFilesDesc(){
   var dir = new java.io.File(BACKUP_DIR);
   var files = dir.listFiles();
   var arr = [];
   if (files){
     for (var i = 0; i < files.length; i++){
-      if (BACKUP_NAME_RE.test(String(files[i].getName()))) arr.push(files[i]);
+      if (stampOf(files[i].getName())) arr.push(files[i]);
     }
   }
+  // 접두사가 섞이면 사전순 != 시간순이 된다("msgbot_2026..." < "msgbot_data_...").
+  // 그래서 파일명에서 뽑은 타임스탬프로 정렬한다.
   arr.sort(function(a, b){
-    var an = String(a.getName()), bn = String(b.getName());
-    return an < bn ? 1 : (an > bn ? -1 : 0);   // 이름=타임스탬프라 사전순 내림차순=최신순
+    var as = stampOf(a.getName()), bs = stampOf(b.getName());
+    return as < bs ? 1 : (as > bs ? -1 : 0);
   });
   return arr;
 }
 
-function dateStrOf(fileName){ return String(fileName).substring(7, 15); }  // "msgbot_YYYYMMDD_..." → YYYYMMDD
+function dateStrOf(fileName){
+  var s = stampOf(fileName);
+  return s ? s.substring(0, 8) : "";
+}
 
 function isSundayDateStr(d8){
   var cal = java.util.Calendar.getInstance(KST_TZ);
@@ -149,17 +223,19 @@ function appendBackupLog(line){
   }
 }
 
+// 오늘 날짜의 백업이 하나라도 있으면 true (data/full/옛 형식 무관)
 function hasBackupForToday(){
-  var prefix = "msgbot_" + tsFmt("yyyyMMdd").format(new java.util.Date());
+  var today = tsFmt("yyyyMMdd").format(new java.util.Date());
   var arr = listBackupFilesDesc();
   for (var i = 0; i < arr.length; i++){
-    if (String(arr[i].getName()).indexOf(prefix) === 0) return true;
+    if (dateStrOf(arr[i].getName()) === today) return true;
   }
   return false;
 }
 
 // trigger: "auto"(스케줄) | "manual"(!백업)
-function runBackup(trigger){
+// full=true 면 레포 파일까지 통째로 (예전 동작), 기본은 레포에 없는 것만
+function runBackup(trigger, full){
   var t0 = java.lang.System.currentTimeMillis();
   var dir = new java.io.File(BACKUP_DIR);
   if (!dir.exists() && !dir.mkdirs()){
@@ -167,12 +243,15 @@ function runBackup(trigger){
     return { error: "백업 폴더 생성 실패: " + BACKUP_DIR };
   }
 
-  var name = "msgbot_" + tsFmt("yyyyMMdd_HHmmss").format(new java.util.Date()) + ".zip";
+  var kind = full ? "full" : "data";
+  var skipFn = full ? null : makeSkipFn(loadManifestFiles());
+
+  var name = "msgbot_" + kind + "_" + tsFmt("yyyyMMdd_HHmmss").format(new java.util.Date()) + ".zip";
   var dest = BACKUP_DIR + "/" + name;
   var tmp = dest + ".part";   // 도중 실패한 반쪽 zip 이 정상 백업으로 오인되지 않게 완료 후 rename
 
   try {
-    var stats = zipDirectory(BACKUP_SRC, tmp);
+    var stats = zipDirectory(BACKUP_SRC, tmp, skipFn);
     if (!new java.io.File(tmp).renameTo(new java.io.File(dest))){
       throw new Error("rename 실패: " + tmp);
     }
@@ -180,8 +259,10 @@ function runBackup(trigger){
     var sizeKB = Math.round(new java.io.File(dest).length() / 1024);
     var ms = java.lang.System.currentTimeMillis() - t0;
     appendBackupLog(trigger + " OK " + name + " " + sizeKB + "KB files=" + stats.files +
-                    " errors=" + stats.errors + " pruned=" + pruned + " " + ms + "ms");
-    return { name: name, files: stats.files, errors: stats.errors, sizeKB: sizeKB, ms: ms, pruned: pruned };
+                    " skipped=" + stats.skipped + " errors=" + stats.errors +
+                    " pruned=" + pruned + " " + ms + "ms");
+    return { name: name, kind: kind, files: stats.files, skipped: stats.skipped,
+             errors: stats.errors, sizeKB: sizeKB, ms: ms, pruned: pruned };
   } catch(e) {
     try { new java.io.File(tmp)["delete"](); } catch(_) {}
     appendBackupLog(trigger + " FAIL " + String(e));
@@ -192,8 +273,10 @@ function runBackup(trigger){
 function formatBackupResult(res){
   if (res.error) return "[백업 실패] " + res.error;
   var line = "[백업 완료] " + res.name +
-             "\n파일 " + res.files + "개, " + (res.sizeKB >= 1024 ? (res.sizeKB/1024).toFixed(1) + "MB" : res.sizeKB + "KB") +
+             "\n" + (res.kind === "full" ? "전체 백업" : "레포에 없는 파일만") +
+             " — 파일 " + res.files + "개, " + (res.sizeKB >= 1024 ? (res.sizeKB/1024).toFixed(1) + "MB" : res.sizeKB + "KB") +
              ", " + (res.ms/1000).toFixed(1) + "초";
+  if (res.kind !== "full" && res.skipped > 0) line += "\nGitHub 에 있는 " + res.skipped + "개 제외";
   if (res.errors > 0) line += "\n⚠️ 읽기 실패 " + res.errors + "개 건너뜀";
   if (res.pruned > 0) line += "\n오래된 백업 " + res.pruned + "개 삭제 (보관: " + KEEP_DESC + ")";
   return line;
@@ -246,7 +329,7 @@ function startScheduler(){
       try {
         var now = java.util.Calendar.getInstance(KST_TZ);
         if (now.get(java.util.Calendar.HOUR_OF_DAY) >= BACKUP_HOUR && !hasBackupForToday()){
-          runBackup("auto");
+          runBackup("auto", false);
         }
       } catch(e) { appendBackupLog("auto FAIL 캐치업: " + String(e)); }
 
@@ -260,7 +343,7 @@ function startScheduler(){
           catch(ie) { return; }   // interrupt = 재컴파일/수동 kill → 종료
         }
         try {
-          if (!hasBackupForToday()) runBackup("auto");   // 새벽에 수동 !백업 했으면 스킵
+          if (!hasBackupForToday()) runBackup("auto", false);   // 새벽에 수동 !백업 했으면 스킵
         } catch(e) { appendBackupLog("auto FAIL " + String(e)); }
       }
     }
@@ -304,14 +387,18 @@ function handleBackupList(){
 function handleMessage(msg){
   var text = trim(msg.content);
 
-  if (text === "!백업"){ msg.reply(formatBackupResult(runBackup("manual"))); return; }
+  if (text === "!백업"){ msg.reply(formatBackupResult(runBackup("manual", false))); return; }
+  if (text === "!백업 전체"){ msg.reply(formatBackupResult(runBackup("manual", true))); return; }
   if (text === "!백업목록"){ msg.reply(handleBackupList()); return; }
   if (text === "!백업봇"){
     msg.reply(
       "[백업봇 설명서]\n" +
-      "매일 오전 " + BACKUP_HOUR + "시(KST) msgbot 폴더 전체를 자동 백업\n" +
+      "매일 오전 " + BACKUP_HOUR + "시(KST) 자동 백업\n" +
+      "GitHub 에 있는 파일(봇 소스·사전 db·apk)은 제외하고,\n" +
+      "복구 불가능한 런타임 데이터만 담는다.\n" +
       "저장: " + BACKUP_DIR + " (보관: " + KEEP_DESC + ")\n\n" +
-      "!백업 — 지금 즉시 백업\n" +
+      "!백업 — 지금 즉시 백업 (레포에 없는 것만)\n" +
+      "!백업 전체 — msgbot 폴더 통째로 백업\n" +
       "!백업목록 — 백업 파일 목록"
     );
     return;
