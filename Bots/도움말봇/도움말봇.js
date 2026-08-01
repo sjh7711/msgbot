@@ -165,6 +165,13 @@ var REGISTRY = [
     ]
   },
   {
+    topic: "야민정음봇",
+    aliases: ["야민", "야민정음", "댕댕이", "띵작", "밈"],
+    commands: [
+      { display: "!야민정음 [텍스트]", triggers: ["!야민정음", "!야민"], desc: "글자 모양이 닮은 한글로 바꿔줌 (멍멍이→댕댕이, 명작→띵작)", admin: false }
+    ]
+  },
+  {
     topic: "로그봇",
     aliases: ["로그", "지운채팅", "삭제채팅", "지운", "삭제", "복구", "log"],
     commands: [
