@@ -382,12 +382,8 @@ function handleQwen(msg) {
     var room = msg.room;
 
     // 30초~1분 걸리므로 기다리는 줄 알 수 있게 먼저 알린다.
-    // 실제 경로는 서버가 고르지만, URL 유무로 안내 문구만 맞춰 준다.
-    var hasUrl = askMod ? askMod.extractUrl(question) : null;
-    try {
-      msg.reply(hasUrl ? "링크를 읽고 요약하는 중입니다. 잠시만요."
-                       : "답변을 생성중입니다.");
-    } catch(_) {}
+    // 무엇을 할지(요약·검색·일반 답변)는 서버가 고르므로 안내도 한 가지로 둔다.
+    try { msg.reply("답변을 생성중입니다."); } catch(_) {}
 
     // 생성에 시간이 걸리므로 워커 큐를 막지 않도록 별도 스레드에서 처리.
     new java.lang.Thread(function() {

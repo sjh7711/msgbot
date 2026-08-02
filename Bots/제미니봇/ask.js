@@ -6,7 +6,8 @@
 //     · 최신 정보/명시적 검색 요청이면 → 웹 검색    (route=web_search)
 //     · 그 외                         → 일반 답변  (route=chat)
 //   일반 답변 도중 모델이 근거가 필요하다고 하면 서버가 검색을 한 번 더 돈다.
-//   덕분에 클라이언트에서 URL 정규식으로 갈래를 나눌 필요가 없다.
+//   덕분에 클라이언트에서 URL 정규식으로 갈래를 나눌 필요가 없다. 봇의 대기
+//   안내도 경로를 모른 채 "답변을 생성중입니다." 하나로 나간다.
 //
 //   ⚠ mode=auto 이므로 질문이 외부 검색엔진(SearXNG 경유)으로 나갈 수 있다.
 //     API 키·개인정보는 !qwen 에 넣지 않는다. (문서: "안전 경계" 절)
@@ -44,26 +45,6 @@ var MODE = "auto";          // 서버가 chat/url/search 를 고르게 한다
 var SUMMARY_STYLE = "brief";
 var MAX_RESULTS = 3;        // 검색 시 수집 문서 수 (서버 최대 5)
 var LANGUAGE = "ko";
-
-// 카톡 메시지에 섞여 들어오는 URL 을 집는다.
-//  라우팅은 서버가 하므로, 이건 "요약하는 중" 안내 문구를 고르는 용도로만 쓴다.
-var URL_RE     = /https?:\/\/[^\s<>"']+/i;
-var URL_WWW_RE = /(^|\s)(www\.[^\s<>"']+)/i;
-
-// 끝에 붙기 쉬운 문장부호 제거 ("...html." / "...html)" 등)
-function trimUrlTail(u) {
-  return String(u).replace(/[)\]}>.,;:!?'"]+$/, "");
-}
-
-// 텍스트에서 첫 URL 을 뽑는다. 없으면 null.
-function extractUrl(text) {
-  var s = String(text == null ? "" : text);
-  var m = URL_RE.exec(s);
-  if (m) return trimUrlTail(m[0]);
-  var w = URL_WWW_RE.exec(s);
-  if (w) return "https://" + trimUrlTail(w[2]);
-  return null;
-}
 
 function readApiKey() {
   var reader = null;
@@ -245,6 +226,5 @@ function ask(query) {
 }
 
 module.exports = {
-  ask: ask,
-  extractUrl: extractUrl
+  ask: ask
 };
