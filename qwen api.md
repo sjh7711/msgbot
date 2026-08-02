@@ -142,3 +142,204 @@ LoadCredential=openai_api_key:/home/autotrader/.config/cointrade-briefing/openai
 
 적용은 `systemctl --user daemon-reload` 후 수동 실행으로 검증한다. API 키와 거래소
 키는 보고서 JSON이나 로그에 기록하지 않는다.
+
+# 안전한 URL 수집·요약 및 웹 검색 API
+
+`cointrade-url-summary.service`는 공개 웹 문서를 제한적으로 수집하고 내부
+Qwen3.6으로 요약한다. 거래 워커·웹 대시보드와 별도 프로세스로 실행되며
+`192.168.0.55:18082`에만 바인딩한다. `/health/*` 외 endpoint는 내부 LLM과
+동일한 Bearer API 키를 요구한다.
+
+일반 Qwen 답변·URL 요약·웹 검색을 하나로 사용할 때는 `/v1/ask`를 호출한다.
+이 endpoint가 경로를 선택하고 필요한 작업만 실행하며, Qwen 모델 자체에는
+네트워크나 도구 실행 권한을 주지 않는다.
+
+웹 검색은 별도 `cointrade-searxng.service`가 공개 검색엔진을 조회하고,
+URL 요약 서비스가 결과 문서를 기존 SSRF 방어 경로로 다시 수집한 뒤 Qwen에
+전달한다. SearXNG는 `127.0.0.1:18888`에만 바인딩하며 LAN·Nginx·인터넷에
+직접 노출하지 않는다.
+
+## 안전 경계
+
+- `http`와 `https`, 표준 포트 80·443만 허용한다.
+- DNS의 모든 결과가 공개 IP여야 하며, 선택한 IP를 curl `--resolve`로 고정한다.
+- localhost, 사설망, link-local, multicast, reserved 주소와 `.local`,
+  `.internal` 이름을 거부한다.
+- 리다이렉트는 최대 3회이며 매 목적지를 다시 DNS 검사하고 고정한다.
+- 환경 프록시는 사용하지 않고 TLS 인증서를 검증한다.
+- HTML·일반 텍스트는 2MiB, PDF는 8MiB, PDF는 50페이지로 제한한다.
+- HTML의 script·style·form·navigation 요소를 제거한다.
+- PDF 추출은 CPU·메모리·파일 수가 제한된 별도 subprocess에서 실행한다.
+- 추출 본문은 최대 64,000자이고 긴 문서는 최대 10개 chunk로 나눠 요약한다.
+- 문서 안의 명령은 신뢰하지 않으며 제공된 본문 밖의 사실을 추측하지 않도록
+  고정 system policy를 사용한다.
+- URL 요약과 검색은 합쳐서 동시에 1개만 처리한다. 같은 IP·키 조합에서 URL
+  요약은 15분당 10회, 웹 검색은 15분당 5회로 제한한다.
+- `/v1/ask`도 선택된 작업과 같은 한도를 공유한다. 일반·URL 요청은 10회,
+  검색은 5회에 포함되며 일반 답변 뒤 자동 검색으로 전환되면 양쪽 한도를
+  각각 사용한다.
+- 요청 본문은 인증·JSON 파싱 전에 16KiB로 제한한다. 검색 문서 수집은
+  75초 예산과 문서당 12초 timeout, 검색 답변 LLM 호출은 180초 timeout을
+  적용해 단일 처리 slot이 무기한 점유되지 않게 한다.
+- 감사 로그에는 query string을 제거한 URL, 크기, SHA-256, 처리 결과와 시간만
+  기록하고 본문·요약·API 키는 기록하지 않는다.
+- 검색 질의 원문·검색 snippet·종합 답변은 감사 로그에 남기지 않는다. 프로세스
+  임시 salt를 쓴 질의 HMAC-SHA256과 길이, 수집 성공·실패 수, query string을
+  제거한 출처만 기록한다.
+- `.env`, 거래 state, SSH·백업·LLM 평문 키 경로는 systemd sandbox에서 가린다.
+- SearXNG는 전용 Unix 사용자와 별도 venv로 실행하고 RFC1918·link-local
+  목적지로의 네트워크 접근을 systemd에서 차단한다.
+
+검색 API는 한 페이지의 일반 검색 결과만 사용하고 기본 3개, 최대 5개 문서를
+수집한다. 각 결과 URL은 공개 IP·표준 포트·리다이렉트 규칙을 다시 통과해야
+출처가 된다. 전체 근거 본문은 12,000자로 제한한다. Qwen은 `[S1]` 형식으로
+실제 수집 출처를 인용해야 하며, 없는 출처 ID나 임의 URL을 만들면 응답을
+실패 처리한다. 일부 문서만 수집되면 `partial=true`, 전부 실패하면 근거 없는
+모델 답변 대신 오류를 반환한다.
+
+로그인, 쿠키, 사용자 지정 header, JavaScript 렌더링 페이지, 50페이지를 넘는
+PDF는 지원하지 않는다. URL에 인증 token이나 개인정보를 넣지 않는다.
+
+## 설치
+
+SearXNG는 CoinTrade virtualenv와 섞지 않는다. 설치 스크립트는 공식 저장소의
+고정 커밋 `8892414dc38dd57728b7f62f33152ea80e3b305f`를
+`/opt/cointrade-searxng`의 독립 venv에 설치하고 전용
+`cointrade-search` 사용자로 실행한다. 먼저 검색 백엔드, 다음으로 API
+서비스를 설치한다.
+
+```bash
+sudo deploy/systemd/install-searxng-service.sh
+.venv/bin/pip install -r requirements-linux-py312.lock
+sudo deploy/systemd/install-url-summary-service.sh
+```
+
+SearXNG 설치에는 Ubuntu 패키지와 Python 의존성을 받기 위한 인터넷 연결이
+필요하다. 설치 후에는 다음 조건을 확인한다.
+
+```bash
+systemctl status cointrade-searxng.service --no-pager
+ss -ltnp | grep 18888
+curl -X POST http://127.0.0.1:18888/search \
+  -d 'q=SearXNG' -d 'format=json' -d 'categories=general'
+```
+
+`18888`은 반드시 `127.0.0.1`에만 보여야 한다. UFW·라우터·Nginx에는 이
+포트를 열지 않는다.
+
+UFW가 활성 상태이면 설치 스크립트가 `192.168.0.0/24`에서
+`192.168.0.55:18082/tcp`로 들어오는 연결만 허용한다.
+
+## API
+
+상태 확인에는 인증이 필요하지 않다.
+
+```bash
+curl http://192.168.0.55:18082/health/live
+curl http://192.168.0.55:18082/health/ready
+```
+
+API 키는 shell history에 남기지 않고 입력한다.
+
+```bash
+read -rsp "API key: " COINTRADE_LLM_API_KEY
+echo
+```
+
+### 통합 질문
+
+일반 질문, URL 요약, 웹 검색을 자동으로 선택하려면 다음처럼 호출한다.
+
+```bash
+curl http://192.168.0.55:18082/v1/ask \
+  -H "Authorization: Bearer ${COINTRADE_LLM_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query":"현재 SearXNG 안정 버전의 주요 변경점을 알려줘",
+    "mode":"auto",
+    "summary_style":"detailed",
+    "language":"ko",
+    "max_results":3,
+    "time_range":"month"
+  }'
+```
+
+`mode`의 의미:
+
+- `auto`: URL이 있으면 URL 요약, 최신 정보나 명시적 검색 요청이면 웹 검색,
+  나머지는 일반 Qwen 답변으로 처리한다. 일반 답변 단계에서 Qwen이 외부 근거가
+  필요하다고 선언하면 검색을 한 번 실행한다.
+- `chat`: 일반 Qwen만 호출하며 자동 검색하지 않는다.
+- `url`: 질문에서 첫 번째 `http` 또는 `https` URL을 찾아 요약한다.
+- `search`: 입력을 검색어로 사용해 SearXNG 검색과 근거 종합을 강제한다.
+
+응답의 `route`는 실제 사용한 `chat`, `url_summary`, `web_search` 중 하나이며,
+`route_reason`, `searched`, `fallback_used`, `sources`, 모델 token 사용량을
+함께 반환한다. 자동 검색 fallback이 실행되면 모델이 정리한 검색어도
+`search.query`에서 확인할 수 있다.
+
+`auto`와 `search` 질문은 외부 검색엔진으로 전송될 수 있다. API 키·개인정보·
+비공개 거래정보가 포함된 질문은 반드시 `mode=chat`으로 고정한다.
+
+### 단일 URL 요약
+
+기존 전용 endpoint도 계속 사용할 수 있다.
+
+```bash
+curl http://192.168.0.55:18082/v1/url-summaries \
+  -H "Authorization: Bearer ${COINTRADE_LLM_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com/","summary_style":"brief","language":"ko"}'
+```
+
+응답에는 요청 ID, 요청·최종 URL, 제목, 수집 시각, MIME, byte 수, 원문
+SHA-256, 리다이렉트·페이지 수, 요약, 잘림 여부, chunk 수, 모델과 token
+사용량이 포함된다.
+
+### 웹 검색 강제
+
+검색하고 근거 문서를 종합하려면 다음 endpoint를 사용한다. 검색어는 외부
+검색엔진으로 전달되므로 API 키·개인정보·비공개 거래정보를 입력하지 않는다.
+
+```bash
+curl http://192.168.0.55:18082/v1/web-search \
+  -H "Authorization: Bearer ${COINTRADE_LLM_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query":"SearXNG JSON API 보안 설정",
+    "summary_style":"detailed",
+    "language":"ko",
+    "max_results":3,
+    "time_range":"month"
+  }'
+```
+
+작업이 끝나면 shell 변수에서 API 키를 제거한다.
+
+```bash
+unset COINTRADE_LLM_API_KEY
+```
+
+`time_range`는 생략하거나 `day`, `month`, `year` 중 하나를 쓴다. 응답에는
+Qwen의 `answer`, `[S1]`과 연결되는 실제 `sources`, 검색·수집 수,
+부분 성공 여부, 모델과 token 사용량이 포함된다. 검색 결과가 없으면 빈 출처와
+결정론적인 “검색 결과 없음”을 반환하며 Qwen을 호출하지 않는다.
+
+`/health/ready`의 전체 `status`는 API 키와 URL 요약 서비스 준비 상태를 뜻한다.
+`web_search.available`은 loopback SearXNG TCP 연결 여부를 별도로 표시하므로,
+전체 상태가 `ready`여도 이 값이 `false`이면 검색 endpoint는 사용할 수 없다.
+
+감사 로그:
+
+```bash
+sudo tail -n 20 /var/lib/cointrade-url-summary/audit.jsonl
+journalctl -u cointrade-url-summary.service --since today
+journalctl -u cointrade-searxng.service --since today
+```
+
+SearXNG가 중단돼도 `/v1/url-summaries`는 계속 사용할 수 있다.
+`/v1/web-search`와 `/v1/ask`의 검색 경로만 503을 반환한다. `/v1/ask`의
+`chat`·`url` 경로는 계속 사용할 수 있다. 롤백할 때는 검색 서비스를 먼저
+비활성화하고 URL 요약 unit에서 `URL_SUMMARY_SEARCH_*`와
+`cointrade-searxng.service` 의존성을 제거한 뒤 URL 요약 서비스를
+재시작한다.

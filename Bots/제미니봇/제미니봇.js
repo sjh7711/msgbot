@@ -294,74 +294,104 @@ var qwen = (function() {
 
 function isSummaryCommand(text) { return text.indexOf(summaryMod.CMD) === 0; }
 
-// URL 요약 모듈 (내부망 별도 엔드포인트). "!qwen" 에 URL 이 섞이면 이쪽으로 보낸다.
-// 못 불러오면 null → URL 라우팅만 꺼지고 일반 !qwen 은 그대로 동작한다
+// 통합 질의 모듈 (/v1/ask). 일반 답변·URL 요약·웹 검색 중 무엇을 할지는 서버가
+// 고르므로 클라이언트에서 갈래를 나누지 않는다.
+// 못 불러오면 null → 아래에서 qwen.js(18080) 일반 답변으로만 동작한다
 // (이 파일 하나 때문에 봇 전체가 컴파일 실패하지 않도록).
-var urlsum = (function() {
+var askMod = (function() {
   try {
-    var p = "/sdcard/msgbot/Bots/제미니봇/urlsummary.js";
-    try { if (typeof bot.getRootPath === "function") p = bot.getRootPath() + "/urlsummary.js"; } catch(_) {}
+    var p = "/sdcard/msgbot/Bots/제미니봇/ask.js";
+    try { if (typeof bot.getRootPath === "function") p = bot.getRootPath() + "/ask.js"; } catch(_) {}
     var m = require(p);
-    return (m && typeof m.extractUrl === "function") ? m : null;
+    return (m && typeof m.ask === "function") ? m : null;
   } catch(_) { return null; }
 })();
 
 function isQwenCommand(text) { return text.indexOf("!qwen") === 0; }
 
+// /v1/ask 결과를 카톡 메시지로 꾸민다.
+// 첫 줄 + 제로폭 스페이서로 카카오톡 미리보기를 채우는 건 제미니와 같은 형식.
+function formatAskResult(res, tag) {
+  var kind = "";
+  if (res.route === "url_summary") kind = " · 링크 요약";
+  else if (res.route === "web_search") kind = " · 웹 검색";
+
+  var lines = [];
+  if (res.route === "url_summary") {
+    if (res.title) lines.push("📄 " + res.title);
+    if (res.url) lines.push(res.url);
+    if (lines.length) lines.push("");
+  }
+  lines.push(res.answer);
+
+  // 검색 답변의 [S1] 인용과 짝이 되는 실제 출처. 없으면 붙이지 않는다.
+  if (res.route === "web_search" && res.sources.length) {
+    lines.push("");
+    lines.push("출처");
+    for (var i = 0; i < res.sources.length; i++) {
+      var s = res.sources[i];
+      lines.push("[" + s.id + "] " + (s.title || s.url));
+      if (s.title && s.url) lines.push("    " + s.url);
+    }
+  }
+  if (res.truncated) lines.push("\n※ 문서가 길어 일부만 반영됐습니다.");
+  if (res.partial) lines.push("\n※ 일부 문서만 수집돼 근거가 불완전합니다.");
+
+  return "답변입니다. (" + tag + kind + ")" + LONG_MSG_SPACER + "\n" + lines.join("\n");
+}
+
 // ── Qwen 답변 전송 (공통) ────────────────────────────────────────────
-// 제미니와 같은 형식: 첫 줄 + 제로폭 스페이서로 카카오톡 미리보기를 채운다.
-function sendQwenAnswer(room, question, header) {
+// 기본 경로는 /v1/ask. 서버에 닿지 못할 때만 18080 일반 답변으로 내려간다
+// (같은 호스트라 대개 같이 죽지만, 요약 서비스만 내려간 경우를 건진다).
+function sendQwenAnswer(room, question, tag) {
+  if (askMod) {
+    var r = askMod.ask(question);
+    if (r && !r.error) {
+      try { bot.send(room, formatAskResult(r, tag)); } catch(_) {}
+      return true;
+    }
+    if (r && !r.connectFailed) {
+      try { bot.send(room, "⚠ Qwen 답변 실패: " + r.error); } catch(_) {}
+      return false;
+    }
+  }
   var res = qwen.ask(question);
   if (res && typeof res.text === "string" && res.text) {
-    try { bot.send(room, header + LONG_MSG_SPACER + "\n" + res.text); } catch(_) {}
+    try { bot.send(room, "답변입니다. (" + tag + ")" + LONG_MSG_SPACER + "\n" + res.text); } catch(_) {}
     return true;
   }
   try { bot.send(room, "⚠ Qwen 답변 실패: " + ((res && res.error) ? res.error : "알 수 없음")); } catch(_) {}
   return false;
 }
 
-// URL 요약 결과를 카톡 형식으로 전송
-function sendUrlSummary(room, url, style) {
-  var res = urlsum.summarize(url, style);
-  if (res && res.error) {
-    try { bot.send(room, "⚠ 요약 실패: " + res.error); } catch(_) {}
-    return;
-  }
-  var head = "요약입니다." + (res.style === "detailed" ? " (상세)" : "");
-  var lines = [];
-  if (res.title) lines.push("📄 " + res.title);
-  lines.push(res.url);
-  lines.push("");
-  lines.push(res.summary);
-  if (res.truncated) lines.push("\n※ 문서가 길어 일부만 반영됐습니다.");
-  try { bot.send(room, head + LONG_MSG_SPACER + "\n" + lines.join("\n")); } catch(_) {}
-}
-
-// "!qwen [질문]" — 내부망 서버라 사용 한도를 세지 않는다.
-//   뒤에 URL 이 섞여 있으면(어디에 있든) 자동으로 URL 요약 API 로 넘긴다.
-//   "!qwen <URL> 요약해줘" / "!qwen 요약좀 <URL>" / "!qwen <URL>" 전부 동작.
+// "!qwen [무엇이든]" — 내부망 서버라 우리 쪽에서 사용 횟수를 세지 않는다.
+//   URL 이 섞여 있으면 요약, 최신 정보가 필요하면 웹 검색, 나머지는 일반 답변.
+//   무엇을 할지는 서버(/v1/ask, mode=auto)가 고르므로 사용자는 형식을 몰라도 된다.
+//   "!qwen <URL> 요약해줘" / "!qwen 요약좀 <URL>" / "!qwen 오늘 환율" 전부 동작.
 function handleQwen(msg) {
   try {
     var text = String(msg.content || "").trim();
     var question = text.slice("!qwen".length).trim();
     if (!question) {
-      msg.reply("사용법: !qwen [질문]  또는  !qwen [URL] (요약)\n예) !qwen 광합성이 뭐야?");
+      msg.reply("사용법: !qwen [질문]\n" +
+                "· 링크를 넣으면 그 문서를 요약하고, 최신 정보가 필요하면 웹을 검색합니다.\n" +
+                "· 검색이 필요한 질문은 외부 검색엔진으로 전달됩니다. 개인정보·비밀번호·키는 넣지 마세요.\n" +
+                "예) !qwen 광합성이 뭐야?  /  !qwen https://... 요약해줘");
       return;
     }
     var room = msg.room;
 
-    var url = urlsum ? urlsum.extractUrl(question) : null;
-    if (url) {
-      var style = urlsum.styleFor(urlsum.stripUrl(question, url));
-      // 요약은 30초~1분 걸리므로 기다리는 줄 알 수 있게 먼저 알린다.
-      try { msg.reply("링크를 읽고 " + (style === "detailed" ? "상세히 " : "") + "요약하는 중입니다. 잠시만요."); } catch(_) {}
-      new java.lang.Thread(function() { sendUrlSummary(room, url, style); }).start();
-      return;
-    }
+    // 30초~1분 걸리므로 기다리는 줄 알 수 있게 먼저 알린다.
+    // 실제 경로는 서버가 고르지만, URL 유무로 안내 문구만 맞춰 준다.
+    var hasUrl = askMod ? askMod.extractUrl(question) : null;
+    try {
+      msg.reply(hasUrl ? "링크를 읽고 요약하는 중입니다. 잠시만요."
+                       : "생각 중입니다. 필요하면 웹도 찾아볼게요. 잠시만요.");
+    } catch(_) {}
 
     // 생성에 시간이 걸리므로 워커 큐를 막지 않도록 별도 스레드에서 처리.
     new java.lang.Thread(function() {
-      sendQwenAnswer(room, question, "답변입니다. (Qwen)");
+      sendQwenAnswer(room, question, "Qwen");
     }).start();
   } catch(e) {
     try { msg.reply("오류: " + (e && e.message ? e.message : e)); } catch(_) {}
@@ -417,7 +447,7 @@ function handleMessage(msg) {
         "내부망 Qwen 으로 답변을 만드는 중입니다. 조금 오래 걸릴 수 있습니다.\n" +
         "(상식퀴즈봇과 1:1 채팅에서 !api 로 키를 등록하면 제미니를 무제한 사용할 수 있습니다.)");
       new java.lang.Thread(function() {
-        sendQwenAnswer(overRoom, question, "답변입니다. (제미니 한도 초과 → Qwen)");
+        sendQwenAnswer(overRoom, question, "제미니 한도 초과 → Qwen");
       }).start();
       return;
     }
@@ -434,7 +464,7 @@ function handleMessage(msg) {
         // 폴백은 "토큰 소진"일 때만 한다. 차단·파싱오류 같은 건 그대로 오류로 알려야
         // 진짜 문제가 Qwen 답변 뒤에 숨지 않는다.
         try { bot.send(room, "⚠ 제미니 API 사용량이 모두 소진되어 내부망 Qwen 으로 답변합니다. 조금 오래 걸릴 수 있습니다."); } catch(_) {}
-        sendQwenAnswer(room, question, "답변입니다. (제미니 소진 → Qwen)");
+        sendQwenAnswer(room, question, "제미니 소진 → Qwen");
       } else {
         try { bot.send(room, "⚠ 답변 생성 실패: " + ((res && res.error) ? res.error : "알 수 없음")); } catch(_) {}
       }
