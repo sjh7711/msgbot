@@ -37,7 +37,11 @@ var CONNECT_TIMEOUT = 15000;
 var READ_TIMEOUT = 300000;
 
 var MODE = "auto";          // 서버가 chat/url/search 를 고르게 한다
-var SUMMARY_STYLE = "detailed";
+// summary_style 은 "brief" 아니면 "detailed" 둘뿐이다(서버 검증 응답으로 확인).
+// 같은 문서 실측(llama.cpp README, 1 chunk): brief 17.6초/710자,
+// detailed 44.4초/2,100자. 카톡은 마크다운을 렌더링하지 않아 detailed 의
+// 굵은 제목·중첩 목록이 날것으로 보이고 미리보기도 넘긴다 → brief.
+var SUMMARY_STYLE = "brief";
 var MAX_RESULTS = 3;        // 검색 시 수집 문서 수 (서버 최대 5)
 var LANGUAGE = "ko";
 
