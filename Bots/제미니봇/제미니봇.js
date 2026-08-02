@@ -386,7 +386,7 @@ function handleQwen(msg) {
     var hasUrl = askMod ? askMod.extractUrl(question) : null;
     try {
       msg.reply(hasUrl ? "링크를 읽고 요약하는 중입니다. 잠시만요."
-                       : "생각 중입니다. 필요하면 웹도 찾아볼게요. 잠시만요.");
+                       : "답변을 생성중입니다.");
     } catch(_) {}
 
     // 생성에 시간이 걸리므로 워커 큐를 막지 않도록 별도 스레드에서 처리.
