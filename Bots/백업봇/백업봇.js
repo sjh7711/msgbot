@@ -319,6 +319,68 @@ function nextRunMillis(){
   return cal.getTimeInMillis();
 }
 
+// ── ChatManager 전원 감시 (역방향) ──────────────────────────────────
+// ChatManager 는 다른 모든 봇을 되살리지만 자기 자신은 못 지킨다 — 꺼지면 감시자도
+// 같이 죽는다. 게다가 ChatManager 가 죽으면 구독 봇 전체가 메시지를 못 받아 사실상
+// 전멸이라, 이 한 놈만은 다른 데서 지켜야 한다. 백업봇은 이미 상주 스케줄러
+// 스레드가 있어 추가 비용이 거의 없다.
+// 복구 규칙(백오프 1분→5분→30분, 안정 10분 후 리셋, 그 뒤 포기)은 ChatManager 쪽과 동일.
+var CM_NAME = "ChatManager";
+var CM_TICK_MS = 2 * 60 * 1000;                    // 스케줄러가 깨는 주기
+var CM_STABLE_MS = 10 * 60 * 1000;
+var CM_BACKOFF_MS = [60000, 300000, 1800000];
+var _cmTries = 0, _cmNextAt = 0, _cmOkSince = 0, _cmGaveUp = false;
+
+function watchChatManager(){
+  try {
+    var now = java.lang.System.currentTimeMillis();
+    var on = null;
+    try { on = BotManager.getPower(CM_NAME); } catch(_) { return; }   // 조회 실패는 판단 보류
+
+    if (on){
+      if (_cmTries > 0){
+        if (!_cmOkSince) _cmOkSince = now;
+        else if (now - _cmOkSince >= CM_STABLE_MS){
+          appendBackupLog("watch " + CM_NAME + " 안정 — 복구 카운터 리셋 (" + _cmTries + "회 후)");
+          _cmTries = 0; _cmNextAt = 0; _cmOkSince = 0; _cmGaveUp = false;
+        }
+      }
+      return;
+    }
+
+    _cmOkSince = 0;
+    if (_cmGaveUp) return;                // 포기 — 수동 확인 전까지 그대로
+    if (now < _cmNextAt) return;          // 백오프 대기 중
+
+    // 판정은 시도하기 전에. (시도 뒤에 정하면 마지막 시도가 성공해도 포기 알림이 나간다)
+    if (_cmTries >= CM_BACKOFF_MS.length){
+      _cmGaveUp = true;
+      appendBackupLog("watch " + CM_NAME + " 복구 포기 — 수동 확인 필요");
+      try { bot.send("신쫑", "⛔ ChatManager 가 계속 꺼집니다. " + _cmTries +
+                     "회 되살렸지만 유지되지 않아 자동 복구를 멈춥니다.\n" +
+                     "ChatManager 가 꺼져 있으면 구독 봇 전체가 메시지를 받지 못합니다."); } catch(_) {}
+      return;
+    }
+
+    var ok = false, err = "";
+    try {
+      try { BotManager.prepare(CM_NAME, false); } catch(_) {}
+      BotManager.setPower(CM_NAME, true);
+      try { ok = !!BotManager.getPower(CM_NAME); } catch(_) { ok = false; }
+      if (!ok) err = "setPower 후에도 OFF";
+    } catch(e){ err = (e && e.message) ? e.message : String(e); }
+
+    _cmTries++;
+    _cmNextAt = now + CM_BACKOFF_MS[_cmTries - 1];
+    appendBackupLog("watch " + CM_NAME + " OFF 감지 → 복구 " +
+                    (ok ? "성공" : "실패(" + err + ")") + " (" + _cmTries + "회차)");
+    if (ok){
+      _cmOkSince = now;
+      try { bot.send("신쫑", "🔄 ChatManager 가 꺼져 있어 백업봇이 다시 켰습니다. (" + _cmTries + "회차)"); } catch(_) {}
+    }
+  } catch(_) {}
+}
+
 function startScheduler(){
   killOldSchedThreads();
 
@@ -335,11 +397,14 @@ function startScheduler(){
 
       while (!java.lang.Thread.currentThread().isInterrupted()){
         var target = nextRunMillis();
-        // 시계 변경(수동 시간조정 등)에 대비해 최대 1시간 단위로 끊어 자면서 재계산
+        // 시계 변경(수동 시간조정 등)에 대비해 끊어 자면서 재계산.
+        // 끊는 간격은 ChatManager 감시 주기(2분)에 맞춘다 — 깰 때마다 한 번 확인한다.
+        // 예전엔 1시간이었으나, 감시가 붙으면서 그만큼 늦게 알아채면 의미가 없다.
         while (true){
           var remain = target - java.lang.System.currentTimeMillis();
           if (remain <= 0) break;
-          try { java.lang.Thread.sleep(Math.min(remain, 3600000)); }
+          watchChatManager();
+          try { java.lang.Thread.sleep(Math.min(remain, CM_TICK_MS)); }
           catch(ie) { return; }   // interrupt = 재컴파일/수동 kill → 종료
         }
         try {

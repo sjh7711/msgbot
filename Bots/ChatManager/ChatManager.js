@@ -540,6 +540,9 @@ var POLL_BACKOFF = 2;    // 빈 폴링마다 간격 ×2 (MAX 까지 단계적 �
 var _poller = new java.lang.Thread(function() {
   var interval = POLL_MIN_MS, initWait = 2000, INIT_MAX = 30000;
   while (!java.lang.Thread.currentThread().isInterrupted()) {
+    // 봇 전원 감시. KakaoDB 초기화와 무관하게 돌아야 하므로 KT_OK 검사보다 앞에 둔다.
+    // 자체 스로틀(WATCH_TICK_MS)이 있어 폴링 간격이 짧아도 30초에 한 번만 실제로 돈다.
+    try { _watchTick(); } catch(_) {}
     if (!KT_OK) {                                                          // 아직 초기화 전 → 재시도
       var ok = false;
       try { ok = initKakaoDB(); } catch(_) { ok = false; }
@@ -623,6 +626,9 @@ function _applyOnOff(name) {
     // 켤 때: OFF(언로드)였던 봇은 미컴파일일 수 있으므로 먼저 prepare (이미 컴파일됐으면 무동작)
     if (next) { try { BotManager.prepare(name, false); } catch(_) {} }
     BotManager.setPower(name, next);
+    // 감시자가 사용자 의도와 싸우지 않도록 희망 상태를 남긴다. 수동으로 켜면
+    // 크래시 루프 판정(백오프·포기)도 함께 초기화된다.
+    _setWatchWant(name, next);
     return name + " : " + (next ? "🟢 ON" : "🔴 OFF");
   } catch(e) {
     return name + " : ⚠️ 전원 변경 실패 (" + (e && e.message ? e.message : e) + ")";
@@ -647,11 +653,197 @@ function _statusText() {
     var power = null, comp = null;
     try { power = BotManager.getPower(nm); } catch(_) {}
     try { comp = BotManager.isCompiled(nm); } catch(_) {}
+    var note = "";
+    if (!_watchWantOf(nm)) note = " / 감시 제외";
+    else {
+      var st = _watchState[nm];
+      if (st && st.gaveUp) note = " / ⛔ 복구 포기";
+      else if (st && st.tries > 0) note = " / 복구 " + st.tries + "회";
+    }
     lines.push("• " + nm + " : " +
       (power ? "🟢 ON" : "🔴 OFF") + " / " +
-      (comp ? "컴파일됨" : "미컴파일"));
+      (comp ? "컴파일됨" : "미컴파일") + note);
   }
   return lines.join("\n");
+}
+
+// ── 봇 자동 복구 감시자 ──────────────────────────────────────────────
+// 봇이 원인 불명으로 하나씩 꺼지는 일이 있어, 주기적으로 확인해 되살린다.
+//
+//  · "켜져 있어야 할 봇" 은 botwatch.json 에 남긴다. !onoff 로 끈 봇은 want=false 가
+//    되어 감시에서 빠진다 — 감시자가 사용자 의도와 싸우면 안 되기 때문.
+//  · 파일에 없는 봇은 want=true 로 본다. 새로 만든 봇도 자동으로 지켜진다.
+//  · 죽어서 꺼진 봇을 무한정 되살리면 크래시 루프가 되어 지금보다 나빠진다.
+//    1분 → 5분 → 30분으로 물러서고, 그래도 안 되면 포기하고 알린다.
+//    켠 뒤 STABLE_MS 를 버티면 정상으로 보고 재시도 횟수를 리셋한다.
+//  · 꺼지는 원인이 아직 불명이므로 복구 기록을 파일로 남긴다(언제·어느 봇·결과).
+//    며칠 쌓이면 특정 봇/시간대/직전 동작에 몰리는지가 드러난다.
+//  · ChatManager 자신은 못 지킨다(꺼지면 감시자도 같이 죽음). 백업봇이 역으로 지킨다.
+var WATCH_PATH = Packages.android.os.Environment.getExternalStorageDirectory()
+    .getAbsolutePath() + "/msgbot/botwatch.json";
+var WATCH_LOG_PATH = Packages.android.os.Environment.getExternalStorageDirectory()
+    .getAbsolutePath() + "/msgbot/botwatch.log";
+var WATCH_TICK_MS   = 30 * 1000;        // 확인 주기 (폴러 안에서 스로틀)
+var WATCH_STABLE_MS = 10 * 60 * 1000;   // 이만큼 켜져 있으면 "안정" → 백오프 리셋
+var WATCH_BACKOFF_MS = [60000, 300000, 1800000];   // 1분 → 5분 → 30분, 그 다음은 포기
+var WATCH_NOTIFY_ROOM = "신쫑";         // lib/admin.js 의 ADMIN_ROOMS 와 같은 방
+var WATCH_LOG_MAX = 200 * 1024;         // 로그가 무한정 커지지 않게 (넘으면 새로 시작)
+
+var _watchWant = null;    // { name: { want, at } } — 파일 내용. null 이면 아직 안 읽음
+var _watchState = {};     // name -> { tries, nextAt, okSince, gaveUp } (메모리, 재컴파일 시 초기화)
+var _watchLastTick = 0;
+
+function _watchStamp() {
+  try {
+    var f = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+    f.setTimeZone(java.util.TimeZone.getTimeZone("Asia/Seoul"));
+    return String(f.format(new java.util.Date()));
+  } catch(_) { return ""; }
+}
+
+function _loadWatchWant() {
+  try {
+    var f = new java.io.File(WATCH_PATH);
+    if (!f.exists()) return {};
+    var br = new java.io.BufferedReader(new java.io.InputStreamReader(new java.io.FileInputStream(f), "UTF-8"));
+    var sb = new java.lang.StringBuilder(), line;
+    while ((line = br.readLine()) !== null) sb.append(line);
+    br.close();
+    var obj = JSON.parse(String(sb.toString()) || "{}");
+    return (obj && typeof obj === "object") ? obj : {};
+  } catch(_) { return {}; }
+}
+
+function _saveWatchWant() {
+  try {
+    var w = new java.io.FileWriter(WATCH_PATH, false);
+    w.write(JSON.stringify(_watchWant));
+    w.close();
+  } catch(_) {}
+}
+
+// 파일에 없거나 want 가 false 가 아니면 "켜져 있어야 하는" 봇으로 본다.
+function _watchWantOf(name) {
+  if (_watchWant === null) _watchWant = _loadWatchWant();
+  var v = _watchWant[String(name)];
+  return !(v && v.want === false);
+}
+
+function _setWatchWant(name, want) {
+  var nm = String(name);
+  try {
+    if (_watchWant === null) _watchWant = _loadWatchWant();
+    _watchWant[nm] = { want: !!want, at: _watchStamp() };
+    _saveWatchWant();
+  } catch(_) {}
+  _watchState[nm] = { tries: 0, nextAt: 0, okSince: 0, gaveUp: false };
+}
+
+function _watchLog(line) {
+  try {
+    var f = new java.io.File(WATCH_LOG_PATH);
+    var append = true;
+    try { if (f.exists() && f.length() > WATCH_LOG_MAX) append = false; } catch(_) {}
+    var w = new java.io.FileWriter(WATCH_LOG_PATH, append);
+    w.write(_watchStamp() + "  " + line + "\n");
+    w.close();
+  } catch(_) {}
+}
+
+// 알림은 "받은 방에 답장" 이 아니라 능동 전송이라, 그 방의 알림 세션이 살아 있어야
+// 나간다(재부팅 후 해당 방에 아직 메시지가 없으면 실패). 실패하면 버리지 않고 쌓아
+// 두었다가 다음 tick 에 다시 시도한다. 확실한 기록은 어차피 botwatch.log 쪽이다.
+var _watchPending = [];
+var WATCH_PENDING_MAX = 20;
+
+function _watchFlushNotices() {
+  while (_watchPending.length) {
+    var ok = false;
+    try { ok = (bot.send(WATCH_NOTIFY_ROOM, _watchPending[0]) !== false); } catch(_) { ok = false; }
+    if (!ok) return;                     // 아직 못 보냄 — 순서 유지한 채 다음 기회에
+    _watchPending.shift();
+  }
+}
+
+function _watchNotify(text) {
+  _watchPending.push(String(text));
+  while (_watchPending.length > WATCH_PENDING_MAX) _watchPending.shift();
+  _watchFlushNotices();
+}
+
+// 꺼진 봇 하나를 되살린다. 성공 여부를 실제 전원 상태로 확인한다.
+function _watchRecover(name) {
+  try {
+    try { BotManager.prepare(name, false); } catch(_) {}
+    BotManager.setPower(name, true);
+    var on = false;
+    try { on = !!BotManager.getPower(name); } catch(_) { on = false; }
+    return { ok: on, err: on ? "" : "setPower 후에도 OFF" };
+  } catch(e) {
+    return { ok: false, err: (e && e.message) ? e.message : String(e) };
+  }
+}
+
+function _watchTick() {
+  // 폴러 스레드는 이 블록의 var 초기화보다 먼저 돌 수 있다(선언은 호이스팅되지만
+  // 대입은 아래에서 일어남). 준비 전에는 조용히 넘어간다.
+  if (!WATCH_BACKOFF_MS) return;
+  var now = java.lang.System.currentTimeMillis();
+  if (now - _watchLastTick < WATCH_TICK_MS) return;
+  _watchLastTick = now;
+
+  _watchFlushNotices();                 // 지난번에 못 보낸 알림 재시도
+  var names = _otherBotNames();
+  for (var i = 0; i < names.length; i++) {
+    var nm = names[i];
+    if (!_watchWantOf(nm)) continue;                    // 일부러 꺼둔 봇
+    if (!_watchState[nm]) _watchState[nm] = { tries: 0, nextAt: 0, okSince: 0, gaveUp: false };
+    var st = _watchState[nm];
+
+    var on = null;
+    try { on = BotManager.getPower(nm); } catch(_) { continue; }   // 조회 실패는 판단 보류
+
+    if (on) {
+      // 켜져 있음. 복구 이력이 있으면 충분히 버텼는지 보고 백오프를 푼다.
+      if (st.tries > 0) {
+        if (!st.okSince) st.okSince = now;
+        else if (now - st.okSince >= WATCH_STABLE_MS) {
+          _watchLog(nm + " 안정 — 복구 카운터 리셋 (" + st.tries + "회 후)");
+          _watchState[nm] = { tries: 0, nextAt: 0, okSince: 0, gaveUp: false };
+        }
+      }
+      continue;
+    }
+
+    st.okSince = 0;
+    if (st.gaveUp) continue;              // 포기한 봇은 수동 개입(!onoff) 전까지 그대로 둔다
+    if (now < st.nextAt) continue;        // 백오프 대기 중
+
+    // 판정은 "시도하기 전"에 한다. 시도한 뒤에 포기를 정하면, 마지막 시도가 성공했는데도
+    // "복구를 멈춥니다" 를 보내게 된다.
+    if (st.tries >= WATCH_BACKOFF_MS.length) {
+      // 정해진 횟수를 다 쓰고 마지막 백오프까지 기다렸는데 여전히 꺼져 있다.
+      // 켜는 것 자체가 답이 아니라는 뜻 — 사람을 부른다.
+      st.gaveUp = true;
+      _watchLog(nm + " 복구 포기 — 수동 확인 필요");
+      _watchNotify("⛔ " + nm + " 이 계속 꺼집니다. " + st.tries + "회 되살렸지만 유지되지 않아 자동 복구를 멈춥니다.\n" +
+                   "로그: " + WATCH_LOG_PATH + "\n확인 후 !onoff 로 켜면 감시가 다시 시작됩니다.");
+      continue;
+    }
+
+    var r = _watchRecover(nm);
+    st.tries++;
+    st.nextAt = now + WATCH_BACKOFF_MS[st.tries - 1];
+
+    if (r.ok) {
+      st.okSince = now;
+      _watchLog(nm + " OFF 감지 → 복구 성공 (" + st.tries + "회차)");
+      _watchNotify("🔄 " + nm + " 이 꺼져 있어 다시 켰습니다. (" + st.tries + "회차)");
+    } else {
+      _watchLog(nm + " OFF 감지 → 복구 실패 (" + st.tries + "회차): " + r.err);
+      _watchNotify("⚠️ " + nm + " 이 꺼져 있어 켜려 했지만 실패했습니다. (" + st.tries + "회차)\n사유: " + r.err);
+    }
+  }
 }
 
 // 선택 입력 파싱: "전체"/"all"/"모두" → 전체, "1 3 5" 또는 "1,3,5" → 0-기반 인덱스 목록(중복 제거).
