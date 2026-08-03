@@ -43,6 +43,21 @@ var deletedChat = (function() {
   try { if (typeof bot.getRootPath === "function") p = bot.getRootPath() + "/deletedchat.js"; } catch(_) {}
   return require(p);
 })();
+// 에러 로그 수집 + 권한. 못 불러오면 null → "!에러" 만 죽고 나머지는 그대로 동작한다
+// (이 두 파일 때문에 로그봇 전체가 컴파일 실패하지 않도록).
+function _libPath(name) {
+  var p = "/sdcard/msgbot/lib/" + name;
+  try { if (typeof bot.getRootPath === "function") p = bot.getRootPath() + "/../../lib/" + name; } catch(_) {}
+  return p;
+}
+var errlog = (function() {
+  try { var m = require(_libPath("errlog.js"));
+        return (m && typeof m.collect === "function") ? m : null; } catch(_) { return null; }
+})();
+var admin = (function() {
+  try { var m = require(_libPath("admin.js"));
+        return (m && typeof m.levelOf === "function") ? m : null; } catch(_) { return null; }
+})();
 
 // 공용 DB 커넥션 재사용 (메시지마다 open/close 하지 않음).
 // SQLiteDatabase 는 내부 락이 있어 워커 단일 스레드에서 안전하게 공유 가능.
@@ -105,6 +120,104 @@ function upsertUserHash(hash, name, room) {
   finally { if (cur) cur.close(); }
 }
 
+// ─── "!에러" — 흩어진 에러 로그 모아보기 ────────────────────────────────────
+//   !에러            최근 24시간 요약 (봇별 건수 + 같은 에러 묶음)
+//   !에러 6          최근 6시간
+//   !에러 제미니봇    그 봇 것만 (부분일치)
+//   !에러 상세        최근 원문 15줄 그대로
+//   !에러 전체        기간 제한 없이 (남아 있는 기록 전부)
+//
+//   스택·파일 경로가 그대로 나오므로 관리자만 쓸 수 있게 한다.
+var ERR_CMD = "!에러";
+var ERR_DEFAULT_HOURS = 24;
+var ERR_GROUP_MAX = 6;      // 요약에 보여줄 에러 묶음 수
+var ERR_RAW_MAX = 15;       // 상세에서 보여줄 원문 줄 수
+var ERR_SAMPLE_LEN = 110;   // 한 줄이 너무 길면 자른다 (카톡 가독성)
+
+function _errCut(s, n) {
+  var t = String(s).replace(/[\r\n]+/g, " ");
+  return t.length > n ? t.slice(0, n - 1) + "…" : t;
+}
+
+function _errUsage() {
+  return [ERR_CMD + " 사용법",
+    "• " + ERR_CMD + "            최근 " + ERR_DEFAULT_HOURS + "시간 요약",
+    "• " + ERR_CMD + " 6          최근 6시간",
+    "• " + ERR_CMD + " 제미니봇    그 봇 것만",
+    "• " + ERR_CMD + " 상세        최근 원문 " + ERR_RAW_MAX + "줄",
+    "• " + ERR_CMD + " 전체        남아 있는 기록 전부"].join("\n");
+}
+
+function _errSummaryText(res, label) {
+  var s = errlog.summarize(res.entries);
+  if (!s.total) {
+    return "[에러 로그] " + label + "\n에러가 없습니다. 👍\n" +
+           "(수집: " + (res.sources.length ? res.sources.length + "개 파일" : "로그 파일 없음") + ")";
+  }
+  var lines = ["[에러 로그] " + label + " — 총 " + s.total + "건"];
+
+  lines.push("");
+  var bots = [];
+  for (var i = 0; i < s.byBot.length && i < 8; i++) bots.push(s.byBot[i].bot + " " + s.byBot[i].n);
+  lines.push("봇별: " + bots.join(" / "));
+
+  lines.push("");
+  lines.push("자주 나는 순:");
+  for (var g = 0; g < s.groups.length && g < ERR_GROUP_MAX; g++) {
+    var it = s.groups[g];
+    lines.push((g + 1) + ") [" + it.bot + "] " + it.n + "회  마지막 " + it.last.slice(5));
+    lines.push("   " + _errCut(it.sample, ERR_SAMPLE_LEN));
+  }
+  if (s.groups.length > ERR_GROUP_MAX) lines.push("… 그 외 " + (s.groups.length - ERR_GROUP_MAX) + "종류");
+
+  lines.push("");
+  var srcs = [];
+  for (var k = 0; k < res.sources.length; k++) srcs.push(res.sources[k].name + "(" + res.sources[k].kept + ")");
+  lines.push("수집: " + srcs.join(", "));
+  // 각 기록부가 256KB 에서 파일을 비우므로 "전 기간"이 아니라는 걸 밝혀 둔다.
+  lines.push("※ 로그는 용량 한도로 앞부분이 잘렸을 수 있습니다.");
+  return lines.join("\n");
+}
+
+function _errRawText(res, label) {
+  if (!res.entries.length) return "[에러 로그] " + label + "\n에러가 없습니다. 👍";
+  var lines = ["[에러 로그] " + label + " — 최근 " + Math.min(res.entries.length, ERR_RAW_MAX) +
+               "건 (총 " + res.entries.length + ")", ""];
+  var from = Math.max(0, res.entries.length - ERR_RAW_MAX);
+  for (var i = from; i < res.entries.length; i++) {
+    var e = res.entries[i];
+    lines.push(e.ts.slice(5) + " [" + e.bot + "]");
+    lines.push("  " + _errCut(e.text, 200));
+  }
+  return lines.join("\n");
+}
+
+function handleErrCmd(msg) {
+  if (!errlog) { msg.reply("에러 로그 모듈(lib/errlog.js)을 불러오지 못했습니다."); return true; }
+  // 권한 모듈을 못 읽으면 열어주지 않는다 (실패 시 닫히는 쪽으로).
+  if (!admin || !admin.isAdmin(msg.hash)) { msg.reply(ERR_CMD + " 은 관리자만 사용할 수 있습니다."); return true; }
+
+  var arg = String(msg.content).slice(ERR_CMD.length).replace(/^\s+|\s+$/g, "");
+  var opts = { hours: ERR_DEFAULT_HOURS }, label = "최근 " + ERR_DEFAULT_HOURS + "시간", raw = false;
+
+  if (/^(도움말|help|\?)$/i.test(arg)) { msg.reply(_errUsage()); return true; }
+  if (/^전체$/.test(arg)) { opts = {}; label = "전체 기간"; }
+  else if (/^상세$/.test(arg)) { raw = true; }
+  else if (/^\d+$/.test(arg)) {
+    var h = Number(arg);
+    if (h < 1 || h > 720) { msg.reply("시간은 1~720 사이로 넣어주세요."); return true; }
+    opts = { hours: h }; label = "최근 " + h + "시간";
+  } else if (arg) {
+    opts = { bot: arg }; label = "'" + arg + "' 전체 기간";
+  }
+
+  var res = errlog.collect(opts);
+  // 기간 계산이 실패하면 필터가 걸리지 않는다 — 라벨을 사실대로 바꾼다.
+  if (res.sinceFailed) label = "전체 기간 (⚠ 기간 계산 실패로 " + label + " 필터가 적용되지 않음)";
+  msg.reply(raw ? _errRawText(res, label) : _errSummaryText(res, label));
+  return true;
+}
+
 // ─── 메시지 큐 + 워커 스레드 (ChatManager 구독, 공유 모듈) ───────────────────
 var WORKER_NAME = "LOG_BOT_WORKER";
 
@@ -115,6 +228,16 @@ subscribe(BOT_NAME, WORKER_NAME, function(msg) {
       if (deletedChat.handle(msg, kt)) return;
     }
   } catch (e) {}
+
+  // "!에러" — 에러 로그 모아보기 (관리자 전용)
+  try {
+    if (msg.content && String(msg.content).indexOf(ERR_CMD) === 0) {
+      if (handleErrCmd(msg)) return;
+    }
+  } catch (e) {
+    try { msg.reply("에러 로그 조회 실패: " + (e && e.message ? e.message : e)); } catch(_) {}
+    return;
+  }
 
   // 로그봇은 모든 메시지에 대해 userhash 를 기록한다 (프리필터 없음).
   if (!msg.hash) return;
