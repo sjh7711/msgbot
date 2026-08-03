@@ -610,11 +610,32 @@ function _otherBotNames() {
   return out;
 }
 
+// 목록에 현재 상태를 함께 보여준다 — 토글은 "지금 어느 쪽인지"를 모르면 고를 수 없다.
+// 카톡은 폰트가 가변폭이라 공백으로 열을 맞춰도 어긋난다. 구분자(—)로 붙인다.
+function _botStateLabel(name, action) {
+  if (action === "onoff") {
+    var power = null;
+    try { power = BotManager.getPower(name); } catch(_) {}
+    var s = power ? "🟢 ON" : "🔴 OFF";
+    // 꺼져 있는데 감시자가 안 되살리는 이유가 있으면 같이 알려준다.
+    if (!power) {
+      if (!_watchWantOf(name)) s += " (감시 제외)";
+      else { var st = _watchState[name]; if (st && st.gaveUp) s += " (⛔ 복구 포기)"; }
+    }
+    return s;
+  }
+  var comp = null;
+  try { comp = BotManager.isCompiled(name); } catch(_) {}
+  return comp ? "컴파일됨" : "미컴파일";
+}
+
 function _botListText(action) {
   var names = _otherBotNames();
   var label = (action === "onoff") ? "on/off 토글" : "컴파일";
   var lines = ["[" + label + "] 어떤 봇에 적용할까요?"];
-  for (var i = 0; i < names.length; i++) lines.push((i + 1) + ". " + names[i]);
+  for (var i = 0; i < names.length; i++) {
+    lines.push((i + 1) + ". " + names[i] + " — " + _botStateLabel(names[i], action));
+  }
   lines.push("");
   lines.push("번호를 입력하세요. 여러 개는 공백/쉼표로 구분 (예: 1 3 5), 전체는 '전체'. (취소: !취소)");
   return { text: lines.join("\n"), names: names };
