@@ -139,6 +139,14 @@ function isApiProvider(hash, room) {
 }
 
 // ── 이 방에서 쓸 수 있는 키 목록 ──────────────────────────────────────
+// 키 선택 정책 공용 모듈. 못 불러오면 null → 아래 옛 경로(eligibleKeysForRoom)로 내려간다.
+var APIKEYS = (function() {
+  var p = "/sdcard/msgbot/lib/apikeys.js";
+  try { if (typeof bot.getRootPath === "function") p = bot.getRootPath() + "/../../lib/apikeys.js"; } catch(_) {}
+  try { var m = require(p); return (m && typeof m.forRoom === "function") ? m : null; } catch(_) { return null; }
+})();
+
+// [폴백] 공용 모듈을 못 쓸 때의 옛 선택 로직.
 // 내장 전역 키 + quiz_apikey 중 (이 방 등록분 OR 전역 등록분). 매 호출마다 DB 를 새로 읽어
 // 상식퀴즈봇에서 방금 등록한 키도 재시작 없이 반영된다. quiz.db 가 없거나 잠기면 내장 키만 사용.
 function eligibleKeysForRoom(room) {
@@ -182,13 +190,21 @@ function eligibleKeysForRoom(room) {
 //   - eligible 키가 0개면 { error }.
 var _keyCursor = 0;   // 호출 간 시작 키를 돌려가며 부하 분산
 function callGemini(prompt, room) {
-  var keys = eligibleKeysForRoom(room);
+  // 키 순서는 lib/apikeys.js 가 정한다 (primary → secondary → 방 전용, 쿨다운은 뒤로).
+  // 예전엔 매 호출마다 커서를 돌려 라운드로빈했는데, 그러면 primary 를 주력으로
+  // 쓴다는 말이 무의미해진다(부하가 반반 갈림). 상식퀴즈봇과 정책이 갈라지기도 했다.
+  var keys = APIKEYS ? APIKEYS.forRoom(room) : eligibleKeysForRoom(room);
   if (!keys.length) return { error: "이 방에서 사용 가능한 API 키가 없습니다." };
-  var start = _keyCursor % keys.length;
-  _keyCursor = (_keyCursor + 1) % 1000000;
   for (var tried = 0; tried < keys.length; tried++) {
-    var res = _callGeminiOnce(prompt, keys[(start + tried) % keys.length]);
-    if (res.quota429) continue;   // 이 키는 쿼터 소진 — 다음 키로
+    var k = keys[tried];
+    var res = _callGeminiOnce(prompt, k);
+    if (res.quota429) {
+      // 소진을 DB 에 남겨 상식퀴즈봇도 이 키를 피하게 한다. 실패해도 호출은 계속.
+      if (APIKEYS) { try { APIKEYS.markExhausted(k.key); } catch(_) {} }
+      continue;
+    }
+    // 쉬는 중이던 키가 살아 돌아왔으면 쿨다운을 푼다
+    if (APIKEYS && k.cooling && !res.error) { try { APIKEYS.markAlive(k.key); } catch(_) {} }
     return res;                   // 정상 응답 또는 429 외 오류 → 즉시 반환
   }
   return { quotaExhausted: true, error: "모든 API 사용량 한도 초과" };

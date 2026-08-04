@@ -98,6 +98,14 @@ var ADMIN = (function() {
   try { var m = require(p); return (m && typeof m.isAdmin === "function") ? m : null; } catch(_) { return null; }
 })();
 
+// 키 선택 정책 (lib/apikeys.js) — 제미니봇과 같은 순서를 쓰기 위한 공용 모듈.
+// 못 불러오면 null → 아래 옛 경로(eligibleProviderIndexes)로 내려간다.
+var APIKEYS = (function() {
+  var p = "/sdcard/msgbot/lib/apikeys.js";
+  try { if (typeof bot.getRootPath === "function") p = bot.getRootPath() + "/../../lib/apikeys.js"; } catch(_) {}
+  try { var m = require(p); return (m && typeof m.forRoom === "function") ? m : null; } catch(_) { return null; }
+})();
+
 function initDB() {
   DBH.withDB(DB_PATH, function(db){
   try {
@@ -508,8 +516,9 @@ function loadApiKeys() {
 //   멈추는데 증상만 봐선 한도 초과와 구분이 안 되므로, 눌러서 확인할 수단이 필요하다.
 var VERIFY_CMD = "!api검증";
 
-// 등록된 키 목록 (created ASC — 첫 항목이 기본/전역 키)
+// 등록된 키 목록. 공용 모듈이 있으면 등급(priority)·쿨다운까지 실어 온다.
 function listApiKeyRows() {
+  if (APIKEYS) return APIKEYS.list();
   return DBH.withDB(DB_PATH, function(db) {
     var cur = null, out = [];
     try {
@@ -518,11 +527,20 @@ function listApiKeyRows() {
         out.push({ key: String(cur.getString(0) || ""),
                    model: String(cur.getString(1) || DEFAULT_MODEL),
                    who: String(cur.getString(2) || "?"),
-                   room: String(cur.getString(3) || "") });
+                   room: String(cur.getString(3) || ""),
+                   priority: (out.length === 0 ? 0 : 9), cooldownUntil: 0 });
       }
     } catch (e) {} finally { if (cur) cur.close(); }
     return out;
   });
+}
+
+// 목록 한 줄의 앞머리: "[primary]" / "[secondary]" / "[명동]" (+ 쿨다운)
+function apiRowLabel(r) {
+  var tag = APIKEYS ? APIKEYS.priorityLabel(r.priority) : (r.priority === 0 ? "primary" : "방 전용");
+  if (tag === "방 전용") tag = r.room || "전역";
+  var cd = APIKEYS ? APIKEYS.cooldownLabel(r) : "";
+  return "[" + tag + "]" + (cd ? " " + cd : "");
 }
 
 // testApiKey 의 반환값을 사람이 읽을 한 줄로. quota 는 "죽은 키"가 아니라는 게 요점.
@@ -577,8 +595,7 @@ function handleVerify(msg, arg) {
       // 각 키는 자기 model 로 검사해야 한다. 모델이 다르면 결과도 달라진다.
       var st = testApiKeyWithModel(r.key, r.model);
       lines.push("");
-      // 첫 항목이 전역 기본 키 (loadApiKeys 가 created ASC 로 읽는다)
-      lines.push((i === 0 ? "[기본] " : "[" + (r.room || "전역") + "] ") + r.who);
+      lines.push((i + 1) + ". " + apiRowLabel(r) + " " + r.who);
       lines.push("   " + maskKey(r.key) + " / " + r.model);
       lines.push("   " + verifyLabel(st));
     }
@@ -600,17 +617,19 @@ function handleVerify(msg, arg) {
 //   관리자 전용. 아니면 무응답 — 등록된 키가 몇 개인지도 알려주지 않는다.
 var DELETE_CMD = "!api삭제";
 var LIST_CMD = "!api목록";
+var PRIMARY_CMD = "!api기본";      // primary 로 승격 (모든 방, 가장 먼저 씀)
+var SECONDARY_CMD = "!api보조";    // secondary 로 (모든 방, primary 가 쉴 때 씀)
 
 function apiDeleteListText(rows) {
-  var lines = ["[API 키 삭제] " + rows.length + "개"];
+  var lines = ["[API 키 목록] " + rows.length + "개"];
   for (var i = 0; i < rows.length; i++) {
     var r = rows[i];
     lines.push("");
-    lines.push((i + 1) + ". " + (i === 0 ? "[기본] " : "[" + (r.room || "전역") + "] ") + r.who);
+    lines.push((i + 1) + ". " + apiRowLabel(r) + " " + r.who);
     lines.push("   " + maskKey(r.key) + " / " + r.model);
   }
   lines.push("");
-  lines.push("삭제하려면  " + DELETE_CMD + " 번호  를 입력하세요. (예: " + DELETE_CMD + " 2)");
+  lines.push("삭제: " + DELETE_CMD + " 번호   등급: " + PRIMARY_CMD + " / " + SECONDARY_CMD + " 번호");
   return lines.join("\n");
 }
 
@@ -650,13 +669,14 @@ function handleApiDelete(msg, arg) {
     return;
   }
   var target = rows[idx];
+  var isPrimary = (target.priority === (APIKEYS ? APIKEYS.PRIORITY_PRIMARY : 0));
 
-  // 기본(전역) 키는 모든 방이 쓴다. 지우면 그 즉시 전 방의 제미니가 멈출 수 있어
-  // 확인을 한 번 더 받는다. 나머지는 등록한 방에서만 쓰이므로 바로 지운다.
-  if (idx === 0 && !m[2]) {
-    msg.reply("⚠ 1번은 기본(전역) 키입니다. 지우면 모든 방에서 제미니가 멈출 수 있습니다.\n" +
+  // primary 는 모든 방이 쓴다. 지우면 그 즉시 전 방의 제미니가 멈출 수 있어
+  // 확인을 한 번 더 받는다. 나머지는 범위가 좁으므로 바로 지운다.
+  if (isPrimary && !m[2]) {
+    msg.reply("⚠ " + (idx + 1) + "번은 primary 키입니다. 지우면 모든 방에서 제미니가 멈출 수 있습니다.\n" +
               maskKey(target.key) + " / " + target.who + "\n\n" +
-              "그래도 지우려면  " + DELETE_CMD + " 1 확인  을 입력하세요.");
+              "그래도 지우려면  " + DELETE_CMD + " " + (idx + 1) + " 확인  을 입력하세요.");
     return;
   }
 
@@ -664,11 +684,61 @@ function handleApiDelete(msg, arg) {
 
   var left = listApiKeyRows();
   var lines = ["[API 키 삭제] 완료",
-               maskKey(target.key) + " / " + target.who + " (" + (target.room || "전역") + ")",
+               maskKey(target.key) + " / " + target.who + " (" + apiRowLabel(target) + ")",
                "남은 키: " + left.length + "개"];
-  // 기본 키를 지웠으면 그 다음으로 오래된 키가 자동으로 기본이 된다(created ASC).
-  if (idx === 0 && left.length) lines.push("새 기본 키: " + maskKey(left[0].key) + " / " + left[0].who);
+  // primary 를 지우면 그 자리가 빈다. secondary 가 있어도 자동 승격되지는 않으므로
+  // (등급은 명시적으로만 바뀐다) 다음에 무엇이 쓰이는지 알려준다.
+  if (isPrimary && left.length) {
+    lines.push("⚠ primary 자리가 비었습니다. 다음 순서는 " +
+               apiRowLabel(left[0]) + " " + maskKey(left[0].key) + " 입니다.");
+    lines.push("   " + PRIMARY_CMD + " 1  로 승격해 두세요.");
+  }
   if (!left.length) lines.push("⚠ 키가 하나도 남지 않았습니다. 제미니 기능이 모두 멈춥니다.");
+  msg.reply(lines.join("\n"));
+}
+
+// ── !api기본 / !api보조 [번호] — 등급 변경 ──────────────────────────────
+//   primary  는 하나만 둔다. 새로 지정하면 기존 primary 는 secondary 로 내려간다.
+//   등급을 올리면 등록한 방과 무관하게 모든 방에서 쓰인다.
+function handleApiPriority(msg, arg, priority) {
+  if (!ADMIN || !ADMIN.isAdmin(msg.author.hash)) return;      // 무응답
+  if (!APIKEYS) { msg.reply("등급 기능을 쓸 수 없습니다 (lib/apikeys.js 를 불러오지 못함)."); return; }
+
+  var want = APIKEYS.priorityLabel(priority);
+  var rows = listApiKeyRows();
+  if (!rows.length) { msg.reply("등록된 API 키가 없습니다."); return; }
+
+  var a = String(arg || "").replace(/^\s+|\s+$/g, "");
+  if (!a) { msg.reply(apiDeleteListText(rows)); return; }
+  if (!/^[0-9]+$/.test(a)) {
+    msg.reply("번호를 알아볼 수 없습니다. (예: " + (priority === APIKEYS.PRIORITY_PRIMARY ? PRIMARY_CMD : SECONDARY_CMD) + " 2)");
+    return;
+  }
+  var idx = parseInt(a, 10) - 1;
+  if (idx < 0 || idx >= rows.length) { msg.reply("1~" + rows.length + " 사이 번호를 입력하세요."); return; }
+
+  var target = rows[idx];
+  if (target.priority === priority) {
+    msg.reply(maskKey(target.key) + " 는 이미 " + want + " 입니다.");
+    return;
+  }
+  var wasPrimary = null;
+  if (priority === APIKEYS.PRIORITY_PRIMARY) {
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].priority === APIKEYS.PRIORITY_PRIMARY) { wasPrimary = rows[i]; break; }
+    }
+  }
+  if (!APIKEYS.setPriority(target.key, priority)) { msg.reply("등급 변경에 실패했습니다."); return; }
+
+  var lines = ["[API 키 등급] " + maskKey(target.key) + " / " + target.who + " → " + want];
+  if (wasPrimary && wasPrimary.key !== target.key) {
+    lines.push(maskKey(wasPrimary.key) + " / " + wasPrimary.who + " → secondary (기존 primary)");
+  }
+  var after = listApiKeyRows();
+  lines.push("");
+  for (var j = 0; j < after.length; j++) {
+    lines.push((j + 1) + ". " + apiRowLabel(after[j]) + " " + after[j].who + "  " + maskKey(after[j].key));
+  }
   msg.reply(lines.join("\n"));
 }
 
@@ -854,6 +924,29 @@ function eligibleProviderIndexes(room) {
 }
 
 function callGemini(prompt, room) {
+  // 공용 정책(lib/apikeys.js)이 있으면 그쪽 순서를 따른다: primary → secondary →
+  // 방 전용, 쿨다운 중인 키는 뒤로. 제미니봇과 같은 순서를 쓰게 하려는 것이다.
+  if (APIKEYS) {
+    var ks = APIKEYS.forRoom(room);
+    if (!ks.length) return { quotaExhausted: true, error: "이 방에서 사용 가능한 API 키 없음" };
+    var lastErr = null;
+    for (var t = 0; t < ks.length; t++) {
+      var k = ks[t];
+      var r = _callGeminiOnce(prompt, { key: k.key, model: k.model || DEFAULT_MODEL });
+      if (r.keyError) {
+        // 429 만 쿨다운 대상. 401/403(폐기된 키)은 쉬게 해도 의미가 없고,
+        // 24시간 뒤 되살아난 것처럼 보이면 오히려 헷갈린다.
+        if (r.quota429) { try { APIKEYS.markExhausted(k.key); } catch(_) {} }
+        lastErr = r;
+        continue;
+      }
+      if (k.cooling) { try { APIKEYS.markAlive(k.key); } catch(_) {} }
+      return r;
+    }
+    return lastErr ? { quotaExhausted: true, error: lastErr.error }
+                   : { quotaExhausted: true, error: "모든 API 사용량 한도 초과" };
+  }
+
   var elig = eligibleProviderIndexes(room);
   if (!elig.length) return { quotaExhausted: true, error: "이 방에서 사용 가능한 API 키 없음" };
   // 직전 currentProviderIndex 이상인 첫 eligible 부터 시작 (소진된 키 재시도 최소화, 방이 바뀌면 자동 보정)
@@ -2241,6 +2334,8 @@ function isGameCommand(text) {
   if (text === VERIFY_CMD || text.indexOf(VERIFY_CMD + " ") === 0) return true;
   if (text === DELETE_CMD || text.indexOf(DELETE_CMD + " ") === 0) return true;
   if (text === LIST_CMD) return true;
+  if (text === PRIMARY_CMD || text.indexOf(PRIMARY_CMD + " ") === 0) return true;
+  if (text === SECONDARY_CMD || text.indexOf(SECONDARY_CMD + " ") === 0) return true;
   return false;
 }
 
@@ -2633,6 +2728,15 @@ function handleMessage(msg) {
 
     // 목록 전용 이름. 인자는 받지 않는다 — 여기서 지울 수 있으면 이름이 거짓말이 된다.
     if (text === LIST_CMD) { handleApiDelete(msg, ""); return; }
+
+    if (text === PRIMARY_CMD || text.indexOf(PRIMARY_CMD + " ") === 0) {
+      handleApiPriority(msg, text.slice(PRIMARY_CMD.length), APIKEYS ? APIKEYS.PRIORITY_PRIMARY : 0);
+      return;
+    }
+    if (text === SECONDARY_CMD || text.indexOf(SECONDARY_CMD + " ") === 0) {
+      handleApiPriority(msg, text.slice(SECONDARY_CMD.length), APIKEYS ? APIKEYS.PRIORITY_SECONDARY : 1);
+      return;
+    }
 
     if (text.indexOf("!api ") === 0) {
       var key = text.slice("!api ".length).trim();
