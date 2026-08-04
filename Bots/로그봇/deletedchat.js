@@ -19,6 +19,22 @@
 var CMD = "!지운채팅";
 var LONG_MSG_SPACER = "​".repeat(500);
 
+var DEFAULT_COUNT = 10;    // 인자 없을 때 (예전 30 — 한 통에 안 담겨 여러 통으로 쪼개졌다)
+var MAX_COUNT = 300;       // 사용자가 직접 지정할 수 있는 상한
+
+// 한 줄이 길면 그 한 건 때문에 메시지가 통째로 쪼개진다. 지운 채팅을 "훑어보는"
+// 용도라 앞부분만 있어도 충분하므로 줄 단위로 자른다.
+var LINE_MAX = 200;
+// 한 통에 담는 길이. 여기를 넘으면 다음 통으로 넘어간다.
+var CHUNK_MAX = 3500;
+// 그래도 넘치면 몇 통까지 보낼지. 도배를 막는 마지막 방어선.
+var MAX_CHUNKS = 3;
+
+function cut(s, n) {
+  var t = String(s == null ? "" : s).replace(/[\r\n]+/g, " ");
+  return t.length > n ? t.slice(0, n - 1) + "…" : t;
+}
+
 var _render = (function(){
   var p = Packages.android.os.Environment.getExternalStorageDirectory()
       .getAbsolutePath() + "/msgbot/lib/kakao-msg-render.js";
@@ -106,10 +122,10 @@ function handle(msg, kt){
   if (!chatId){ msg.reply("이 방의 chat_id 를 알 수 없습니다."); return true; }
 
   var rest = content.substring(CMD.length).trim();
-  var count = 30, namePat = null;
+  var count = DEFAULT_COUNT, namePat = null;
   if (rest.length){
     var parts = rest.split(/\s+/);
-    if (isPosInt(parts[parts.length - 1])) count = Math.min(java.lang.Integer.parseInt(parts.pop()), 300);
+    if (isPosInt(parts[parts.length - 1])) count = Math.min(java.lang.Integer.parseInt(parts.pop()), MAX_COUNT);
     var np = parts.join(" ").trim();
     if (np.length) namePat = np;
   }
@@ -123,17 +139,40 @@ function handle(msg, kt){
 
   if (!rows.length){ msg.reply("지워진 채팅이 없습니다."); return true; }
 
-  var header = CMD + " (" + rows.length + "건)" + LONG_MSG_SPACER + "\n—";
-  var out = header + "\n";
+  // 스페이서(제로폭 500자)는 카톡 미리보기를 접기 위한 것이라 첫 통에만 붙인다.
+  // 예전엔 조각마다 헤더를 다시 넣어서, 쪼개질 때마다 500자를 더 쓰고 그만큼
+  // 더 쪼개지는 악순환이었다.
+  var lines = [];
   for (var i = 0; i < rows.length; i++){
     var r = rows[i];
-    var line = r.lost
+    lines.push(r.lost
       ? "[" + formatTs(r.delAt) + " 삭제] (원본 유실)"
-      : "[" + formatTs(r.ts) + "] " + r.name + ": " + r.content;
-    if ((out.length + line.length + 1) > 3500){ msg.reply(out); out = header + "\n"; }
-    out += line + "\n";
+      : "[" + formatTs(r.ts) + "] " + r.name + ": " + cut(r.content, LINE_MAX));
   }
-  if (out.trim().length) msg.reply(out.trim());
+
+  var chunks = [], cur = "";
+  for (var j = 0; j < lines.length; j++){
+    if (cur && (cur.length + lines[j].length + 1) > CHUNK_MAX){ chunks.push(cur); cur = ""; }
+    cur += (cur ? "\n" : "") + lines[j];
+  }
+  if (cur) chunks.push(cur);
+
+  var dropped = 0;
+  if (chunks.length > MAX_CHUNKS){
+    // 몇 통까지만 보내고 나머지는 잘라낸다. 방을 도배하느니 개수를 줄여 다시 묻는 게 낫다.
+    for (var d = MAX_CHUNKS; d < chunks.length; d++) dropped += chunks[d].split("\n").length;
+    chunks = chunks.slice(0, MAX_CHUNKS);
+  }
+
+  var head = CMD + " (" + rows.length + "건)" + LONG_MSG_SPACER + "\n—\n";
+  for (var c = 0; c < chunks.length; c++){
+    var prefix = (c === 0) ? head
+               : (CMD + " (" + (c + 1) + "/" + chunks.length + ")\n—\n");
+    var tail = (c === chunks.length - 1 && dropped)
+             ? "\n\n※ " + dropped + "건은 길어서 생략했습니다. " + CMD + " " + Math.max(1, count - dropped) + " 처럼 개수를 줄여 보세요."
+             : "";
+    msg.reply(prefix + chunks[c] + tail);
+  }
   return true;
 }
 

@@ -170,7 +170,7 @@ var REGISTRY = [
     topic: "로그봇",
     aliases: ["로그", "지운채팅", "삭제채팅", "지운", "삭제", "복구", "log", "에러", "오류"],
     commands: [
-      { display: "!지운채팅",               triggers: ["!지운채팅"], desc: "이 방에서 삭제된 채팅 모아보기 (최근 30건, 오래된 순)", admin: false },
+      { display: "!지운채팅",               triggers: ["!지운채팅"], desc: "이 방에서 삭제된 채팅 모아보기 (최근 10건, 오래된 순)", admin: false },
       { display: "!지운채팅 [개수]",          triggers: ["!지운채팅"], desc: "삭제된 채팅 N건 조회 (최대 300)", admin: false },
       { display: "!지운채팅 [닉패턴] [개수]",  triggers: ["!지운채팅"], desc: "닉 패턴(*=와일드카드) 발신자의 삭제 채팅만 조회", admin: false },
       { display: "!에러",                   triggers: ["!에러"],     desc: "봇 에러 로그 모아보기 (최근 24시간 요약)", admin: true },
