@@ -1,7 +1,7 @@
 // =====================================================================
 // ask.js — 내부망 통합 질의 API(/v1/ask) 클라이언트
 //
-//   "!qwen [무엇이든]" 의 기본 경로. 어떤 처리를 할지는 서버가 고른다:
+//   "!제미니 [무엇이든]" 의 기본 경로. 어떤 처리를 할지는 서버가 고른다:
 //     · 질문에 URL 이 있으면          → URL 요약   (route=url_summary)
 //     · 최신 정보/명시적 검색 요청이면 → 웹 검색    (route=web_search)
 //     · 그 외                         → 일반 답변  (route=chat)
@@ -10,7 +10,7 @@
 //   안내도 경로를 모른 채 "답변을 생성중입니다." 하나로 나간다.
 //
 //   ⚠ mode=auto 이므로 질문이 외부 검색엔진(SearXNG 경유)으로 나갈 수 있다.
-//     API 키·개인정보는 !qwen 에 넣지 않는다. (문서: "안전 경계" 절)
+//     API 키·개인정보는 !제미니 에 넣지 않는다. (문서: "안전 경계" 절)
 //
 //   API (POST http://192.168.0.55:18082/v1/ask)
 //     요청 : { query, mode, summary_style, language, max_results }
@@ -20,11 +20,8 @@
 //              chunks/truncated(url), search(web_search) }
 //     오류 : HTTP 4xx/5xx + { detail } (문자열 또는 FastAPI 검증 배열)
 //
-//   한도(같은 IP·키 기준, 15분): 일반·URL 합쳐 10회, 검색 5회.
-//   일반 답변이 자동 검색으로 넘어가면 양쪽을 각각 1회씩 쓴다.
-//   그래서 같은 질문은 아래 캐시로 재요청하지 않는다.
-//
-//   실측(2026-08-02): chat 51초 / url_summary 7초 / web_search 42초.
+//   실측(2026-08-02, Qwen 시절): chat 51초 / url_summary 7초 / web_search 42초.
+//   2026-08-04 게이트웨이가 Gemini 로 교체돼 더 빠를 것으로 보이나 미실측.
 //
 //   RhinoJS-safe: var / function 만.
 // =====================================================================
@@ -100,54 +97,20 @@ function normSources(arr) {
   return out;
 }
 
-// ── 결과 캐시 ────────────────────────────────────────────────────────
-//  15분 한도가 빡빡해서(일반·URL 10회 / 검색 5회) 단톡방에서 같은 질문이
-//  반복되면 금방 막힌다. 질문 원문이 같으면 재요청하지 않는다.
-var CACHE_TTL_MS = 3600000;   // 1시간
-var CACHE_MAX = 30;
-var _cache = {};
-var _cacheKeys = [];
-
-function cacheGet(k) {
-  var e = _cache[k];
-  if (!e) return null;
-  if (java.lang.System.currentTimeMillis() - e.ts > CACHE_TTL_MS) {
-    delete _cache[k];
-    return null;
-  }
-  return e.value;
-}
-
-function cachePut(k, v) {
-  if (!_cache[k]) {
-    _cacheKeys.push(k);
-    while (_cacheKeys.length > CACHE_MAX) {
-      var old = _cacheKeys.shift();
-      delete _cache[old];
-    }
-  }
-  _cache[k] = { ts: java.lang.System.currentTimeMillis(), value: v };
-}
-
-function shallowCopy(o) {
-  var c = {};
-  for (var k in o) if (o.hasOwnProperty(k)) c[k] = o[k];
-  return c;
-}
+// 결과 캐시는 두지 않는다. 예전엔 15분 한도(일반·URL 10회 / 검색 5회)를 아끼려고
+// 같은 질문을 1시간 재사용했는데, 게이트웨이 개편으로 그 한도가 없어졌다.
+// 남겨두면 "어제 환율" 같은 질문에 옛 답을 돌려주는 손해만 남는다.
 
 // 질문 하나를 서버에 넘기고 결과를 받는다.
 //   반환 : { route, routeReason, answer, sources, searched, fallbackUsed,
-//            partial, truncated, title, url, elapsedMs, cached? }
+//            partial, truncated, title, url, elapsedMs }
 //   실패 : { error, connectFailed? }
-//          connectFailed 는 서버에 닿지도 못한 경우 — 호출 측에서 18080
-//          일반 답변으로 내려갈지 판단하는 데 쓴다.
+//          connectFailed 는 서버에 닿지도 못한 경우 — 호출 측에서 로컬 Gemini 키로
+//          내려갈지 판단하는 데 쓴다.
 function ask(query) {
   var q = String(query == null ? "" : query);
-  var hit = cacheGet(q);
-  if (hit) { var c = shallowCopy(hit); c.cached = true; return c; }
-
   var key = readApiKey();
-  if (!key) return { error: "Qwen API 키 파일을 읽을 수 없습니다(" + KEY_PATH + ")." };
+  if (!key) return { error: "게이트웨이 API 키 파일을 읽을 수 없습니다(" + KEY_PATH + ")." };
 
   var conn = null;
   var gotResponse = false;
@@ -214,7 +177,6 @@ function ask(query) {
       out.title = out.sources[0].title;
       out.url = out.sources[0].url;
     }
-    cachePut(q, out);
     return out;
   } catch (e) {
     var em = (e && e.message) ? e.message : String(e);
