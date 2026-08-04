@@ -57,11 +57,13 @@ function handleEval(msg) {
 
   if (lv >= admin.LEVEL_ADMIN) {
     var r = sandbox.run(code);
-    msg.reply(r.error ? ("[제한 실행] ⚠ " + r.error) : ("[제한 실행] " + r.value));
+    msg.reply(r.error ? ("⚠ " + r.error) : String(r.value));
     return;
   }
 
-  msg.reply("권한이 없습니다. 관리자만 쓸 수 있습니다. (!내권한 으로 확인)");
+  // 권한 없으면 아무 응답도 하지 않는다. 거절 문구는 그 방 전체가 보는 공개
+  // 메시지라, 명령이 있다는 사실과 누가 시도했는지를 드러낸다.
+
 }
 
 // =====================================================================
