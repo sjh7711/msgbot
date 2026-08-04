@@ -597,7 +597,7 @@ function handleVerify(msg, arg) {
       var r = rows[i];
       // 저장된 model 이 아니라 "실제로 쓰일 모델" 로 검사해야 결과가 맞는다.
       // (옛 행에는 3.1 이 들어 있지만 지금은 사슬을 따라 3.5 부터 시도한다)
-      var use = APIKEYS ? APIKEYS.modelsFor(r.key, r.model)[0] : (r.model || DEFAULT_MODEL);
+      var use = apiRowModel(r);
       var st = testApiKeyWithModel(r.key, use);
       var note = "";
       // 첫 모델이 없으면 아래 모델로 내려가 다시 본다 — 그 사실도 같이 알린다.
@@ -629,13 +629,21 @@ var PRIMARY_CMD = "!api기본";      // primary 로 승격 (모든 방, 가장 �
 var SECONDARY_CMD = "!api보조";    // secondary 로 (모든 방, primary 가 쉴 때 씀)
 var ROOMONLY_CMD = "!api방전용";   // 등록한 방에서만 쓰도록 강등
 
+// 목록에 찍는 모델은 "저장된 값" 이 아니라 "실제로 먼저 시도할 모델" 이다.
+// quiz_apikey.model 은 등록 시점의 기본값이 박제된 것이라, 기본 모델을 바꾸고 나면
+// 실제 호출과 어긋난다. 어긋난 값을 보여주면 왜 안 바뀌었나 오해하게 된다.
+function apiRowModel(r) {
+  if (!APIKEYS) return r.model || DEFAULT_MODEL;
+  return APIKEYS.modelsFor(r.key, r.model)[0];
+}
+
 function apiDeleteListText(rows) {
   var lines = ["[API 키 목록] " + rows.length + "개"];
   for (var i = 0; i < rows.length; i++) {
     var r = rows[i];
     lines.push("");
     lines.push((i + 1) + ". " + apiRowLabel(r) + " " + r.who);
-    lines.push("   " + maskKey(r.key) + " / " + r.model);
+    lines.push("   " + maskKey(r.key) + " / " + apiRowModel(r));
   }
   lines.push("");
   lines.push("삭제: " + DELETE_CMD + " 번호");
