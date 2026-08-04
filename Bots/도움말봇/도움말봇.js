@@ -62,7 +62,9 @@ var REGISTRY = [
       { display: "!이의신청 [N]",        triggers: ["!이의신청"],     desc: "최근(또는 N)회차 정답 재검증 (오답자만)", admin: false },
       { display: "!api [KEY]",          triggers: ["!api"],         desc: "Gemini API 키 등록 (토픽 한도 45회로 상향)", admin: false },
       { display: "!api검증 [KEY]",       triggers: ["!api검증"],      desc: "그 키가 아직 살아 있는지 실제로 호출해 확인", admin: false },
-      { display: "!api검증 전체",        triggers: ["!api검증"],      desc: "등록된 모든 키의 유효성 점검 (관리자)", admin: true }
+      { display: "!api검증 전체",        triggers: ["!api검증"],      desc: "등록된 모든 키의 유효성 점검 (관리자)", admin: true },
+      { display: "!api목록",            triggers: ["!api목록"],      desc: "등록된 키 목록을 번호와 함께 표시 (관리자)", admin: true },
+      { display: "!api삭제 [번호]",      triggers: ["!api삭제"],      desc: "그 번호의 키 삭제. 1번(기본 키)은 '확인'을 한 번 더 받음", admin: true }
     ]
   },
   {

@@ -586,6 +586,92 @@ function handleVerify(msg, arg) {
   }).start();
 }
 
+// ── !api삭제 [번호] — 등록된 키 제거 ────────────────────────────────────
+//   !api삭제        번호가 붙은 목록을 보여준다
+//   !api삭제 2      2번을 삭제
+//   !api삭제 1 확인  기본(전역) 키는 확인을 한 번 더 받는다
+//
+//   번호를 맨몸으로("2") 받지 않는 이유: 이 봇은 숫자 답안을 받는 퀴즈봇이라
+//   진행 중인 퀴즈의 답안을 삭제 선택으로 먹어버린다. 명령 뒤에 붙여 받는다.
+//
+//   목록만 보려면 !api목록 (= !api삭제 를 인자 없이 부른 것과 같다). 지우는 동작이
+//   "목록" 이라는 이름 아래 있으면 위험하므로, 삭제는 !api삭제 쪽에만 둔다.
+//
+//   관리자 전용. 아니면 무응답 — 등록된 키가 몇 개인지도 알려주지 않는다.
+var DELETE_CMD = "!api삭제";
+var LIST_CMD = "!api목록";
+
+function apiDeleteListText(rows) {
+  var lines = ["[API 키 삭제] " + rows.length + "개"];
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    lines.push("");
+    lines.push((i + 1) + ". " + (i === 0 ? "[기본] " : "[" + (r.room || "전역") + "] ") + r.who);
+    lines.push("   " + maskKey(r.key) + " / " + r.model);
+  }
+  lines.push("");
+  lines.push("삭제하려면  " + DELETE_CMD + " 번호  를 입력하세요. (예: " + DELETE_CMD + " 2)");
+  return lines.join("\n");
+}
+
+// DB 에서 지우고 런타임 API_KEYS 에서도 뺀다. 둘 중 하나만 하면 재컴파일 전까지
+// 죽은 키를 계속 호출하거나(런타임 잔존) 이미 지운 키가 되살아난다(DB 잔존).
+function deleteApiKey(key) {
+  var ok = DBH.withDB(DB_PATH, function(db) {
+    try { db.execSQL("DELETE FROM quiz_apikey WHERE key = ?", [key]); } catch (e) { return false; }
+    return true;
+  });
+  if (!ok) return false;
+  for (var i = API_KEYS.length - 1; i >= 0; i--) {
+    if (API_KEYS[i] && API_KEYS[i].key === key) API_KEYS.splice(i, 1);
+  }
+  // 커서가 배열 밖이나 엉뚱한 키를 가리키지 않도록 되돌린다
+  if (currentProviderIndex >= API_KEYS.length) currentProviderIndex = 0;
+  return true;
+}
+
+function handleApiDelete(msg, arg) {
+  if (!ADMIN || !ADMIN.isAdmin(msg.author.hash)) return;   // 무응답
+
+  var a = String(arg || "").replace(/^\s+|\s+$/g, "");
+  var rows = listApiKeyRows();
+  if (!rows.length) { msg.reply("등록된 API 키가 없습니다."); return; }
+
+  if (!a) { msg.reply(apiDeleteListText(rows)); return; }
+
+  var m = /^([0-9]+)(\s+확인)?$/.exec(a);
+  if (!m) {
+    msg.reply("번호를 알아볼 수 없습니다. " + DELETE_CMD + " 번호  형식으로 입력하세요. (예: " + DELETE_CMD + " 2)");
+    return;
+  }
+  var idx = parseInt(m[1], 10) - 1;
+  if (idx < 0 || idx >= rows.length) {
+    msg.reply("1~" + rows.length + " 사이 번호를 입력하세요.");
+    return;
+  }
+  var target = rows[idx];
+
+  // 기본(전역) 키는 모든 방이 쓴다. 지우면 그 즉시 전 방의 제미니가 멈출 수 있어
+  // 확인을 한 번 더 받는다. 나머지는 등록한 방에서만 쓰이므로 바로 지운다.
+  if (idx === 0 && !m[2]) {
+    msg.reply("⚠ 1번은 기본(전역) 키입니다. 지우면 모든 방에서 제미니가 멈출 수 있습니다.\n" +
+              maskKey(target.key) + " / " + target.who + "\n\n" +
+              "그래도 지우려면  " + DELETE_CMD + " 1 확인  을 입력하세요.");
+    return;
+  }
+
+  if (!deleteApiKey(target.key)) { msg.reply("삭제에 실패했습니다."); return; }
+
+  var left = listApiKeyRows();
+  var lines = ["[API 키 삭제] 완료",
+               maskKey(target.key) + " / " + target.who + " (" + (target.room || "전역") + ")",
+               "남은 키: " + left.length + "개"];
+  // 기본 키를 지웠으면 그 다음으로 오래된 키가 자동으로 기본이 된다(created ASC).
+  if (idx === 0 && left.length) lines.push("새 기본 키: " + maskKey(left[0].key) + " / " + left[0].who);
+  if (!left.length) lines.push("⚠ 키가 하나도 남지 않았습니다. 제미니 기능이 모두 멈춥니다.");
+  msg.reply(lines.join("\n"));
+}
+
 // !api 로 등록: DB 에 영구 저장(누가/어느 방 닉네임으로 줬는지 포함) + 런타임 API_KEYS 에 즉시 추가.
 // 반환: "added" | "exists" | "error"
 function registerApiKey(key, name, hash, room) {
@@ -2153,6 +2239,8 @@ function isGameCommand(text) {
   if (text.indexOf("!ㅅㅅ ") === 0 && text.length > 4) return true;
   if (text.indexOf("!api ") === 0 && text.length > 5) return true;
   if (text === VERIFY_CMD || text.indexOf(VERIFY_CMD + " ") === 0) return true;
+  if (text === DELETE_CMD || text.indexOf(DELETE_CMD + " ") === 0) return true;
+  if (text === LIST_CMD) return true;
   return false;
 }
 
@@ -2532,11 +2620,19 @@ function handleMessage(msg) {
       return;
     }
 
-    // "!api검증" 은 "!api " 에 걸리지 않지만(공백이 없음), 의도를 분명히 하려고 먼저 본다.
+    // "!api검증"/"!api삭제" 는 "!api " 에 걸리지 않지만(공백이 없음), 의도를 분명히 하려고 먼저 본다.
     if (text === VERIFY_CMD || text.indexOf(VERIFY_CMD + " ") === 0) {
       handleVerify(msg, text.slice(VERIFY_CMD.length));
       return;
     }
+
+    if (text === DELETE_CMD || text.indexOf(DELETE_CMD + " ") === 0) {
+      handleApiDelete(msg, text.slice(DELETE_CMD.length));
+      return;
+    }
+
+    // 목록 전용 이름. 인자는 받지 않는다 — 여기서 지울 수 있으면 이름이 거짓말이 된다.
+    if (text === LIST_CMD) { handleApiDelete(msg, ""); return; }
 
     if (text.indexOf("!api ") === 0) {
       var key = text.slice("!api ".length).trim();
