@@ -33,7 +33,9 @@ const bot = BotManager.getCurrentBot();
 const BOT_NAME = "제미니봇";
 
 // ── 설정 ─────────────────────────────────────────────────────────────
-const DEFAULT_MODEL = "gemini-3.1-flash-lite";
+// 사슬의 첫 모델. 이 모델이 없으면 lib/apikeys.js 의 MODEL_CHAIN 을 따라
+// gemini-3.1-flash-lite 로 자동으로 내려간다.
+const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 
 // 긴 답변 미리보기 채움용 제로폭 공백(U+200B) 스페이서.
 var LONG_MSG_SPACER = "​".repeat(500);
@@ -197,7 +199,19 @@ function callGemini(prompt, room) {
   if (!keys.length) return { error: "이 방에서 사용 가능한 API 키가 없습니다." };
   for (var tried = 0; tried < keys.length; tried++) {
     var k = keys[tried];
-    var res = _callGeminiOnce(prompt, k);
+    // 키 하나마다 모델 사슬을 훑는다: 3.5 → 3.1. "그 모델 없음" 일 때만 내려간다.
+    var res = null;
+    if (APIKEYS) {
+      var models = APIKEYS.modelsFor(k.key, k.model);
+      for (var mi = 0; mi < models.length; mi++) {
+        res = _callGeminiOnce(prompt, { key: k.key, model: models[mi] });
+        if (!res.modelError) break;
+        try { APIKEYS.markModelDown(k.key, models[mi]); } catch(_) {}
+      }
+      if (res && res.modelError) continue;   // 이 키로는 쓸 모델이 없다 → 다음 키
+    } else {
+      res = _callGeminiOnce(prompt, k);
+    }
     if (res.quota429) {
       // 소진을 DB 에 남겨 상식퀴즈봇도 이 키를 피하게 한다. 실패해도 호출은 계속.
       if (APIKEYS) { try { APIKEYS.markExhausted(k.key); } catch(_) {} }
@@ -242,6 +256,10 @@ function _callGeminiOnce(prompt, provider) {
     }
 
     if (code < 200 || code >= 300) {
+      // 모델 문제는 키를 바꿔도 그대로다 — 다음 모델로 내려가야 한다.
+      if (APIKEYS && APIKEYS.isModelError(code, raw)) {
+        return { modelError: true, error: "모델 " + provider.model + " 사용 불가: " + raw.slice(0, 160) };
+      }
       if (code === 429) return { quota429: true, error: "HTTP 429" };
       return { error: "HTTP " + code + ": " + raw.slice(0, 200) };
     }

@@ -31,7 +31,9 @@ const BOT_NAME = "상식퀴즈봇";
 // 각 provider: { key, model } — 429(쿼터 초과) 발생 시 다음 항목으로 라운드로빈.
 // 아래는 기본(코드 내장) 키. 사용자가 !api 로 등록한 키는 quiz_apikey 에 저장되고,
 // 시작 시 loadApiKeys() 가 이 배열 뒤에 append 한다. (const 지만 배열 mutate 는 허용됨)
-const DEFAULT_MODEL = "gemini-3.1-flash-lite";
+// 사슬의 첫 모델. 이 모델이 없으면 lib/apikeys.js 의 MODEL_CHAIN 을 따라
+// gemini-3.1-flash-lite 로 자동으로 내려간다.
+const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const API_KEYS = [];
 var currentProviderIndex = 0;
 
@@ -545,9 +547,10 @@ function apiRowLabel(r) {
 
 // testApiKey 의 반환값을 사람이 읽을 한 줄로. quota 는 "죽은 키"가 아니라는 게 요점.
 function verifyLabel(status) {
-  if (status === "ok")      return "✅ 정상";
-  if (status === "quota")   return "⚠ 한도 초과 (키는 유효)";
-  if (status === "invalid") return "❌ 무효 — 폐기됐거나 잘못된 키";
+  if (status === "ok")        return "✅ 정상";
+  if (status === "quota")     return "⚠ 한도 초과 (키는 유효)";
+  if (status === "invalid")   return "❌ 무효 — 폐기됐거나 잘못된 키";
+  if (status === "modelmiss") return "❌ 사슬의 어느 모델도 이 키로 못 씀";
   return "❓ 통신 오류 — 키 상태 확인 불가";
 }
 
@@ -592,11 +595,16 @@ function handleVerify(msg, arg) {
     var lines = ["[API 키 검증] " + rows.length + "개"];
     for (var i = 0; i < rows.length; i++) {
       var r = rows[i];
-      // 각 키는 자기 model 로 검사해야 한다. 모델이 다르면 결과도 달라진다.
-      var st = testApiKeyWithModel(r.key, r.model);
+      // 저장된 model 이 아니라 "실제로 쓰일 모델" 로 검사해야 결과가 맞는다.
+      // (옛 행에는 3.1 이 들어 있지만 지금은 사슬을 따라 3.5 부터 시도한다)
+      var use = APIKEYS ? APIKEYS.modelsFor(r.key, r.model)[0] : (r.model || DEFAULT_MODEL);
+      var st = testApiKeyWithModel(r.key, use);
+      var note = "";
+      // 첫 모델이 없으면 아래 모델로 내려가 다시 본다 — 그 사실도 같이 알린다.
+      if (st === "modelmiss") { st = testApiKey(r.key); note = "  (" + use + " 없음 → 사슬 재시도)"; }
       lines.push("");
       lines.push((i + 1) + ". " + apiRowLabel(r) + " " + r.who);
-      lines.push("   " + maskKey(r.key) + " / " + r.model);
+      lines.push("   " + maskKey(r.key) + " / " + use + note);
       lines.push("   " + verifyLabel(st));
     }
     try { msgQueue.put({ type: "api_verify_result", room: rm2, lines: lines }); } catch (_) {}
@@ -770,7 +778,16 @@ function registerApiKey(key, name, hash, room) {
 
 // 키를 실제로 한 번 호출해 유효성 검증. 네트워크 호출이므로 워커 스레드가 아닌 별도 스레드에서 호출할 것.
 // 반환: "ok"(정상응답) | "quota"(키는 유효하나 429) | "invalid"(잘못된 키) | "neterr"(통신 오류)
-function testApiKey(key) { return testApiKeyWithModel(key, DEFAULT_MODEL); }
+// 모델 사슬을 그대로 따라간다. 3.5 가 아직 안 열린 키를 "무효" 로 보고하면
+// 멀쩡한 키를 버리게 되므로, 모델이 없으면 다음 모델로 내려가서 다시 본다.
+function testApiKey(key) {
+  var models = APIKEYS ? APIKEYS.MODEL_CHAIN : [DEFAULT_MODEL];
+  for (var i = 0; i < models.length; i++) {
+    var st = testApiKeyWithModel(key, models[i]);
+    if (st !== "modelmiss") return st;
+  }
+  return "modelmiss";
+}
 
 // 등록된 키는 저마다 model 이 다를 수 있다. 그 키가 실제로 쓰는 모델로 찔러야
 // 결과가 맞는다 (모델이 사라진 경우와 키가 죽은 경우를 섞지 않기 위해서도).
@@ -804,6 +821,8 @@ function testApiKeyWithModel(key, model) {
       while ((ln = rd.readLine()) !== null) sb.append(ln);
       rd.close(); raw = String(sb.toString());
     }
+    // 모델이 없는 것과 키가 죽은 것을 섞으면 안 된다 — 먼저 가려낸다.
+    if (APIKEYS && APIKEYS.isModelError(code, raw)) return "modelmiss";
     if (code === 429 || raw.indexOf("RESOURCE_EXHAUSTED") !== -1) return "quota";
     if (code === 400 || code === 403 ||
         raw.indexOf("API_KEY_INVALID") !== -1 || raw.indexOf("API key not valid") !== -1) return "invalid";
@@ -932,7 +951,15 @@ function callGemini(prompt, room) {
     var lastErr = null;
     for (var t = 0; t < ks.length; t++) {
       var k = ks[t];
-      var r = _callGeminiOnce(prompt, { key: k.key, model: k.model || DEFAULT_MODEL });
+      // 키 하나마다 모델 사슬을 훑는다: 3.5 → 3.1. "그 모델 없음" 일 때만 내려간다.
+      var models = APIKEYS.modelsFor(k.key, k.model), r = null;
+      for (var mi = 0; mi < models.length; mi++) {
+        r = _callGeminiOnce(prompt, { key: k.key, model: models[mi] });
+        if (!r.modelError) break;
+        try { APIKEYS.markModelDown(k.key, models[mi]); } catch(_) {}
+        lastErr = r;
+      }
+      if (r && r.modelError) continue;      // 이 키로는 쓸 모델이 없다 → 다음 키
       if (r.keyError) {
         // 429 만 쿨다운 대상. 401/403(폐기된 키)은 쉬게 해도 의미가 없고,
         // 24시간 뒤 되살아난 것처럼 보이면 오히려 헷갈린다.
@@ -1008,6 +1035,11 @@ function _callGeminiOnce(prompt, provider) {
     }
 
     if (code < 200 || code >= 300) {
+      // 모델 문제를 먼저 가려낸다. 없는 모델을 부른 400/404 가 "잘못된 키" 로
+      // 분류되면 멀쩡한 키를 차례로 버리다가 전부 죽었다고 결론 내린다.
+      if (APIKEYS && APIKEYS.isModelError(code, raw)) {
+        return { modelError: true, error: "모델 " + provider.model + " 사용 불가: " + raw.slice(0, 200) };
+      }
       // keyError=true 면 callGemini 가 다음 키로 회전한다.
       if (code === 429) {
         // 사용량 한도 초과
