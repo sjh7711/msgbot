@@ -627,6 +627,7 @@ var DELETE_CMD = "!api삭제";
 var LIST_CMD = "!api목록";
 var PRIMARY_CMD = "!api기본";      // primary 로 승격 (모든 방, 가장 먼저 씀)
 var SECONDARY_CMD = "!api보조";    // secondary 로 (모든 방, primary 가 쉴 때 씀)
+var ROOMONLY_CMD = "!api방전용";   // 등록한 방에서만 쓰도록 강등
 
 function apiDeleteListText(rows) {
   var lines = ["[API 키 목록] " + rows.length + "개"];
@@ -637,7 +638,8 @@ function apiDeleteListText(rows) {
     lines.push("   " + maskKey(r.key) + " / " + r.model);
   }
   lines.push("");
-  lines.push("삭제: " + DELETE_CMD + " 번호   등급: " + PRIMARY_CMD + " / " + SECONDARY_CMD + " 번호");
+  lines.push("삭제: " + DELETE_CMD + " 번호");
+  lines.push("등급: " + PRIMARY_CMD + " / " + SECONDARY_CMD + " / " + ROOMONLY_CMD + " 번호");
   return lines.join("\n");
 }
 
@@ -728,6 +730,15 @@ function handleApiPriority(msg, arg, priority) {
   var target = rows[idx];
   if (target.priority === priority) {
     msg.reply(maskKey(target.key) + " 는 이미 " + want + " 입니다.");
+    return;
+  }
+  // 방 전용은 added_by_room 으로 범위를 정한다. 그게 비어 있으면 어느 방에도
+  // 걸리지 않아 사실상 죽은 키가 된다 — 지우는 것과 다름없으니 막는다.
+  if (priority === APIKEYS.PRIORITY_ROOM && !target.room) {
+    msg.reply("이 키는 등록된 방 정보가 없어 방 전용으로 내릴 수 없습니다.\n" +
+              "(내리면 어느 방에서도 쓰이지 않습니다)\n" +
+              maskKey(target.key) + " / " + target.who + "\n\n" +
+              "정말 안 쓸 거라면 " + DELETE_CMD + " " + (idx + 1) + " 로 삭제하세요.");
     return;
   }
   var wasPrimary = null;
@@ -2368,6 +2379,7 @@ function isGameCommand(text) {
   if (text === LIST_CMD) return true;
   if (text === PRIMARY_CMD || text.indexOf(PRIMARY_CMD + " ") === 0) return true;
   if (text === SECONDARY_CMD || text.indexOf(SECONDARY_CMD + " ") === 0) return true;
+  if (text === ROOMONLY_CMD || text.indexOf(ROOMONLY_CMD + " ") === 0) return true;
   return false;
 }
 
@@ -2767,6 +2779,10 @@ function handleMessage(msg) {
     }
     if (text === SECONDARY_CMD || text.indexOf(SECONDARY_CMD + " ") === 0) {
       handleApiPriority(msg, text.slice(SECONDARY_CMD.length), APIKEYS ? APIKEYS.PRIORITY_SECONDARY : 1);
+      return;
+    }
+    if (text === ROOMONLY_CMD || text.indexOf(ROOMONLY_CMD + " ") === 0) {
+      handleApiPriority(msg, text.slice(ROOMONLY_CMD.length), APIKEYS ? APIKEYS.PRIORITY_ROOM : 9);
       return;
     }
 
