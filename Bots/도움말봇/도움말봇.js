@@ -160,15 +160,10 @@ var REGISTRY = [
   },
   {
     topic: "제미니봇",
-    aliases: ["제미니", "ㅈㅁㄴ", "gemini", "질문", "ai", "대화요약", "요약", "채팅요약",
-              "qwen", "큐원", "llm", "내부망", "검색"],
+    aliases: ["제미니", "ㅈㅁㄴ", "gemini", "질문", "ai", "요약", "llm", "내부망", "검색", "링크"],
     commands: [
-      { display: "!제미니 [질문] / !ㅈㅁㄴ [질문]", triggers: ["!제미니", "!ㅈㅁㄴ"], desc: "Gemini로 질문에 답변 (키 제공자 무제한, 그 외 1일 10회). 한도를 다 쓰면 내부망 Qwen이 대신 답변", admin: false },
-      { display: "!qwen [질문]",           triggers: ["!qwen"],     desc: "내부망 Qwen에 질문 (횟수 제한 없음, 생성이 느려 오래 걸릴 수 있음). 최신 정보가 필요하면 웹을 검색해 출처와 함께 답변", admin: false },
-      { display: "!qwen [URL]",            triggers: ["!qwen"],     desc: "링크를 읽고 한국어로 요약. 예) !qwen https://... 요약해줘", admin: false },
-      { display: "!대화요약",             triggers: ["!대화요약"], desc: "이 방 최근 3시간(기본) 대화를 시간대별로 요약", admin: false },
-      { display: "!대화요약 [N]",          triggers: ["!대화요약"], desc: "최근 N시간(최대 12) 대화 요약. 길면 자동 분할요약(map-reduce)", admin: false },
-      { display: "!대화요약 [N] [관심사]",  triggers: ["!대화요약"], desc: "특정 키워드/사람 관련 주제를 더 상세히 요약", admin: false }
+      { display: "!제미니 [질문] / !ㅈㅁㄴ [질문]", triggers: ["!제미니", "!ㅈㅁㄴ"], desc: "내부망 LLM에 질문 (키 제공자 무제한, 그 외 1일 10회). 최신 정보가 필요하면 웹을 검색해 출처와 함께 답변", admin: false },
+      { display: "!제미니 [URL]",          triggers: ["!제미니", "!ㅈㅁㄴ"], desc: "링크를 읽고 한국어로 요약. 예) !제미니 https://... 요약해줘", admin: false }
     ]
   },
   {

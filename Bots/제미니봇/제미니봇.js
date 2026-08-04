@@ -1,24 +1,25 @@
 const bot = BotManager.getCurrentBot();
 
 // =====================================================================
-// 제미니봇 — LLM 질의응답 (Gemini 주 API + 내부망 Qwen 서브 API)
+// 제미니봇 — LLM 질의응답 (내부망 게이트웨이 주 경로 + 로컬 Gemini 키 폴백)
 //
 // 명령어:
 //   !제미니 [질문] / !ㅈㅁㄴ [질문]
-//       : 질문을 Gemini 에 보내고 답변을 받아옴. 질문 길이 제한 없음.
-//       : 사용 한도 — API 키 제공자(이 방)는 무제한, 그 외는 1일 10회 (한국시간 자정 리셋).
-//   !qwen [질문]   (구 qwen봇 통합)
-//       : 내부망 Qwen 서버에 직접 질문. 무료라 사용 한도를 세지 않는다.
-//   !대화요약 …    (summary.js)
+//       : 내부망 게이트웨이(192.168.0.55:18082 /v1/ask)에 질문한다.
+//         게이트웨이가 일반 답변·URL 요약·웹 검색 중 알아서 고른다.
+//       : 사용 한도 — 이 방에 키를 제공한 사람은 무제한, 그 외 1일 10회(KST 자정 리셋).
 //
-// 제미니 → Qwen 폴백:
-//   ① 개인 1일 한도 소진  ② 이 방의 모든 제미니 키가 429
-//   두 경우에만 Qwen 으로 넘긴다. 차단·파싱오류 등 다른 실패는 그대로 오류로 알린다
-//   (진짜 문제가 Qwen 답변 뒤에 숨지 않도록).
-//   Qwen 은 ≈2.4 tok/s 로 느려서 폴백 시 먼저 안내 메시지를 보낸다.
-//   대화요약은 출력이 길어 Qwen 으로는 수 분이 걸리므로 폴백 대상에서 제외한다.
+// 게이트웨이 → 로컬 키 폴백:
+//   게이트웨이에 닿지 못하거나(PC 꺼짐·네트워크 단절) 한도를 넘으면 이 방에
+//   등록된 Gemini 키로 직접 답한다.
+//   단, 질문에 링크가 있으면 폴백하지 않는다 — 로컬 키는 문서를 읽지 못한 채
+//   그럴듯한 요약을 지어낸다. 틀린 답을 주느니 못 한다고 말하는 게 낫다.
 //
-// API 키:
+// 2026-08-04 구조 변경:
+//   내부망 LLM 이 Qwen → Gemini 게이트웨이로 교체되면서 !qwen 과 qwen.js 를
+//   없앴다. !대화요약(summary.js)도 함께 제거했다.
+//
+// API 키 (폴백용):
 //   상식퀴즈봇과 동일한 키 저장소(quiz.db 의 quiz_apikey)를 "읽기"만 한다.
 //   사용자가 상식퀴즈봇의 !api 로 등록한 키가 그대로 적용된다.
 //   - 코드 내장 키(room 없음/빈값)는 모든 방 공용.
@@ -315,25 +316,9 @@ var kt = (function() {
   return require(libPath);
 })();
 
-// "!대화요약 N" 모듈 (같은 봇 디렉터리). chat_logs → 주제별 요약(Gemini 재사용).
-var summaryMod = (function() {
-  var p = "/sdcard/msgbot/Bots/제미니봇/summary.js";
-  try { if (typeof bot.getRootPath === "function") p = bot.getRootPath() + "/summary.js"; } catch(_) {}
-  return require(p);
-})();
-
-// 내부망 Qwen 클라이언트 (구 qwen봇 통합). "!qwen" 직접 호출 + 제미니 한도 소진 시 폴백.
-var qwen = (function() {
-  var p = "/sdcard/msgbot/Bots/제미니봇/qwen.js";
-  try { if (typeof bot.getRootPath === "function") p = bot.getRootPath() + "/qwen.js"; } catch(_) {}
-  return require(p);
-})();
-
-function isSummaryCommand(text) { return text.indexOf(summaryMod.CMD) === 0; }
-
-// 통합 질의 모듈 (/v1/ask). 일반 답변·URL 요약·웹 검색 중 무엇을 할지는 서버가
-// 고르므로 클라이언트에서 갈래를 나누지 않는다.
-// 못 불러오면 null → 아래에서 qwen.js(18080) 일반 답변으로만 동작한다
+// 내부망 게이트웨이 클라이언트 (/v1/ask). 일반 답변·URL 요약·웹 검색 중 무엇을
+// 할지는 서버가 고르므로 클라이언트에서 갈래를 나누지 않는다.
+// 못 불러오면 null → 로컬 키 직접 호출로만 동작한다
 // (이 파일 하나 때문에 봇 전체가 컴파일 실패하지 않도록).
 var askMod = (function() {
   try {
@@ -344,7 +329,12 @@ var askMod = (function() {
   } catch(_) { return null; }
 })();
 
-function isQwenCommand(text) { return text.indexOf("!qwen") === 0; }
+// 폴백 가능 여부 판정용 URL 검출.
+//   게이트웨이는 링크를 직접 읽지만 로컬 Gemini 키는 그런 능력이 없다. 링크가 든
+//   질문을 폴백하면 문서를 못 본 채 그럴듯한 요약을 지어낸다 — 틀린 답보다
+//   "지금은 못 한다" 가 낫다. 라우팅이 아니라 이 판단에만 쓴다.
+var URL_RE = /https?:\/\/[^\s<>"']+|(^|\s)www\.[^\s<>"']+/i;
+function hasUrl(text) { return URL_RE.test(String(text == null ? "" : text)); }
 
 // /v1/ask 결과를 카톡 메시지로 꾸민다.
 // 첫 줄 + 제로폭 스페이서로 카카오톡 미리보기를 채우는 건 제미니와 같은 형식.
@@ -377,79 +367,57 @@ function formatAskResult(res, tag) {
   return "답변입니다. (" + tag + kind + ")" + LONG_MSG_SPACER + "\n" + lines.join("\n");
 }
 
-// ── Qwen 답변 전송 (공통) ────────────────────────────────────────────
-// 기본 경로는 /v1/ask. 서버에 닿지 못할 때만 18080 일반 답변으로 내려간다
-// (같은 호스트라 대개 같이 죽지만, 요약 서비스만 내려간 경우를 건진다).
-function sendQwenAnswer(room, question, tag) {
+// ── 답변 생성 (게이트웨이 우선, 로컬 키 폴백) ────────────────────────
+// 1순위는 내부망 게이트웨이. 게이트웨이가 URL 수집·웹 검색까지 해준다.
+// 로컬 Gemini 키는 게이트웨이를 못 쓸 때의 폴백이며, 순수 대화만 가능하다.
+//
+// 폴백을 거는 경우
+//   · 게이트웨이에 닿지 못함 (PC 꺼짐·네트워크 단절) → connectFailed
+//   · 게이트웨이 한도 초과 / 5xx
+// 폴백을 걸지 않는 경우
+//   · 질문에 링크가 있음 — 로컬 키는 문서를 읽지 못한 채 요약을 지어낸다.
+//     틀린 답을 주느니 못 한다고 말하는 게 낫다.
+//   · 422 같은 요청 자체의 문제 — 키를 바꿔도 결과가 같다.
+function gatewayFallbackAllowed(r, question) {
+  if (!r || !r.error) return false;
+  if (hasUrl(question)) return false;
+  return true;
+}
+
+function sendAnswer(room, question, hash, isProvider) {
+  var viaGateway = false;
+
   if (askMod) {
     var r = askMod.ask(question);
     if (r && !r.error) {
-      try { bot.send(room, formatAskResult(r, tag)); } catch(_) {}
+      try { bot.send(room, formatAskResult(r, "내부망")); } catch(_) {}
+      if (!isProvider) { try { recordUse(hash); } catch(_) {} }
       return true;
     }
-    if (r && !r.connectFailed) {
-      try { bot.send(room, "⚠ Qwen 답변 실패: " + r.error); } catch(_) {}
+    if (!gatewayFallbackAllowed(r, question)) {
+      var why = (r && r.error) ? r.error : "알 수 없음";
+      var extra = hasUrl(question)
+        ? "\n(링크가 든 질문은 내부망이 문서를 직접 읽어야 합니다. 로컬 키로는 대신할 수 없습니다.)"
+        : "";
+      try { bot.send(room, "⚠ 답변 생성 실패: " + why + extra); } catch(_) {}
       return false;
     }
+    // 여기까지 왔으면 게이트웨이를 못 썼고 폴백이 가능한 상태
+    try {
+      bot.send(room, "⚠ 내부망 응답을 받지 못해 이 방에 등록된 제미니 키로 답합니다.\n사유: " + r.error);
+    } catch(_) {}
   }
-  var res = qwen.ask(question);
-  if (res && typeof res.text === "string" && res.text) {
-    try { bot.send(room, "답변입니다. (" + tag + ")" + LONG_MSG_SPACER + "\n" + res.text); } catch(_) {}
+
+  var res = callGemini(buildPrompt(question), room);
+  if (res && typeof res.text === "string" && res.text.trim()) {
+    if (!isProvider) { try { recordUse(hash); } catch(_) {} }   // 성공 응답만 한도에 반영
+    try { bot.send(room, "답변입니다. (제미니 키)" + LONG_MSG_SPACER + "\n" + res.text.trim()); } catch(_) {}
     return true;
   }
-  try { bot.send(room, "⚠ Qwen 답변 실패: " + ((res && res.error) ? res.error : "알 수 없음")); } catch(_) {}
+  var err = (res && res.error) ? res.error
+          : (res && res.quotaExhausted) ? "이 방 제미니 키도 모두 한도 초과" : "알 수 없음";
+  try { bot.send(room, "⚠ 답변 생성 실패: " + err); } catch(_) {}
   return false;
-}
-
-// "!qwen [무엇이든]" — 내부망 서버라 우리 쪽에서 사용 횟수를 세지 않는다.
-//   URL 이 섞여 있으면 요약, 최신 정보가 필요하면 웹 검색, 나머지는 일반 답변.
-//   무엇을 할지는 서버(/v1/ask, mode=auto)가 고르므로 사용자는 형식을 몰라도 된다.
-//   "!qwen <URL> 요약해줘" / "!qwen 요약좀 <URL>" / "!qwen 오늘 환율" 전부 동작.
-function handleQwen(msg) {
-  try {
-    var text = String(msg.content || "").trim();
-    var question = text.slice("!qwen".length).trim();
-    if (!question) {
-      msg.reply("사용법: !qwen [질문]\n" +
-                "· 링크를 넣으면 그 문서를 요약하고, 최신 정보가 필요하면 웹을 검색합니다.\n" +
-                "· 검색이 필요한 질문은 외부 검색엔진으로 전달됩니다. 개인정보·비밀번호·키는 넣지 마세요.\n" +
-                "예) !qwen 광합성이 뭐야?  /  !qwen https://... 요약해줘");
-      return;
-    }
-    var room = msg.room;
-
-    // 30초~1분 걸리므로 기다리는 줄 알 수 있게 먼저 알린다.
-    // 무엇을 할지(요약·검색·일반 답변)는 서버가 고르므로 안내도 한 가지로 둔다.
-    try { msg.reply("답변을 생성중입니다."); } catch(_) {}
-
-    // 생성에 시간이 걸리므로 워커 큐를 막지 않도록 별도 스레드에서 처리.
-    new java.lang.Thread(function() {
-      sendQwenAnswer(room, question, "Qwen");
-    }).start();
-  } catch(e) {
-    try { msg.reply("오류: " + (e && e.message ? e.message : e)); } catch(_) {}
-  }
-}
-
-// 대화요약 처리: 사용 한도는 제미니와 동일(제공자 무제한 / 그 외 1일 N회). 성공 시 1회 차감.
-function handleSummary(msg) {
-  try {
-    var room = msg.room;
-    var who = (function(){ try { return kt.resolveSender(msg); } catch(_) { return null; } })();
-    var displayName = (who && who.name) ? who.name : (msg.author.name || "익명");
-    var hash = msg.author.hash || ("noname:" + (msg.author.name || "익명"));
-    var isProvider = isApiProvider(msg.author.hash, room);
-    if (!isProvider && countTodayUses(hash) >= GEMINI_DAILY_LIMIT) {
-      msg.reply("⚠ " + displayName + "님은 오늘 제미니 사용 한도(" + GEMINI_DAILY_LIMIT + "회)에 도달했습니다.\n" +
-        "상식퀴즈봇과 1:1 채팅에서 !api 로 이 방에 키를 등록하면 무제한으로 사용할 수 있습니다.");
-      return;
-    }
-    summaryMod.handle(msg, kt, callGemini, bot, function onSuccess(){
-      if (!isProvider) { try { recordUse(hash); } catch(_){} }
-    });
-  } catch(e) {
-    try { msg.reply("오류: " + (e && e.message ? e.message : e)); } catch(_){}
-  }
 }
 
 function handleMessage(msg) {
@@ -462,7 +430,10 @@ function handleMessage(msg) {
 
     var question = text.slice(prefix.length).trim();
     if (!question) {
-      msg.reply("사용법: " + prefix + " [질문]\n예) " + prefix + " 광합성이 뭐야?");
+      msg.reply("사용법: " + prefix + " [질문]\n" +
+                "· 링크를 넣으면 그 문서를 요약하고, 최신 정보가 필요하면 웹을 검색합니다.\n" +
+                "· 검색이 필요한 질문은 외부 검색엔진으로 전달됩니다. 개인정보·비밀번호·키는 넣지 마세요.\n" +
+                "예) " + prefix + " 광합성이 뭐야?  /  " + prefix + " https://... 요약해줘");
       return;
     }
 
@@ -472,35 +443,21 @@ function handleMessage(msg) {
     var hash = msg.author.hash || ("noname:" + (msg.author.name || "익명"));
     var isProvider = isApiProvider(msg.author.hash, room);   // 이 방에 키 제공 → 무제한
 
-    // 사용 한도: 제공자는 무제한, 그 외는 1일 GEMINI_DAILY_LIMIT 회 (한국시간 자정 리셋).
-    // 한도에 걸리면 거절하지 않고 내부망 Qwen 으로 넘긴다(무료·무제한이라 횟수를 세지 않음).
+    // 사용 한도: 이 방에 키를 제공한 사람은 무제한, 그 외는 1일 GEMINI_DAILY_LIMIT 회.
+    // 기본 경로는 게이트웨이지만 한도는 그대로 센다 — 게이트웨이도 유한한 자원이다.
     if (!isProvider && countTodayUses(hash) >= GEMINI_DAILY_LIMIT) {
-      var overRoom = room;
-      msg.reply("⚠ " + displayName + "님은 오늘 제미니 한도(" + GEMINI_DAILY_LIMIT + "회)를 다 쓰셨습니다.\n" +
-        "내부망 Qwen 으로 답변을 만드는 중입니다. 조금 오래 걸릴 수 있습니다.\n" +
-        "(상식퀴즈봇과 1:1 채팅에서 !api 로 키를 등록하면 제미니를 무제한 사용할 수 있습니다.)");
-      new java.lang.Thread(function() {
-        sendQwenAnswer(overRoom, question, "제미니 한도 초과 → Qwen");
-      }).start();
+      msg.reply("⚠ " + displayName + "님은 오늘 사용 한도(" + GEMINI_DAILY_LIMIT + "회)를 다 쓰셨습니다.\n" +
+        "(상식퀴즈봇과 1:1 채팅에서 !api 로 이 방에 키를 등록하면 무제한으로 사용할 수 있습니다.)");
       return;
     }
 
+    // 30초~1분 걸리므로 기다리는 줄 알 수 있게 먼저 알린다.
+    try { msg.reply("답변을 생성중입니다."); } catch(_) {}
+
     // 네트워크 호출은 워커 큐를 막지 않도록 별도 스레드에서 처리하고, 끝나면 직접 send.
+    var q = question, rm = room, hs = hash, pv = isProvider;
     new java.lang.Thread(function() {
-      var res = callGemini(buildPrompt(question), room);
-      if (res && typeof res.text === "string" && res.text.trim()) {
-        if (!isProvider) { try { recordUse(hash); } catch(_) {} }   // 성공 응답만 한도에 반영
-        // 요청 형식: "답변입니다." 500회 반복(미리보기 채움) 뒤 줄바꿈 후 실제 답변.
-        try { bot.send(room, "답변입니다."+ LONG_MSG_SPACER + "\n" + res.text.trim()); } catch(_) {}
-      } else if (res && res.quotaExhausted) {
-        // 모든 제미니 키가 429 → Qwen 으로 폴백.
-        // 폴백은 "토큰 소진"일 때만 한다. 차단·파싱오류 같은 건 그대로 오류로 알려야
-        // 진짜 문제가 Qwen 답변 뒤에 숨지 않는다.
-        try { bot.send(room, "⚠ 제미니 API 사용량이 모두 소진되어 내부망 Qwen 으로 답변합니다. 조금 오래 걸릴 수 있습니다."); } catch(_) {}
-        sendQwenAnswer(room, question, "제미니 소진 → Qwen");
-      } else {
-        try { bot.send(room, "⚠ 답변 생성 실패: " + ((res && res.error) ? res.error : "알 수 없음")); } catch(_) {}
-      }
+      sendAnswer(rm, q, hs, pv);
     }).start();
   } catch(e) {
     try { msg.reply("오류: " + (e && e.message ? e.message : e)); } catch(_) {}
@@ -525,8 +482,6 @@ var subscribe = (function() {
 subscribe(BOT_NAME, WORKER_NAME, function(msg) {
   try {
     var text = String(msg.content || "").trim();
-    if (isSummaryCommand(text)) { handleSummary(msg); return; }   // !대화요약
-    if (isQwenCommand(text)) { handleQwen(msg); return; }         // !qwen (구 qwen봇)
     if (!isGeminiCommand(text)) return;   // 우리 명령이 아니면 무시 (모든 메시지가 broadcast 됨)
     handleMessage(msg);
   } catch(_) {}
