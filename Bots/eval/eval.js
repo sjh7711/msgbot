@@ -197,8 +197,6 @@ function applyUserSelection(msg, text) {
     for (var f = 0; f < failed.length; f++) lines.push("  " + failed[f]);
   }
   if (sel.bad.length) lines.push("무시된 입력: " + sel.bad.join(", "));
-  lines.push("");
-  lines.push("이 방의 hash 만 등록했습니다. 다른 방에서도 쓰게 하려면 그 방을 골라 다시 등록하세요.");
   msg.reply(lines.join("\n"));
 }
 
