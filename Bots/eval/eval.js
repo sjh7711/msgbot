@@ -12,7 +12,6 @@ var bot = BotManager.getCurrentBot();
 //   신원이 아니다 — lib/admin.js 참고.
 //
 //   관리 명령(슈퍼관리자 전용): !관리자 / !관리자추가 / !관리자삭제
-//   누구나: !내권한 (본인 레벨과 이 방에서의 hash 확인)
 //
 // 메시지 수신: ChatManager 의 broadcast 큐 구독. ChatManager 가 켜져 있어야 동작.
 //
@@ -63,31 +62,6 @@ function handleEval(msg) {
 
   // 권한 없으면 아무 응답도 하지 않는다. 거절 문구는 그 방 전체가 보는 공개
   // 메시지라, 명령이 있다는 사실과 누가 시도했는지를 드러낸다.
-
-}
-
-// =====================================================================
-// !내권한
-// =====================================================================
-
-function handleMyLevel(msg) {
-  var lv = admin.levelOf(msg.hash);
-  var person = admin.personOf(msg.hash);
-  var lines = [
-    "[내 권한]",
-    "등급: " + lv + " (" + levelName(lv) + ")"
-  ];
-  if (person) lines.push("사람: " + person);
-  lines.push("hash: " + String(msg.hash || "?"));
-  lines.push("방: " + String(msg.room || "?"));
-  if (lv === admin.LEVEL_NONE) {
-    lines.push("");
-    lines.push("권한이 필요하면 슈퍼관리자에게 위 hash 를 알려주세요.");
-  } else if (lv === admin.LEVEL_ADMIN) {
-    lines.push("");
-    lines.push("] 로 제한 실행 가능 (계산·문자열·정규식·JSON). Java/봇 접근은 불가.");
-  }
-  msg.reply(lines.join("\n"));
 }
 
 // =====================================================================
@@ -304,7 +278,6 @@ function handleMessage(msg) {
   var text = trim(msg.content);
 
   if (text.indexOf("]") === 0) { handleEval(msg); return; }
-  if (text === "!내권한")      { handleMyLevel(msg); return; }
   if (text === "!관리자취소")  { handleCancel(msg); return; }
   if (text === "!관리자")      { handleList(msg); return; }
   if (text.indexOf("!관리자추가") === 0) { handleAdd(msg, text.substring("!관리자추가".length)); return; }
@@ -315,7 +288,7 @@ function handleMessage(msg) {
 function isMyCommand(text, msg) {
   var t = trim(text);
   if (!t) return false;
-  if (t.indexOf("]") === 0 || t.indexOf("!관리자") === 0 || t === "!내권한") return true;
+  if (t.indexOf("]") === 0 || t.indexOf("!관리자") === 0) return true;
   // 번호 선택 대기 중일 때만 숫자 입력을 가로챈다 (같은 사람·같은 방)
   return isSelectionInput(t) && pendingMatches(msg);
 }
