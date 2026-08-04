@@ -975,7 +975,7 @@ function callGemini(prompt, room) {
       for (var mi = 0; mi < models.length; mi++) {
         r = _callGeminiOnce(prompt, { key: k.key, model: models[mi] });
         if (!r.modelError) break;
-        try { APIKEYS.markModelDown(k.key, models[mi]); } catch(_) {}
+        try { APIKEYS.markModelDown(k.key, models[mi], r.modelKind); } catch(_) {}
         lastErr = r;
       }
       if (r && r.modelError) continue;      // 이 키로는 쓸 모델이 없다 → 다음 키
@@ -1054,10 +1054,13 @@ function _callGeminiOnce(prompt, provider) {
     }
 
     if (code < 200 || code >= 300) {
-      // 모델 문제를 먼저 가려낸다. 없는 모델을 부른 400/404 가 "잘못된 키" 로
-      // 분류되면 멀쩡한 키를 차례로 버리다가 전부 죽었다고 결론 내린다.
-      if (APIKEYS && APIKEYS.isModelError(code, raw)) {
-        return { modelError: true, error: "모델 " + provider.model + " 사용 불가: " + raw.slice(0, 200) };
+      // 모델 문제를 먼저 가려낸다. 없는 모델(400/404)이 "잘못된 키" 로 분류되면
+      // 멀쩡한 키를 차례로 버리고, 과부하(503)가 429 로 오면 키를 24시간 쉬게 한다.
+      var mk = APIKEYS ? APIKEYS.modelErrorKind(code, raw) : null;
+      if (mk) {
+        return { modelError: true, modelKind: mk,
+                 error: "모델 " + provider.model + (mk === "busy" ? " 과부하: " : " 사용 불가: ") +
+                        raw.slice(0, 200) };
       }
       // keyError=true 면 callGemini 가 다음 키로 회전한다.
       if (code === 429) {

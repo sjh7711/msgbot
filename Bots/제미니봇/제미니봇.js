@@ -206,7 +206,7 @@ function callGemini(prompt, room) {
       for (var mi = 0; mi < models.length; mi++) {
         res = _callGeminiOnce(prompt, { key: k.key, model: models[mi] });
         if (!res.modelError) break;
-        try { APIKEYS.markModelDown(k.key, models[mi]); } catch(_) {}
+        try { APIKEYS.markModelDown(k.key, models[mi], res.modelKind); } catch(_) {}
       }
       if (res && res.modelError) continue;   // 이 키로는 쓸 모델이 없다 → 다음 키
     } else {
@@ -257,8 +257,11 @@ function _callGeminiOnce(prompt, provider) {
 
     if (code < 200 || code >= 300) {
       // 모델 문제는 키를 바꿔도 그대로다 — 다음 모델로 내려가야 한다.
-      if (APIKEYS && APIKEYS.isModelError(code, raw)) {
-        return { modelError: true, error: "모델 " + provider.model + " 사용 불가: " + raw.slice(0, 160) };
+      var mk = APIKEYS ? APIKEYS.modelErrorKind(code, raw) : null;
+      if (mk) {
+        return { modelError: true, modelKind: mk,
+                 error: "모델 " + provider.model + (mk === "busy" ? " 과부하: " : " 사용 불가: ") +
+                        raw.slice(0, 160) };
       }
       if (code === 429) return { quota429: true, error: "HTTP 429" };
       return { error: "HTTP " + code + ": " + raw.slice(0, 200) };
