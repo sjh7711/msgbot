@@ -60,7 +60,9 @@ var REGISTRY = [
       { display: "!상식종료",            triggers: ["!상식종료"],     desc: "진행 중 퀴즈 강제 종료 및 정답 공개", admin: false },
       { display: "!금지목록",            triggers: ["!금지목록"],     desc: "빈출 정답 상위 50개 목록 조회", admin: true },
       { display: "!이의신청 [N]",        triggers: ["!이의신청"],     desc: "최근(또는 N)회차 정답 재검증 (오답자만)", admin: false },
-      { display: "!api [KEY]",          triggers: ["!api"],         desc: "Gemini API 키 등록 (토픽 한도 45회로 상향)", admin: false }
+      { display: "!api [KEY]",          triggers: ["!api"],         desc: "Gemini API 키 등록 (토픽 한도 45회로 상향)", admin: false },
+      { display: "!api검증 [KEY]",       triggers: ["!api검증"],      desc: "그 키가 아직 살아 있는지 실제로 호출해 확인", admin: false },
+      { display: "!api검증 전체",        triggers: ["!api검증"],      desc: "등록된 모든 키의 유효성 점검 (관리자)", admin: true }
     ]
   },
   {

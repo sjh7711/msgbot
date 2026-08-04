@@ -90,6 +90,14 @@ var DBH = (function() {
   return require(libPath);
 })();
 
+// 권한 판정 (lib/admin.js) — !api검증 전체 에서만 쓴다.
+// 못 불러오면 null → 전체 검증이 잠긴다(실패 시 닫히는 쪽). 퀴즈 기능은 영향 없다.
+var ADMIN = (function() {
+  var p = "/sdcard/msgbot/lib/admin.js";
+  try { if (typeof bot.getRootPath === "function") p = bot.getRootPath() + "/../../lib/admin.js"; } catch(_) {}
+  try { var m = require(p); return (m && typeof m.isAdmin === "function") ? m : null; } catch(_) { return null; }
+})();
+
 function initDB() {
   DBH.withDB(DB_PATH, function(db){
   try {
@@ -492,6 +500,92 @@ function loadApiKeys() {
   });
 }
 
+// ── !api검증 [전체|api키] — 키가 아직 살아 있는지 실제로 호출해 확인 ────
+//   !api검증 전체      등록된 키 전부 (관리자만 — 봇의 키 목록이 드러나므로)
+//   !api검증 [키]      그 키 하나만. 등록 전에 미리 확인할 때. 누구나.
+//
+//   키는 폐기·만료되면 조용히 죽는다. 기본(전역) 키가 죽으면 모든 방의 제미니가
+//   멈추는데 증상만 봐선 한도 초과와 구분이 안 되므로, 눌러서 확인할 수단이 필요하다.
+var VERIFY_CMD = "!api검증";
+
+// 등록된 키 목록 (created ASC — 첫 항목이 기본/전역 키)
+function listApiKeyRows() {
+  return DBH.withDB(DB_PATH, function(db) {
+    var cur = null, out = [];
+    try {
+      cur = db.rawQuery("SELECT key, model, added_by_name, added_by_room FROM quiz_apikey ORDER BY created ASC", []);
+      while (cur.moveToNext()) {
+        out.push({ key: String(cur.getString(0) || ""),
+                   model: String(cur.getString(1) || DEFAULT_MODEL),
+                   who: String(cur.getString(2) || "?"),
+                   room: String(cur.getString(3) || "") });
+      }
+    } catch (e) {} finally { if (cur) cur.close(); }
+    return out;
+  });
+}
+
+// testApiKey 의 반환값을 사람이 읽을 한 줄로. quota 는 "죽은 키"가 아니라는 게 요점.
+function verifyLabel(status) {
+  if (status === "ok")      return "✅ 정상";
+  if (status === "quota")   return "⚠ 한도 초과 (키는 유효)";
+  if (status === "invalid") return "❌ 무효 — 폐기됐거나 잘못된 키";
+  return "❓ 통신 오류 — 키 상태 확인 불가";
+}
+
+// 워커를 막지 않도록 네트워크는 별도 스레드. 결과는 큐로 돌려받아 워커에서 출력한다.
+// (키 하나에 최대 35초까지 걸릴 수 있어 워커에서 직접 돌리면 봇 전체가 멈춘다)
+function handleVerify(msg, arg) {
+  var a = String(arg || "").trim();
+
+  if (!a) {
+    msg.reply("사용법: " + VERIFY_CMD + " [전체|api키]\n" +
+              "• " + VERIFY_CMD + " 전체      등록된 키를 모두 확인 (관리자)\n" +
+              "• " + VERIFY_CMD + " AIza…    그 키 하나만 확인");
+    return;
+  }
+
+  if (a !== "전체") {
+    if (/\s/.test(a) || a.length < 20 || a.length > 200) {
+      msg.reply("키 형식이 올바르지 않습니다. " + VERIFY_CMD + " 발급받은키  형식으로 1개만 입력해주세요.");
+      return;
+    }
+    msg.reply("🔍 키를 확인하는 중입니다...");
+    var rm1 = msg.room;
+    new java.lang.Thread(function() {
+      var st = testApiKey(a);
+      try {
+        msgQueue.put({ type: "api_verify_result", room: rm1,
+                       lines: ["[API 키 검증]", maskKey(a) + " → " + verifyLabel(st)] });
+      } catch (_) {}
+    }).start();
+    return;
+  }
+
+  // 전체 점검 — 키가 몇 개 있고 누가 줬는지가 드러나므로 관리자만. 아니면 무응답.
+  if (!ADMIN || !ADMIN.isAdmin(msg.author.hash)) return;
+
+  var rows = listApiKeyRows();
+  if (!rows.length) { msg.reply("등록된 API 키가 없습니다."); return; }
+
+  msg.reply("🔍 등록된 키 " + rows.length + "개를 확인하는 중입니다...");
+  var rm2 = msg.room;
+  new java.lang.Thread(function() {
+    var lines = ["[API 키 검증] " + rows.length + "개"];
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      // 각 키는 자기 model 로 검사해야 한다. 모델이 다르면 결과도 달라진다.
+      var st = testApiKeyWithModel(r.key, r.model);
+      lines.push("");
+      // 첫 항목이 전역 기본 키 (loadApiKeys 가 created ASC 로 읽는다)
+      lines.push((i === 0 ? "[기본] " : "[" + (r.room || "전역") + "] ") + r.who);
+      lines.push("   " + maskKey(r.key) + " / " + r.model);
+      lines.push("   " + verifyLabel(st));
+    }
+    try { msgQueue.put({ type: "api_verify_result", room: rm2, lines: lines }); } catch (_) {}
+  }).start();
+}
+
 // !api 로 등록: DB 에 영구 저장(누가/어느 방 닉네임으로 줬는지 포함) + 런타임 API_KEYS 에 즉시 추가.
 // 반환: "added" | "exists" | "error"
 function registerApiKey(key, name, hash, room) {
@@ -520,11 +614,16 @@ function registerApiKey(key, name, hash, room) {
 
 // 키를 실제로 한 번 호출해 유효성 검증. 네트워크 호출이므로 워커 스레드가 아닌 별도 스레드에서 호출할 것.
 // 반환: "ok"(정상응답) | "quota"(키는 유효하나 429) | "invalid"(잘못된 키) | "neterr"(통신 오류)
-function testApiKey(key) {
+function testApiKey(key) { return testApiKeyWithModel(key, DEFAULT_MODEL); }
+
+// 등록된 키는 저마다 model 이 다를 수 있다. 그 키가 실제로 쓰는 모델로 찔러야
+// 결과가 맞는다 (모델이 사라진 경우와 키가 죽은 경우를 섞지 않기 위해서도).
+function testApiKeyWithModel(key, model) {
   var conn = null;
   try {
     var url = new java.net.URL(
-      "https://generativelanguage.googleapis.com/v1beta/models/" + DEFAULT_MODEL + ":generateContent?key=" + key);
+      "https://generativelanguage.googleapis.com/v1beta/models/" +
+      String(model || DEFAULT_MODEL) + ":generateContent?key=" + key);
     conn = url.openConnection();
     conn.setRequestMethod("POST");
     conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
@@ -2053,6 +2152,7 @@ function isGameCommand(text) {
   if (text.indexOf("!상식 ") === 0 && text.length > 4) return true;
   if (text.indexOf("!ㅅㅅ ") === 0 && text.length > 4) return true;
   if (text.indexOf("!api ") === 0 && text.length > 5) return true;
+  if (text === VERIFY_CMD || text.indexOf(VERIFY_CMD + " ") === 0) return true;
   return false;
 }
 
@@ -2195,6 +2295,10 @@ function processTask(task) {
     } else {
       m.reply("키 검증 중 통신 오류가 발생했습니다. 잠시 후 다시 시도해주세요.");
     }
+    return;
+  }
+  if (task.type === "api_verify_result") {
+    try { bot.send(task.room, task.lines.join("\n")); } catch(_) {}
     return;
   }
 }
@@ -2425,6 +2529,12 @@ function handleMessage(msg) {
 
     if (text === "!금지목록") {
       showForbiddenList(msg);
+      return;
+    }
+
+    // "!api검증" 은 "!api " 에 걸리지 않지만(공백이 없음), 의도를 분명히 하려고 먼저 본다.
+    if (text === VERIFY_CMD || text.indexOf(VERIFY_CMD + " ") === 0) {
+      handleVerify(msg, text.slice(VERIFY_CMD.length));
       return;
     }
 
