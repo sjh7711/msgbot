@@ -338,10 +338,12 @@ function hasUrl(text) { return URL_RE.test(String(text == null ? "" : text)); }
 
 // /v1/ask 결과를 카톡 메시지로 꾸민다.
 // 첫 줄 + 제로폭 스페이서로 카카오톡 미리보기를 채우는 건 제미니와 같은 형식.
-function formatAskResult(res, tag) {
+// 머리말은 답의 성격만 밝힌다(링크를 읽었는지, 웹을 찾았는지). 어느 백엔드를
+// 썼는지는 사용자가 알 필요가 없다.
+function formatAskResult(res) {
   var kind = "";
-  if (res.route === "url_summary") kind = " · 링크 요약";
-  else if (res.route === "web_search") kind = " · 웹 검색";
+  if (res.route === "url_summary") kind = " (링크 요약)";
+  else if (res.route === "web_search") kind = " (웹 검색)";
 
   var lines = [];
   if (res.route === "url_summary") {
@@ -364,7 +366,7 @@ function formatAskResult(res, tag) {
   if (res.truncated) lines.push("\n※ 문서가 길어 일부만 반영됐습니다.");
   if (res.partial) lines.push("\n※ 일부 문서만 수집돼 근거가 불완전합니다.");
 
-  return "답변입니다. (" + tag + kind + ")" + LONG_MSG_SPACER + "\n" + lines.join("\n");
+  return "답변입니다." + kind + LONG_MSG_SPACER + "\n" + lines.join("\n");
 }
 
 // ── 답변 생성 (게이트웨이 우선, 로컬 키 폴백) ────────────────────────
@@ -384,39 +386,31 @@ function gatewayFallbackAllowed(r, question) {
   return true;
 }
 
+// 어느 경로로 답했는지는 알리지 않는다. 사용자에게 필요한 건 답이지 우리 배관이
+// 아니다. 폴백은 조용히 일어나고, 실패했을 때만 그 사실을 알린다.
 function sendAnswer(room, question, hash, isProvider) {
-  var viaGateway = false;
-
   if (askMod) {
     var r = askMod.ask(question);
     if (r && !r.error) {
-      try { bot.send(room, formatAskResult(r, "내부망")); } catch(_) {}
+      try { bot.send(room, formatAskResult(r)); } catch(_) {}
       if (!isProvider) { try { recordUse(hash); } catch(_) {} }
       return true;
     }
     if (!gatewayFallbackAllowed(r, question)) {
-      var why = (r && r.error) ? r.error : "알 수 없음";
-      var extra = hasUrl(question)
-        ? "\n(링크가 든 질문은 내부망이 문서를 직접 읽어야 합니다. 로컬 키로는 대신할 수 없습니다.)"
-        : "";
-      try { bot.send(room, "⚠ 답변 생성 실패: " + why + extra); } catch(_) {}
+      // 링크가 든 질문은 로컬 키로 대신할 수 없다(문서를 못 읽는다).
+      // 지어낸 요약을 주느니 못 했다고 말한다.
+      try { bot.send(room, "⚠ 링크를 읽지 못했습니다. 잠시 후 다시 시도해 주세요."); } catch(_) {}
       return false;
     }
-    // 여기까지 왔으면 게이트웨이를 못 썼고 폴백이 가능한 상태
-    try {
-      bot.send(room, "⚠ 내부망 응답을 받지 못해 이 방에 등록된 제미니 키로 답합니다.\n사유: " + r.error);
-    } catch(_) {}
   }
 
   var res = callGemini(buildPrompt(question), room);
   if (res && typeof res.text === "string" && res.text.trim()) {
     if (!isProvider) { try { recordUse(hash); } catch(_) {} }   // 성공 응답만 한도에 반영
-    try { bot.send(room, "답변입니다. (제미니 키)" + LONG_MSG_SPACER + "\n" + res.text.trim()); } catch(_) {}
+    try { bot.send(room, "답변입니다." + LONG_MSG_SPACER + "\n" + res.text.trim()); } catch(_) {}
     return true;
   }
-  var err = (res && res.error) ? res.error
-          : (res && res.quotaExhausted) ? "이 방 제미니 키도 모두 한도 초과" : "알 수 없음";
-  try { bot.send(room, "⚠ 답변 생성 실패: " + err); } catch(_) {}
+  try { bot.send(room, "⚠ 답변을 만들지 못했습니다. 잠시 후 다시 시도해 주세요."); } catch(_) {}
   return false;
 }
 
