@@ -303,14 +303,17 @@ function chosung(s) {
 }
 
 // 메시지가 등록된 명령으로 인식되는가 (정확 일치 또는 "트리거 + 공백" 접두 → 다른 봇이 처리)
+// 다른 봇이 처리할 명령인가.
+//   판정 기준을 실제 디스패치와 맞춘다 — 봇들은 대부분 indexOf(CMD) === 0 으로
+//   받으므로 공백이 없어도 인자로 해석한다("!지운채팅5" = "!지운채팅 5").
+//   예전엔 여기서 '트리거 + 공백' 만 인정해서, 공백 없이 친 정상 명령을 모르는
+//   명령으로 보고 추천까지 같이 보냈다 — 한 번 입력에 두 통이 나갔다.
 function isKnownCommand(text) {
   var t = String(text).trim();
   for (var i = 0; i < FLAT_CMDS.length; i++) {
     var trigs = FLAT_CMDS[i].triggers;
     for (var j = 0; j < trigs.length; j++) {
-      var tr = trigs[j];
-      if (t === tr) return true;
-      if (t.indexOf(tr + " ") === 0) return true;
+      if (t.indexOf(trigs[j]) === 0) return true;
     }
   }
   return false;
