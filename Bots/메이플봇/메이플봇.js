@@ -2,7 +2,7 @@ const bot = BotManager.getCurrentBot();
 
 // =====================================================================
 // 메이플봇 — 메이플스토리 이벤트/공지 신규 게시물 알림
-//  - https://maplestory.nexon.com/News/Event           폴링 (30초 ±10초)
+//  - https://maplestory.nexon.com/News/Event           폴링 (5분 ±1분)
 //  - https://maplestory.nexon.com/News/Notice          폴링 (동일 주기)
 //  - https://maplestory.nexon.com/Testworld/News/All   폴링 (동일 주기, 테스트서버 공지)
 //  - !메알림 시작   : 현재 방에 알림 등록
@@ -28,8 +28,10 @@ var TARGETS = [
     { key: "testnotice", url: "https://maplestory.nexon.com/Testworld/News/All", label: "메이플 테스트서버 공지" }
 ];
 var BASE_URL     = "https://maplestory.nexon.com";
-var POLL_BASE_MS = 30000;
-var POLL_JITTER  = 10000;
+// 폴링 주기 5분 ± 1분 (4~6분). 지터를 두는 건 넥슨 쪽에 일정한 간격으로
+// 두드리지 않기 위한 것이다. 한 주기마다 위 SOURCES 3곳을 모두 확인한다.
+var POLL_BASE_MS = 300000;
+var POLL_JITTER  = 60000;
 var STATE_PATH   = Packages.android.os.Environment
                      .getExternalStorageDirectory().getAbsolutePath()
                      + "/msgbot/maple_state.json";
