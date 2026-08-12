@@ -47,6 +47,25 @@ var DBH = (function() {
   return require(libPath);
 })();
 
+// notify_name 컬럼을 처음 만들 때 한 번만 옮겨 심을 옛 매핑 (예전 소스 상수).
+// 키가 알림에 뜨는 이름, 값이 봇 안에서 쓰는 약칭/게임키다.
+// 이관 뒤에는 쓰이지 않는다 — 이후 등록은 !유저등록 / !게임등록 으로 한다.
+// initDatabase 보다 위에 있어야 한다 (var 는 선언만 끌어올려지고 값은 아니다).
+var LEGACY_USER_MAPPING = {
+  '박현식': '이',
+  '신종화': '쫑',
+  '김수민': '그',
+  '송수익': '명',
+  '김다현': '먐'
+};
+var LEGACY_GAME_MAPPING = {
+  'Zip': 'z',
+  'Queens': 'q',
+  'Tango': 't',
+  'Mini Sudoku': 's',
+  'Patches': 'p'
+};
+
 function initDatabase(){
   DBH.withDB(DB_PATH, function(db){
     db.execSQL(
@@ -94,7 +113,45 @@ function initDatabase(){
     } finally { colCur.close(); }
     if (!hasTimeCol) db.execSQL("ALTER TABLE records_v2 ADD COLUMN time INTEGER");
     if (!hasDisqCol) db.execSQL("ALTER TABLE records_v2 ADD COLUMN disq INTEGER NOT NULL DEFAULT 0");
+
+    // notify_name: !자동기록 이 알림 파일에서 찾을 이름.
+    //   users  — 카톡 알림 제목에 뜨는 실명 ("박현식")
+    //   games  — 알림 본문에 뜨는 게임 이름 ("Zip")
+    // 예전엔 소스에 박힌 USER_MAPPING/GAME_MAPPING 이었다. 사람이 들어올 때마다
+    // 코드를 고치고 배포해야 해서 DB 로 옮겼다.
+    if (!hasColumn(db, "users", "notify_name")) {
+      db.execSQL("ALTER TABLE users ADD COLUMN notify_name TEXT");
+      seedNotifyNames(db, "users", "name", LEGACY_USER_MAPPING);
+    }
+    if (!hasColumn(db, "games", "notify_name")) {
+      db.execSQL("ALTER TABLE games ADD COLUMN notify_name TEXT");
+      seedNotifyNames(db, "games", "key", LEGACY_GAME_MAPPING);
+    }
   });
+}
+
+function hasColumn(db, table, col){
+  var cur = null;
+  try {
+    cur = db.rawQuery("PRAGMA table_info(" + table + ")", []);
+    while (cur.moveToNext()) if (String(cur.getString(1)) === col) return true;
+  } catch(_) {} finally { if (cur) cur.close(); }
+  return false;
+}
+
+// 옛 리터럴 매핑을 컬럼으로 옮긴다. 없는 행은 만들지 않는다 —
+// 등록되지 않은 사람/게임을 여기서 새로 만들면 조용히 되살아난다.
+function seedNotifyNames(db, table, keyCol, mapping){
+  try {
+    var st = db.compileStatement("UPDATE " + table + " SET notify_name=? WHERE " + keyCol + "=?");
+    for (var notifyName in mapping) {
+      if (!mapping.hasOwnProperty(notifyName)) continue;
+      st.bindString(1, notifyName);
+      st.bindString(2, mapping[notifyName]);
+      st.execute();
+    }
+    st.close();
+  } catch(_) {}
 }
 initDatabase();
 
@@ -122,37 +179,103 @@ function getAllGamesOrdered(){
 function gameExists(key){ return DBH.withDB(DB_PATH, function(db){ var cur=null; try{ cur=db.rawQuery("SELECT 1 FROM games WHERE key=?", [key]); return cur.moveToFirst(); } finally { if(cur)cur.close(); } }); }
 function userExists(name){ return DBH.withDB(DB_PATH, function(db){ var cur=null; try{ cur=db.rawQuery("SELECT 1 FROM users WHERE name=?", [name]); return cur.moveToFirst(); } finally { if(cur)cur.close(); } }); }
 
-function registerGame(key){
-  key = (key||"").toLowerCase();
-  if (!/^[A-Za-z]$/.test(key)) return "게임키는 1글자 영문만 가능합니다.";
+// "!게임등록 p"            — 게임키만 등록 (!자동기록 대상 아님)
+// "!게임등록 p Patches"     — 알림에 뜨는 게임 이름까지. 이래야 !자동기록 이 찾는다.
+// 이미 있는 게임의 알림 이름만 붙이거나 바꾸는 것도 같은 명령으로 한다.
+function registerGame(arg){
+  var s = trim(arg||"");
+  if (!s) return "형식: !게임등록 [게임키] [알림이름]\n예) !게임등록 p Patches";
+
+  var sp = s.search(/\s/);
+  var key = ((sp === -1) ? s : s.substring(0, sp)).toLowerCase();
+  var notify = (sp === -1) ? "" : trim(s.substring(sp + 1));
+
+  if (!/^[a-z]$/.test(key)) return "게임키는 1글자 영문만 가능합니다. (예: !게임등록 p Patches)";
+
   return DBH.withDB(DB_PATH, function(db){
     var cur=null;
     try{
-      cur = db.rawQuery("SELECT ord FROM games WHERE key=?", [key]);
-      if (cur.moveToFirst()) return "이미 등록된 게임입니다: "+key;
-      cur.close();
-      cur = db.rawQuery("SELECT IFNULL(MAX(ord),0) FROM games", []);
-      var next = 1; if (cur.moveToFirst()) next = cur.getInt(0) + 1; cur.close();
-      var st = db.compileStatement("INSERT INTO games(key, ord) VALUES(?,?)");
-      st.bindString(1, key); st.bindLong(2, next); st.execute(); st.close();
-      return "게임 등록 완료: "+key+" (순서 "+next+")";
+      cur = db.rawQuery("SELECT ord, notify_name FROM games WHERE key=?", [key]);
+      var exists = cur.moveToFirst();
+      var ord = exists ? cur.getInt(0) : 0;
+      var oldNotify = exists ? (cur.getString(1) || "") : "";
+      cur.close(); cur = null;
+
+      if (exists && !notify) {
+        return "이미 등록된 게임입니다: " + key + " (순서 " + ord + ")" +
+               (oldNotify ? "\n알림 이름: " + oldNotify
+                          : "\n⚠ 알림 이름이 없어 !자동기록 대상이 아닙니다.\n" +
+                            "  !게임등록 " + key + " [알림이름] 으로 연결하세요.");
+      }
+      if (!exists) {
+        cur = db.rawQuery("SELECT IFNULL(MAX(ord),0) FROM games", []);
+        ord = 1; if (cur.moveToFirst()) ord = cur.getInt(0) + 1; cur.close(); cur = null;
+        var st = db.compileStatement("INSERT INTO games(key, ord, notify_name) VALUES(?,?,?)");
+        st.bindString(1, key); st.bindLong(2, ord);
+        if (notify) st.bindString(3, notify); else st.bindNull(3);
+        st.execute(); st.close();
+      } else {
+        var up = db.compileStatement("UPDATE games SET notify_name=? WHERE key=?");
+        up.bindString(1, notify); up.bindString(2, key); up.execute(); up.close();
+      }
+
+      if (!notify) {
+        return "게임 등록 완료: " + key + " (순서 " + ord + ")" +
+               "\n⚠ 알림 이름이 없어 !자동기록 에는 안 잡힙니다.\n" +
+               "  !게임등록 " + key + " [알림에 뜨는 게임 이름] 으로 연결하세요.";
+      }
+      return (exists ? "알림 이름 " + (oldNotify ? "변경" : "연결") + ": "
+                     : "게임 등록 완료: ") + key + " ← " + notify +
+             (exists ? (oldNotify ? " (이전: " + oldNotify + ")" : "") : " (순서 " + ord + ")");
     } finally { if (cur) cur.close(); }
   });
 }
 
-function registerUser(name){
-  name = trim(name||"");
-  if (!name) return "형식: !유저등록 [이름]";
-  if (!isValidKoreanName(name)) return "유저 이름은 1글자여야 합니다.";
+// "!유저등록 슈"          — 약칭만 등록 (수동 !기록 에는 쓰이지만 !자동기록 대상은 아님)
+// "!유저등록 슈 홍길동"     — 알림 이름까지. 이래야 !자동기록 이 그 사람을 찾는다.
+// 이미 있는 유저에 알림 이름만 붙이거나 바꾸는 것도 같은 명령으로 한다.
+function registerUser(arg){
+  var s = trim(arg||"");
+  if (!s) return "형식: !유저등록 [약칭] [알림이름]\n예) !유저등록 슈 홍길동";
+
+  var sp = s.search(/\s/);
+  var name = (sp === -1) ? s : trim(s.substring(0, sp));
+  var notify = (sp === -1) ? "" : trim(s.substring(sp + 1));
+
+  if (!isValidKoreanName(name)) return "유저 약칭은 한글 1글자여야 합니다. (예: !유저등록 슈 홍길동)";
+
   return DBH.withDB(DB_PATH, function(db){
     var cur=null;
     try{
-      cur = db.rawQuery("SELECT 1 FROM users WHERE name=?", [name]);
-      if (cur.moveToFirst()) return "이미 등록된 유저입니다: "+name;
-      cur.close();
-      var st = db.compileStatement("INSERT INTO users(name) VALUES(?)");
-      st.bindString(1, name); st.execute(); st.close();
-      return "유저 등록 완료: "+name;
+      cur = db.rawQuery("SELECT notify_name FROM users WHERE name=?", [name]);
+      var exists = cur.moveToFirst();
+      var oldNotify = exists ? (cur.getString(0) || "") : "";
+      cur.close(); cur = null;
+
+      if (exists && !notify) {
+        return "이미 등록된 유저입니다: " + name +
+               (oldNotify ? "\n알림 이름: " + oldNotify
+                          : "\n⚠ 알림 이름이 없어 !자동기록 대상이 아닙니다.\n" +
+                            "  !유저등록 " + name + " [알림이름] 으로 연결하세요.");
+      }
+      if (!exists) {
+        var st = db.compileStatement("INSERT INTO users(name, notify_name) VALUES(?,?)");
+        st.bindString(1, name);
+        if (notify) st.bindString(2, notify); else st.bindNull(2);
+        st.execute(); st.close();
+      } else {
+        var up = db.compileStatement("UPDATE users SET notify_name=? WHERE name=?");
+        up.bindString(1, notify); up.bindString(2, name); up.execute(); up.close();
+      }
+
+      if (!notify) {
+        return "유저 등록 완료: " + name +
+               "\n⚠ 알림 이름이 없어 !자동기록 에는 안 잡힙니다.\n" +
+               "  !유저등록 " + name + " [카톡에 뜨는 이름] 으로 연결하세요.";
+      }
+      return (exists ? "알림 이름 " + (oldNotify ? "변경" : "연결") + ": " : "유저 등록 완료: ") +
+             name + " ← " + notify +
+             (exists && oldNotify ? " (이전: " + oldNotify + ")" : "");
     } finally { if (cur) cur.close(); }
   });
 }
@@ -1136,21 +1259,58 @@ var NOTIFY_DATE_FMT = new java.text.SimpleDateFormat("yyyy-MM-dd");
 NOTIFY_DATE_FMT.setTimeZone(PDT_TZ);
 function todayNotifyDateStr(){ return NOTIFY_DATE_FMT.format(new java.util.Date()); }
 
-var USER_MAPPING = {
-  '박현식': '이',
-  '신종화': '쫑',
-  '김수민': '그',
-  '송수익': '명',
-  '김다현': '먐'
-};
+// 등록 현황. 누가 !자동기록 대상이고 누가 아닌지 한눈에 보이게 한다 —
+// 알림 이름이 비어 있으면 그 사람/게임은 자동기록에서 조용히 빠지므로,
+// 볼 방법이 없으면 왜 안 잡히는지 알 수가 없다.
+function registryText(){
+  return DBH.withDB(DB_PATH, function(db){
+    var lines = ["[등록 목록]"], cur = null, n = 0;
+    try {
+      lines.push("");
+      lines.push("· 유저");
+      cur = db.rawQuery("SELECT name, notify_name FROM users ORDER BY name ASC", []);
+      while (cur.moveToNext()){
+        var nn = cur.getString(1);
+        lines.push("  " + cur.getString(0) + (nn ? " ← " + nn : "  ⚠ 알림 이름 없음"));
+        n++;
+      }
+      if (!n) lines.push("  (없음)");
+      cur.close(); cur = null;
 
-var GAME_MAPPING = {
-  'Zip': 'z',
-  'Queens': 'q',
-  'Tango': 't',
-  'Mini Sudoku': 's',
-  'Patches': 'p'
-};
+      lines.push("");
+      lines.push("· 게임 (순서대로)");
+      n = 0;
+      cur = db.rawQuery("SELECT key, notify_name FROM games ORDER BY ord ASC", []);
+      while (cur.moveToNext()){
+        var gn = cur.getString(1);
+        lines.push("  " + cur.getString(0) + (gn ? " ← " + gn : "  ⚠ 알림 이름 없음"));
+        n++;
+      }
+      if (!n) lines.push("  (없음)");
+    } catch(e) { return "등록 목록 조회 실패: " + (e && e.message ? e.message : e); }
+    finally { if (cur) cur.close(); }
+
+    lines.push("");
+    lines.push("← 뒤가 알림에 뜨는 이름입니다. 비어 있으면 !자동기록 에 안 잡힙니다.");
+    return lines.join("\n");
+  });
+}
+
+// 알림 이름 → 약칭/게임키. DB(users.notify_name / games.notify_name)에서 읽는다.
+// 매 호출마다 조회하므로 !유저등록 직후 재컴파일 없이 바로 반영된다.
+function notifyMapOf(table, keyCol){
+  return DBH.withDB(DB_PATH, function(db){
+    var out = {}, cur = null;
+    try {
+      cur = db.rawQuery("SELECT notify_name, " + keyCol + " FROM " + table +
+                        " WHERE notify_name IS NOT NULL AND notify_name <> ''", []);
+      while (cur.moveToNext()) out[String(cur.getString(0))] = String(cur.getString(1));
+    } catch(_) {} finally { if (cur) cur.close(); }
+    return out;
+  });
+}
+function userNotifyMap(){ return notifyMapOf("users", "name"); }
+function gameNotifyMap(){ return notifyMapOf("games", "key"); }
 
 function readNotificationsFile(notifyDateStr) {
   var d = notifyDateStr || todayNotifyDateStr();
@@ -1166,10 +1326,11 @@ function readNotificationsFile(notifyDateStr) {
   return { path: filePath, content: sb.toString() };
 }
 
-function parseGameResultFromContent(content) {
-  for (var gameName in GAME_MAPPING) {
-    if (!GAME_MAPPING.hasOwnProperty(gameName)) continue;
-    var gameCode = GAME_MAPPING[gameName];
+function parseGameResultFromContent(content, games) {
+  var GAMES = games || gameNotifyMap();
+  for (var gameName in GAMES) {
+    if (!GAMES.hasOwnProperty(gameName)) continue;
+    var gameCode = GAMES[gameName];
 
     // 패턴 1: "GameName #번호 | M:SS" (한 줄)
     var match1 = content.match(new RegExp(gameName + '\\s+#\\d+\\s+\\|\\s+(\\d+):(\\d+)'));
@@ -1187,16 +1348,17 @@ function parseGameResultFromContent(content) {
   return null;
 }
 
-function extractPlayerFromTitle(title) {
+function extractPlayerFromTitle(title, users) {
   var m = title.match(/새\s*메시지\s*\d+\s*:\s*(.+)$/);
   if (!m) return null;
   var nameAndGroup = trim(m[1]);
+  var U = users || userNotifyMap();
 
-  if (USER_MAPPING[nameAndGroup]) return USER_MAPPING[nameAndGroup];
+  if (U[nameAndGroup]) return U[nameAndGroup];
 
   // "이름 - 그룹" 형식 (예: "박현식 - ZQT")
   var dm = nameAndGroup.match(/^(.+?)\s*-\s*.+$/);
-  if (dm && USER_MAPPING[trim(dm[1])]) return USER_MAPPING[trim(dm[1])];
+  if (dm && U[trim(dm[1])]) return U[trim(dm[1])];
 
   return null;
 }
@@ -1207,20 +1369,24 @@ function parseNotificationsFile(content) {
   var entries = [];
   var seen = {};
 
+  // 매핑은 파일 하나당 한 번만 읽는다. 블록마다 조회하면 알림 수만큼 DB 를 두드린다.
+  var users = userNotifyMap();
+  var games = gameNotifyMap();
+
   for (var i = 0; i < blocks.length; i++) {
     var block = trim(blocks[i]);
     if (!block) continue;
 
     var titleMatch = block.match(/제목\s*:\s*(.+)/);
     if (!titleMatch) continue;
-    var player = extractPlayerFromTitle(trim(titleMatch[1]));
+    var player = extractPlayerFromTitle(trim(titleMatch[1]), users);
     if (!player) continue;
 
     var contentMatch = block.match(/내용\s*:\s*([\s\S]+)/);
     if (!contentMatch) continue;
     var msgContent = trim(contentMatch[1]);
 
-    var result = parseGameResultFromContent(msgContent);
+    var result = parseGameResultFromContent(msgContent, games);
     if (!result) continue;
 
     var key = result.game + ":" + player;
@@ -1394,8 +1560,10 @@ function handleMessage(msg) {
   if (text === "!자동기록" || /^!자동기록\s+\S/.test(text)){ var autoArg = trim(text.replace(/^!자동기록/, "")) || null; msg.reply(handleAutoRecord(autoArg)); return; }
   if (/^!실격취소(\s+.*)?$/.test(text)){ msg.reply(handleDisq(trim(text.replace(/^!실격취소/, "")), true)); return; }
   if (/^!실격(\s+.*)?$/.test(text)){ msg.reply(handleDisq(trim(text.replace(/^!실격/, "")), false)); return; }
-  if (/^!유저등록\s+.+$/.test(text)){ var name=trim(text.replace(/^!유저등록\s+/, "")); msg.reply(registerUser(name)); return; }
-  if (/^!게임등록\s+.+$/.test(text)){ var key=trim(text.replace(/^!게임등록\s+/, "")); msg.reply(registerGame(key)); return; }
+  // 인자 없이 쳐도 형식 안내가 나가도록 받는다 (예전엔 무응답이라 쓰는 법을 알 수 없었다)
+  if (/^!유저등록(\s|$)/.test(text)){ msg.reply(registerUser(text.replace(/^!유저등록/, ""))); return; }
+  if (/^!게임등록(\s|$)/.test(text)){ msg.reply(registerGame(text.replace(/^!게임등록/, ""))); return; }
+  if (text === "!등록목록"){ msg.reply(registryText()); return; }
   if (/^!게임기록(\s+\d{8})?(\n|$)/.test(text)){ msg.reply(handleRecord(text)); return; }
   if (/^!게임순위(\s+.*)?$/.test(text)){ var arg = trim(text.replace(/^!게임순위/, "")); msg.reply(handleUnifiedRank(arg)); return; }
   if (/^!완승기록\s+.+$/.test(text)){ var name=trim(text.replace(/^!완승기록\s+/, "")); msg.reply(handlePerfectWins(name)); return; }
