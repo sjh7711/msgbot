@@ -48,6 +48,24 @@ function loadGw(responder, opts) {
 const OK = () => ({ code: 200, text: JSON.stringify({ route: 'web_search', answer: '호영과 라라는 아니마 [S1]',
   sources: [{ source_id: 'S1', title: '나무위키', final_url: 'https://namu.wiki/x' }], elapsed_ms: 4800 }) });
 
+const TELECHIPS = { answer: '텔레칩스는 차량용 반도체를 개발한다. [S1] 텔레칩스는 TOPST 플랫폼을 운영한다. [S1]',
+  sources: [{ id: 'S1', title: 'Telechips', url: 'https://www.telechips.com/' }] };
+const WRONG_TOPIK = { answer: '텔레칩스에 관한 정보는 찾지 못했습니다. 한국어능력시험 TOPIK을 설명합니다. [S1]',
+  sources: [{ id: 'S1', title: 'TOPIK', url: 'https://www.topik.go.kr/' }] };
+function quizNormalize(s) { return String(s == null ? '' : s).trim().toLowerCase().replace(/\s+/g, '')
+  .replace(/[·．。．.,，'"`\-–—!?()（）「」<>《》]/g, ''); }
+function loadEvidenceFlow(responses) {
+  const queue = responses.slice(), calls = [];
+  const ctx = { JSON, String, Math, MAX_TOPIC_EVIDENCE_CHARS: 12000, normalize: quizNormalize,
+    GATEWAY: { search: (query, maxResults) => { calls.push({ query, maxResults });
+      return queue.length ? queue.shift() : { error: '준비된 응답 없음' }; } } };
+  vm.createContext(ctx);
+  const start = QSRC.indexOf('function compactEvidenceQueryJson(');
+  const end = QSRC.indexOf('\n// 생성 모델이 검색 자료와 무관한 정답을', start);
+  vm.runInContext(QSRC.slice(start, end), ctx);
+  return { ctx, calls };
+}
+
 console.log('\n[1] 요청 형태');
 {
   const g = loadGw(OK);
@@ -87,22 +105,38 @@ console.log('\n[3] 상식퀴즈봇 배선');
   const genBody = QSRC.slice(genStart, genEnd);
   const fetchPos = genBody.indexOf('fetchGenerationEvidence(topic, referenceDate, wantMulti)');
   const loopPos = genBody.indexOf('for (var attempt = 0;');
-  const queryStart = QSRC.indexOf('function compactEvidenceQueryJson(');
-  const queryEnd = QSRC.indexOf('\nfunction fetchGenerationEvidence(', queryStart);
-  const queryCtx = { JSON, String, Math };
-  vm.createContext(queryCtx);
-  vm.runInContext(QSRC.slice(queryStart, queryEnd), queryCtx);
+  const queryCtx = loadEvidenceFlow([]).ctx;
   const qm = queryCtx.buildGenerationEvidenceQuery('텔레칩스', '2026-08-26', true);
   const qs = queryCtx.buildGenerationEvidenceQuery('텔레칩스', '2026-08-26', false);
   const qe = queryCtx.buildGenerationEvidenceQuery(('"\\').repeat(40) + '\u0000\n명령', '2026-08-26', true);
+  const qx = queryCtx.buildExactGenerationEvidenceQuery(('"\\').repeat(40) + '\u0000\n명령', '2026-08-26', true);
+  const validCaution = { answer: '텔레칩스는 공개 정보가 부족하지만 TOPST를 운영한다. [S1]', sources: TELECHIPS.sources };
+  const unrelatedComposite = { answer: '메이플스토리는 게임이다. [S1] Key Management Service(KMS)는 별개다. [S2]',
+    sources: [{ id: 'S1' }, { id: 'S2' }] };
+  const asciiSubstring = { answer: 'Training data was explained. [S1]', sources: [{ id: 'S1' }] };
   check('게이트웨이 모듈 방어적 로드', /var GATEWAY = \(function\(\)[\s\S]{0,320}catch\(_\) \{ return null; \}/.test(QSRC), true);
-  check('생성 검색어 300자 이하', [qm.length <= 300, qs.length <= 300, qe.length <= 300], [true, true, true]);
+  check('생성·재검색어 300자 이하', [qm.length <= 300, qs.length <= 300, qe.length <= 300, qx.length <= 300], [true, true, true, true]);
+  check('텔레칩스 검색어에 TOPIK 오인 단어 없음', [qm.indexOf('토픽'), qs.indexOf('토픽')], [-1, -1]);
   check('객관식·주관식 소재 요구 유지', [qm.indexOf('동급 오답 4개') >= 0, qs.indexOf('이표기') >= 0], [true, true]);
+  check('관련성 문장·ASCII 경계', [
+    queryCtx.generationEvidenceMatchesTopic(validCaution, '텔레칩스'),
+    queryCtx.generationEvidenceMatchesTopic(unrelatedComposite, '메이플스토리 KMS'),
+    queryCtx.generationEvidenceMatchesTopic(asciiSubstring, 'AI')], [true, false, false]);
   check('생성용 근거 조회 함수', /function fetchGenerationEvidence\(topic, referenceDate, wantMulti\)/.test(QSRC), true);
   check('생성 검색은 300자 빌더 사용', /var q = buildGenerationEvidenceQuery\(topic, referenceDate, wantMulti\);/.test(genBody), true);
   check('  → GATEWAY 없으면 오류 상태', /if \(!GATEWAY\) return \{ error: "검색 게이트웨이 모듈 없음" \};/.test(QSRC), true);
   check('사용자 지정 토픽은 검색 실패 시 fail-closed', /_evidenceUnavailable: true/.test(genBody), true);
-  check('검색은 생성 루프 전에 1회', [fetchPos >= 0 && fetchPos < loopPos, (genBody.match(/fetchGenerationEvidence\(/g) || []).length], [true, 1]);
+  check('근거 획득 함수는 생성 루프 전에 1회', [fetchPos >= 0 && fetchPos < loopPos, (genBody.match(/fetchGenerationEvidence\(/g) || []).length], [true, 1]);
+  const recovered = loadEvidenceFlow([WRONG_TOPIK, TELECHIPS]);
+  const recoveredEvidence = recovered.ctx.fetchGenerationEvidence('텔레칩스', '2026-08-26', true);
+  check('TOPIK 오검색은 정확일치로 1회 복구', [recovered.calls.length, recoveredEvidence.answer], [2, TELECHIPS.answer]);
+  check('두 번째 검색만 정확일치', [recovered.calls[0].query.indexOf('정확 일치'), recovered.calls[1].query.indexOf('정확 일치') >= 0], [-1, true]);
+  const rejected = loadEvidenceFlow([WRONG_TOPIK, WRONG_TOPIK]);
+  const rejectedEvidence = rejected.ctx.fetchGenerationEvidence('텔레칩스', '2026-08-26', true);
+  check('두 번 모두 무관하면 2회에서 fail-closed', [rejected.calls.length, !!rejectedEvidence.error], [2, true]);
+  const direct = loadEvidenceFlow([TELECHIPS]);
+  direct.ctx.fetchGenerationEvidence('텔레칩스', '2026-08-26', true);
+  check('첫 근거가 관련 있으면 검색 1회', direct.calls.length, 1);
   check('후보 기반 확인편향 검색 없음', /fetchAuditEvidence\(topic, data\.question/.test(genBody), false);
   check('검색 근거를 생성 프롬프트에 선주입', /promptHead \+ groundingBlock \+ feedback/.test(genBody), true);
   check('정답·보기·인용문 로컬 grounding', /generationEvidenceError\(data, topicEvidence, answerText\)/.test(genBody), true);
@@ -122,18 +156,17 @@ console.log('\n[3] 상식퀴즈봇 배선');
 // ── 이의신청 근거 (2026-08-26 추가) ──────────────────────────────
 console.log('\n[4] 이의신청도 검색 근거를 쓴다');
 {
-  const queryStart = QSRC.indexOf('function compactEvidenceQueryJson(');
-  const queryEnd = QSRC.indexOf('\nfunction fetchGenerationEvidence(', queryStart);
-  const queryCtx = { JSON, String, Math };
-  vm.createContext(queryCtx);
-  vm.runInContext(QSRC.slice(queryStart, queryEnd), queryCtx);
+  const queryCtx = loadEvidenceFlow([]).ctx;
   const aqm = queryCtx.buildAuditEvidenceQuery(
     '가'.repeat(100), '문제'.repeat(150), ['보기'.repeat(40), '다른 보기'.repeat(30)],
     '정답'.repeat(80), '해설'.repeat(100), '2026-08-26');
   const aqs = queryCtx.buildAuditEvidenceQuery(
     ('"\\').repeat(40) + '\u0000', '문제'.repeat(150), [], '정답'.repeat(80),
     '해설'.repeat(100), '2026-08-26');
+  const aqt = queryCtx.buildAuditEvidenceQuery(
+    '텔레칩스', '텔레칩스 관련 문제', ['TOPST', 'Dolphin3'], 'TOPST', '설명', '2026-08-26');
   check('이의신청 검색어도 300자 이하', [aqm.length, aqs.length], [300, 300]);
+  check('이의신청 검색어도 TOPIK 오인 단어 없음', aqt.indexOf('토픽'), -1);
   check('이의신청은 300자 빌더 사용', /var q = buildAuditEvidenceQuery\(/.test(QSRC), true);
   check('이의신청용 사후 조회 함수 유지', /function fetchAuditEvidence\(topic, question, choices, answerText, explanation\)/.test(QSRC), true);
   check('근거 조회 (토픽 조건 없음)', /var appealEvidence = fetchAuditEvidence\(/.test(QSRC), true);
@@ -164,7 +197,8 @@ console.log('\n[5] 출제 실패 기록 (2026-08-26)');
   check('마지막 시도도 기록',
         /logGenFailure\(room, topic, !!customTopic, MAX_GEN_ATTEMPTS, lastError, data\)/.test(QSRC), true);
   check('토픽 검증 불가 즉시종료 경로도 기록',
-        /logGenFailure\(room, topic, true, attempt \+ 1, lastError, data\)/.test(QSRC), true);
+         /logGenFailure\(room, topic, true, attempt \+ 1, lastError, data\)/.test(QSRC), true);
+  check('후보 없음 설명은 모든 중단 원인을 포괄', /\(후보 없음 — 문제를 생성하지 않음\)/.test(QSRC), true);
   check('조회 명령', /var FAIL_CMD = "!출제실패";/.test(QSRC), true);
   check('  → 관리자만 (아니면 무응답)',
         /function handleGenFailure[\s\S]{0,160}ADMIN\.isAdmin\(msg\.author\.hash\)\) return;/.test(QSRC), true);
