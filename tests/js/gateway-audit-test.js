@@ -57,22 +57,23 @@ const TELECHIPS = { answer: '텔레칩스는 차량용 반도체를 개발한다
   sources: [{ id: 'S1', title: 'Telechips', url: 'https://www.telechips.com/' }] };
 const WRONG_TOPIK = { answer: '텔레칩스에 관한 정보는 찾지 못했습니다. 한국어능력시험 TOPIK을 설명합니다. [S1]',
   sources: [{ id: 'S1', title: 'TOPIK', url: 'https://www.topik.go.kr/' }] };
-function groundedDs(names, answer) {
-  return names.map((name) => ({ name, fact: name + '은 실제 검증 후보다.',
-    why_wrong: name + '은 이 소재의 정답 ' + answer + '이 아니다.', source_ids: ['S1'] }));
+function groundedDs(names) {
+  return names.map((name) => ({ name, source_ids: ['S1'] }));
 }
 const STRUCTURED_TELECHIPS = {
-  schema_version: 2,
+  schema_version: 3,
   resolved_topic: { name: '텔레칩스', sense: '대한민국 팹리스 반도체 기업', aliases: ['텔레칩스'] },
   materials: [
     { id: 'M1', facet: '제품·기술', answer: 'Dolphin3',
-      answer_type: 'product', choice_mode: 'grounded_entities',
+      answer_type: 'product', choice_mode: 'grounded',
       fact: '텔레칩스는 Dolphin3 차량용 프로세서를 공개했다.', source_ids: ['S1'],
-      distractors: groundedDs(['VCP', 'N-Dolphin', 'AXON', 'TCC8050'], 'Dolphin3') },
+      evidence: [{ source_id: 'S1', quote: '텔레칩스는 Dolphin3 차량용 프로세서를 공개했다.' }],
+      distractors: groundedDs(['VCP', 'N-Dolphin', 'AXON', 'TCC8050']) },
     { id: 'M2', facet: '플랫폼', answer: 'TOPST',
-      answer_type: 'product', choice_mode: 'grounded_entities',
+      answer_type: 'product', choice_mode: 'grounded',
       fact: '텔레칩스는 TOPST 개발 플랫폼을 제공한다.', source_ids: ['S1'],
-      distractors: groundedDs(['Raspberry Pi', 'Arduino', 'Jetson Nano', 'BeagleBone'], 'TOPST') }
+      evidence: [{ source_id: 'S1', quote: '텔레칩스는 TOPST 개발 플랫폼을 제공한다.' }],
+      distractors: groundedDs(['Raspberry Pi', 'Arduino', 'Jetson Nano', 'BeagleBone']) }
   ],
   sources: [{ id: 'S1', title: 'Telechips Products', url: 'https://www.telechips.com/' }],
   partial: false, warnings: []
@@ -124,9 +125,29 @@ console.log('\n[1] 요청 형태');
      qeBody.material_count, qeBody.distractor_count, qeBody.stable_only],
     [false, 'quiz_evidence', '2026-08-26', 'multi', 5, 4, true]);
   check('제외 정답은 별도 배열·중복 제거', qeBody.exclude_answers, ['TOPST']);
+  const qeShort = loadQuizEvidence(() => ({ code: 200, text: JSON.stringify(STRUCTURED_TELECHIPS) }));
+  qeShort.mod.fetchEvidence('텔레칩스', {
+    referenceDate: '2026-08-26', quizType: 'short', distractorCount: 4
+  });
+  check('주관식 요청도 v3 고정 distractor_count=4 전송',
+    JSON.parse(qeShort.log[0].body).distractor_count, 4);
+  const invalidCount = loadQuizEvidence(() => ({ code: 200, text: JSON.stringify(STRUCTURED_TELECHIPS) }));
+  check('고정값이 아닌 distractor_count는 전송 전 거부',
+    [invalidCount.mod.fetchEvidence('텔레칩스', {
+      referenceDate: '2026-08-26', distractorCount: 3
+    }).errorCode, invalidCount.log.length], ['INVALID_REQUEST', 0]);
   check('구조화 소재·실제 URL 출처 수신',
-    [qeResult.materials.length, qeResult.materials[0].distractors.length, qeResult.sources[0].url],
-    [2, 4, 'https://www.telechips.com/']);
+    [qeResult.schema_version, qeResult.materials.length, qeResult.materials[0].distractors.length,
+     Object.keys(qeResult.materials[0].distractors[0]).sort(), qeResult.sources[0].url],
+    [3, 2, 4, ['name', 'source_ids', 'synthetic'], 'https://www.telechips.com/']);
+  const partial = JSON.parse(JSON.stringify(STRUCTURED_TELECHIPS));
+  partial.partial = true;
+  partial.materials = partial.materials.slice(0, 1);
+  const partialResult = loadQuizEvidence(() => ({ code: 200, text: JSON.stringify(partial) }))
+    .mod.fetchEvidence('텔레칩스', { referenceDate: '2026-08-26', quizType: 'multi' });
+  check('partial=true여도 완전한 소재가 하나 이상이면 성공',
+    [partialResult.partial, partialResult.materials.length, partialResult.error],
+    [true, 1, undefined]);
   const tooFew = JSON.parse(JSON.stringify(STRUCTURED_TELECHIPS));
   tooFew.materials[0].distractors = tooFew.materials[0].distractors.slice(0, 3);
   check('객관식 오답 4개 미만 성공 응답도 클라이언트가 거부',
@@ -154,6 +175,12 @@ console.log('\n[2] 실패는 예외 대신 { error } — 호출 측이 fail-clos
     error: { code: 'GATEWAY_BUSY', message: '검색 처리 중입니다', retryable: true }
   }) })).mod.fetchEvidence('텔레칩스', { referenceDate: '2026-08-26' });
   check('전용 오류 코드·retryable 보존', [coded.errorCode, coded.retryable], ['GATEWAY_BUSY', true]);
+  const insufficient = loadQuizEvidence(() => ({ code: 422, text: JSON.stringify({
+    error: { code: 'INSUFFICIENT_DISTRACTORS', message: '근거 있는 오답 부족', retryable: false }
+  }) })).mod.fetchEvidence('창팝', { referenceDate: '2026-08-26' });
+  check('v3의 422 의미 오류 보존',
+    [insufficient.errorCode, insufficient.retryable, insufficient.httpStatus],
+    ['INSUFFICIENT_DISTRACTORS', false, 422]);
   const unsafe = JSON.parse(JSON.stringify(STRUCTURED_TELECHIPS));
   unsafe.materials[0].fact += ' https://fake.example/';
   check('생성 텍스트 URL은 클라이언트에서도 fail-closed',
@@ -194,7 +221,7 @@ console.log('\n[3] 상식퀴즈봇 배선');
   check('날짜·서수·순수 측정값만 면제하고 혼합 직책·제품 숫자는 차단', scalarChecks,
     [true, true, true, true, true, true]);
   const formatFallbackChecks = vm.runInContext(`(function(){
-    var complete={answer:'CFOP',choiceMode:'grounded_entities',distractors:[{name:'A'},{name:'B'},{name:'C'},{name:'D'}]};
+    var complete={answer:'CFOP',choiceMode:'grounded',distractors:[{name:'A'},{name:'B'},{name:'C'},{name:'D'}]};
     var incomplete={answer:'6개',choiceMode:'scalar',distractors:[{name:'1개'},{name:'2개'}]};
     var multi=planGroundedQuizFormat(true,[incomplete,complete],{});
     var invalid=planGroundedQuizFormat(true,[incomplete],{});
@@ -202,8 +229,8 @@ console.log('\n[3] 상식퀴즈봇 배선');
     return [multi.wantMulti,multi.materials.length,multi.materials[0].answer,multi.fallback,
       invalid.wantMulti,invalid.materials.length,invalid.fallback,short.wantMulti,short.materials.length];
   })()`, queryCtx);
-  check('v2는 소재별 오답 4개가 완전한 객관식 소재만 사용', formatFallbackChecks,
-    [true, 1, 'CFOP', '', true, 0, 'invalid_v2_material', false, 1]);
+  check('v3는 소재별 오답 4개가 완전한 객관식 소재만 사용', formatFallbackChecks,
+    [true, 1, 'CFOP', '', true, 0, 'invalid_v3_material', false, 1]);
   const exactChecks = vm.runInContext(`[
     evidenceSentenceHasExactToken('후보가 13위였다', '3위'),
     evidenceSentenceHasExactToken('공식 제품 Dolphin3이 있다', 'Dolphin'),
@@ -268,8 +295,9 @@ console.log('\n[3] 상식퀴즈봇 배선');
   check('구조화 근거는 검색 1회', direct.calls.length, 1);
   check('전용 호출은 토픽과 구조화 옵션을 분리',
     [direct.calls[0].query, direct.calls[0].options.referenceDate,
-     direct.calls[0].options.quizType, direct.calls[0].options.excludeAnswers],
-    ['텔레칩스', '2026-08-26', 'multi', ['TOPST']]);
+     direct.calls[0].options.quizType, direct.calls[0].options.materialCount,
+     direct.calls[0].options.excludeAnswers],
+    ['텔레칩스', '2026-08-26', 'multi', 5, ['TOPST']]);
   const scopedEvidence = direct.ctx.scopedEvidenceForMaterial(directEvidence, directEvidence.materials[0]);
   check('material별 정답·오답을 선택 소재 인용 검증으로만 투영',
     [directEvidence.materials.length, directEvidence.materials[0].distractors.length,
@@ -293,6 +321,23 @@ console.log('\n[3] 상식퀴즈봇 배선');
   check('미사용 소재가 0개일 때만 보강 검색', /if \(!topicMaterials\.length && gatewaySearchesUsed < MAX_GENERATION_GATEWAY_SEARCHES\)/.test(genBody), true);
   check('생성 검색 총예산 2회', /var MAX_GENERATION_GATEWAY_SEARCHES = 2;/.test(genBody) &&
     /gatewaySearchesUsed < MAX_GENERATION_GATEWAY_SEARCHES/.test(genBody), true);
+  const retryStrategy = vm.runInContext(`[
+    shouldRetrySameQuizMaterial('JSON 파싱 실패: bad'),
+    shouldRetrySameQuizMaterial('객관식 보기 수 오류'),
+    shouldRetrySameQuizMaterial('생성 근거 불일치: 선택 소재 밖의 보기'),
+    shouldRetrySameQuizMaterial('감사 반려: 사실 오류'),
+    shouldRetrySameQuizMaterial('최근 출제 정답 중복: CFOP'),
+    shouldRetrySameQuizMaterial('로컬 정책 반려: 현재 정보')
+  ]`, queryCtx);
+  check('형식 오류만 같은 소재에서 교정하고 사실·중복은 다음 소재로 이동', retryStrategy,
+    [true, true, true, false, false, false]);
+  check('compact v3 소재는 최초·보강 모두 5개 요청',
+    /var QUIZ_EVIDENCE_MATERIAL_COUNT = 5;/.test(QSRC) &&
+    (QSRC.match(/materialCount: QUIZ_EVIDENCE_MATERIAL_COUNT/g) || []).length === 2, true);
+  check('소재별 교정 1회와 다음 소재 이동 상태를 분리',
+    /var materialIndex = 0;/.test(genBody) && /var sameMaterialRetryUsed = false;/.test(genBody) &&
+    /shouldRetrySameQuizMaterial\(lastError\) && !sameMaterialRetryUsed/.test(genBody) &&
+    /materialIndex\+\+/.test(genBody), true);
   check('정답·보기·인용문 로컬 grounding', /generationEvidenceError\(data, candidateEvidence, answerText\)/.test(genBody), true);
   check('후보별 검증 근거를 감사에 전달', /auditQuiz\(data, topic, wantMulti, answerText, room, referenceDate, !!customTopic, candidateEvidence\)/.test(genBody), true);
   check('정답·출처 core 검사는 유지', /function generationCoreEvidenceError\(data, evidence, answerText\)/.test(QSRC), true);
@@ -317,7 +362,7 @@ console.log('\n[3] 상식퀴즈봇 배선');
   check('모듈 경계 sources 배열 호환', /typeof result\.sources\.length !== "number"/.test(QSRC), true);
   check('근거 미지원 핵심 주장은 하드 반려', /unsupported_by_evidence: \{ label: "검색 근거에 없는 핵심 주장", hard: true \}/.test(QSRC), true);
   check('  → 숫자 면제는 감사에도 명시', /evidence_exempt_distractor_indices/.test(QSRC) && /동일 템플릿 거짓 숫자 대안/.test(QSRC), true);
-  check('  → scalar 면제는 검증된 v2 choice_mode에서만 감사 직전 재계산',
+  check('  → scalar 면제는 검증된 v3 choice_mode에서만 감사 직전 재계산',
     /data\._verifiedChoiceMode === "scalar"/.test(QSRC) &&
     /var auditScalarSet = \(wantMulti && data\._verifiedChoiceMode === "scalar"\)/.test(QSRC), true);
   check('  → 기본 토픽 적용 불가 오탐 무시', /if \(!evidence\) v\.unsupported_by_evidence = false;/.test(QSRC), true);
@@ -371,7 +416,7 @@ console.log('\n[5] 출제 실패 기록 (2026-08-26)');
   check('반복 상단에서 직전 후보 기록',
         /logGenFailure\(room, topic, !!customTopic, attempt, lastError, data, failureEvidence\)/.test(QSRC), true);
   check('마지막 시도도 기록',
-        /logGenFailure\(room, topic, !!customTopic, MAX_GEN_ATTEMPTS, lastError, data, failureEvidence\)/.test(QSRC), true);
+        /logGenFailure\(room, topic, !!customTopic, attemptsMade \|\| MAX_GEN_ATTEMPTS,/.test(QSRC), true);
   check('토픽 검증 불가 즉시종료 경로도 기록',
          /logGenFailure\(room, topic, true, attempt \+ 1, lastError, data, failureEvidence\)/.test(QSRC), true);
   check('감사 시스템 중단 경로도 근거와 함께 기록',

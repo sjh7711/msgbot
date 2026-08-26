@@ -1,6 +1,6 @@
-"""퀴즈 근거 전용 API v2와 상식퀴즈봇 사이의 구조화 계약 회귀 테스트.
+"""퀴즈 근거 전용 API compact v3와 상식퀴즈봇 사이의 계약 회귀 테스트.
 
-실제 검색/Gemini를 호출하지 않는다. v2의 핵심인 토픽 의미 고정과
+실제 검색/Gemini를 호출하지 않는다. v3의 핵심인 토픽 의미 고정과
 material별 정답·오답 묶음을 Python으로 미러링한다.
 """
 
@@ -33,12 +33,27 @@ def _source_ids(raw: object, known: set[str]) -> list[str]:
     return list(dict.fromkeys(map(str, raw)))
 
 
+def _evidence(raw: object, known: set[str]) -> list[dict[str, str]]:
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("MODEL_OUTPUT_FORMAT")
+    result: list[dict[str, str]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise ValueError("MODEL_OUTPUT_FORMAT")
+        source_id = str(entry.get("source_id", "")).strip()
+        quote = str(entry.get("quote", "")).strip()
+        if source_id not in known or not quote or GENERATED_MARKUP_RE.search(quote):
+            raise ValueError("MODEL_OUTPUT_FORMAT")
+        result.append({"source_id": source_id, "quote": quote})
+    return result
+
+
 def validate_structured_response(
     payload: dict[str, object], *, requested_topic: str, required_distractor_count: int = 4
 ) -> dict[str, object]:
-    """lib/quiz-evidence.js validateSuccess의 v2 핵심 계약을 미러링한다."""
+    """lib/quiz-evidence.js validateSuccess의 compact v3 핵심 계약을 미러링한다."""
 
-    if payload.get("schema_version") != 2:
+    if payload.get("schema_version") != 3:
         raise ValueError("MODEL_OUTPUT_FORMAT")
 
     raw_sources = payload.get("sources")
@@ -90,6 +105,7 @@ def validate_structured_response(
         choice_mode = str(raw.get("choice_mode", "")).strip()
         fact = str(raw.get("fact", "")).strip()
         ids = _source_ids(raw.get("source_ids"), source_ids)
+        _evidence(raw.get("evidence"), source_ids)
         raw_distractors = raw.get("distractors")
         if (
             not MATERIAL_ID_RE.fullmatch(material_id)
@@ -97,7 +113,7 @@ def validate_structured_response(
             or not facet
             or not answer
             or answer_type not in ANSWER_TYPES
-            or choice_mode not in {"grounded_entities", "scalar"}
+            or choice_mode not in {"grounded", "scalar"}
             or (choice_mode == "scalar" and answer_type not in SCALAR_TYPES)
             or not fact
             or answer not in fact
@@ -122,20 +138,12 @@ def validate_structured_response(
                     raise ValueError("MODEL_OUTPUT_FORMAT")
                 distractors.append({"name": name, "synthetic": True})
             else:
-                distractor_fact = str(raw_distractor.get("fact", "")).strip()
-                why_wrong = str(raw_distractor.get("why_wrong", "")).strip()
                 distractor_ids = _source_ids(raw_distractor.get("source_ids"), source_ids)
-                if (
-                    not distractor_fact
-                    or name not in distractor_fact
-                    or not why_wrong
-                    or GENERATED_MARKUP_RE.search(f"{distractor_fact} {why_wrong}")
-                ):
+                if raw_distractor.get("synthetic") is True:
                     raise ValueError("MODEL_OUTPUT_FORMAT")
-                quote = distractor_fact + " " + why_wrong + " " + "".join(
-                    f"[{source_id}]" for source_id in distractor_ids
+                distractors.append(
+                    {"name": name, "source_ids": distractor_ids, "synthetic": False}
                 )
-                distractors.append({"name": name, "quote": quote, "synthetic": False})
             local_names.add(name_key)
 
         quote = fact + " " + "".join(f"[{source_id}]" for source_id in ids)
@@ -155,10 +163,12 @@ def validate_structured_response(
         material_answers.add(normalize_key(answer))
 
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "resolved_topic": resolved,
         "materials": materials,
         "sources": sources,
+        "partial": payload.get("partial") is True,
+        "warnings": list(payload.get("warnings", [])),
     }
 
 
@@ -169,7 +179,7 @@ def fixture(
     distractor_names: list[str] | None = None,
     *,
     answer_type: str = "term",
-    choice_mode: str = "grounded_entities",
+    choice_mode: str = "grounded",
 ) -> dict[str, object]:
     assert topic and answer in fact
     names = distractor_names or ["알파", "베타", "감마", "델타"]
@@ -178,16 +188,11 @@ def fixture(
         distractors = [{"name": name, "synthetic": True} for name in names]
     else:
         distractors = [
-            {
-                "name": name,
-                "fact": f"{name}은 검증된 실제 후보다.",
-                "why_wrong": f"{name}은 이 문제의 정답인 {answer}이 아니다.",
-                "source_ids": ["S1"],
-            }
+            {"name": name, "source_ids": ["S1"]}
             for name in names
         ]
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "resolved_topic": {"name": topic, "sense": f"{topic} 퀴즈 대상", "aliases": [topic]},
         "materials": [
             {
@@ -198,6 +203,7 @@ def fixture(
                 "choice_mode": choice_mode,
                 "fact": fact,
                 "source_ids": ["S1"],
+                "evidence": [{"source_id": "S1", "quote": fact}],
                 "distractors": distractors,
             }
         ],
@@ -244,11 +250,14 @@ class QuizEvidenceContractTests(unittest.TestCase):
         self.assertIn("url", result["sources"][0])
         self.assertNotIn("url", prompt_sources[0])
 
-    def test_v1_and_contract_violations_are_rejected(self) -> None:
+    def test_legacy_schemas_and_contract_violations_are_rejected(self) -> None:
         base = fixture("수박", "시트룰린", "수박에는 시트룰린이 들어 있다.")
         v1 = {key: value for key, value in base.items() if key != "schema_version"}
         with self.assertRaisesRegex(ValueError, "MODEL_OUTPUT_FORMAT"):
             validate_structured_response(v1, requested_topic="수박")
+        v2 = {**base, "schema_version": 2}
+        with self.assertRaisesRegex(ValueError, "MODEL_OUTPUT_FORMAT"):
+            validate_structured_response(v2, requested_topic="수박")
 
         bad_url = {**base, "materials": [dict(base["materials"][0])]}
         bad_url["materials"][0]["fact"] += " https://fake.example/"
@@ -288,6 +297,15 @@ class QuizEvidenceContractTests(unittest.TestCase):
             [item["name"] for item in result["materials"][1]["distractors"]],
             ["1971년", "1972년", "1973년", "1975년"],
         )
+
+    def test_partial_response_with_one_material_is_success(self) -> None:
+        payload = fixture("텔레칩스", "Dolphin3", "텔레칩스는 Dolphin3를 공개했다.")
+        payload["partial"] = True
+        payload["warnings"] = ["불완전한 소재 4개를 제외했습니다."]
+        result = validate_structured_response(payload, requested_topic="텔레칩스")
+        self.assertEqual(result["schema_version"], 3)
+        self.assertTrue(result["partial"])
+        self.assertEqual(len(result["materials"]), 1)
 
     def test_scalar_distractors_must_be_synthetic(self) -> None:
         payload = fixture(
