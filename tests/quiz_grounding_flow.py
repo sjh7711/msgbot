@@ -905,6 +905,27 @@ class GroundingFlowTests(unittest.TestCase):
 
 
 class JavaScriptGroundingContractTests(unittest.TestCase):
+    def test_quiz_failure_messages_are_concise(self) -> None:
+        js_path = Path(__file__).resolve().parents[1] / "Bots" / "상식퀴즈봇" / "상식퀴즈봇.js"
+        source = js_path.read_text(encoding="utf-8")
+
+        expected = (
+            "❗ 신뢰할 검색 근거를 찾지 못해 출제하지 않았습니다.",
+            "검증 가능한 정보가 부족합니다.",
+            "더 넓거나 다른 표현으로 요청해주세요.",
+            "❗ 사실 검증을 완료하지 못해 출제하지 않았습니다.",
+        )
+        missing = [message for message in expected if message not in source]
+        self.assertFalse(missing, "간결한 출제 실패 안내 누락: " + " | ".join(missing))
+
+        verbose_legacy_messages = (
+            "모델의 기억만으로 문제를 만들지 않습니다.",
+            "⚠️ 토픽 검증 불가\\n",
+            "미검증 문제는 안전을 위해 공개하지 않습니다.",
+        )
+        remaining = [message for message in verbose_legacy_messages if message in source]
+        self.assertFalse(remaining, "이전의 장문 안내가 남아 있음: " + " | ".join(remaining))
+
     def test_javascript_grounding_contract(self) -> None:
         js_path = Path(__file__).resolve().parents[1] / "Bots" / "상식퀴즈봇" / "상식퀴즈봇.js"
         source = js_path.read_text(encoding="utf-8")

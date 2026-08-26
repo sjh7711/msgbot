@@ -3293,18 +3293,17 @@ function processTask(task) {
     fq.generating = false;
     if (task.evidenceUnavailable) {
       bot.send(task.room,
-        "❗ 토픽 검색 근거를 확보하지 못해 퀴즈를 출제하지 않았습니다.\n" +
-        "모델의 기억만으로 문제를 만들지 않습니다. 잠시 후 다시 시도해주세요.");
+        "❗ 신뢰할 검색 근거를 찾지 못해 출제하지 않았습니다.\n" +
+        "잠시 후 다시 시도해주세요.");
     } else if (task.unverifiable) {
-      var safeTopic = String(task.topic || "요청한 토픽").replace(/[\r\n]+/g, " ").trim().slice(0, 80);
+      var safeTopic = String(task.topic || "요청한 주제").replace(/[\r\n]+/g, " ").trim().slice(0, 80);
       bot.send(task.room,
-        "⚠️ 토픽 검증 불가\n" +
-        "\"" + safeTopic + "\"에 대해 확인 가능한 사실이 부족해 퀴즈를 출제하지 않았습니다.\n" +
-        "다른 표현이나 더 넓은 분야로 다시 요청해주세요.");
+        "⚠️ \"" + safeTopic + "\"의 검증 가능한 정보가 부족합니다.\n" +
+        "더 넓거나 다른 표현으로 요청해주세요.");
     } else if (task.auditUnavailable && !task.quotaExhausted) {
       bot.send(task.room,
-        "❗ 사실 검증 시스템 응답을 확인하지 못해 퀴즈를 출제하지 않았습니다.\n" +
-        "미검증 문제는 안전을 위해 공개하지 않습니다. 잠시 후 다시 시도해주세요.");
+        "❗ 사실 검증을 완료하지 못해 출제하지 않았습니다.\n" +
+        "잠시 후 다시 시도해주세요.");
     } else if (task.quotaExhausted) {
       bot.send(task.room,
         "사용가능 API [0/" + API_KEYS.length + "]\n상식퀴즈 일시적으로 사용 불가\n\n" +
