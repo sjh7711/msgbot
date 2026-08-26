@@ -2316,7 +2316,7 @@ class JavaScriptGroundingContractTests(unittest.TestCase):
         for snippet in (
             'var BASE_URL = "http://192.168.0.55:18083/v1/quiz-evidence";',
             "var SCHEMA_VERSION = 2;",
-            "schema_version: SCHEMA_VERSION",
+            "Number(resp.schema_version) !== SCHEMA_VERSION",
             'profile: "quiz_evidence"',
             "reference_date: referenceDate",
             "stable_only: true",
@@ -2333,6 +2333,12 @@ class JavaScriptGroundingContractTests(unittest.TestCase):
             "query: topic",
             quiz_evidence_source,
             "전용 API query가 순수 토픽이 아님",
+        )
+        request_block = quiz_evidence_source.split("var requestPayload = {", 1)[1].split("};", 1)[0]
+        self.assertNotIn(
+            "schema_version",
+            request_block,
+            "v1 협상을 하지 않는 전용 API 요청에 schema_version을 전송함",
         )
         self.assertIn(
             "sources: promptEvidenceSources(evidence)",

@@ -120,9 +120,9 @@ console.log('\n[1] 요청 형태');
   check('퀴즈 전용 endpoint', qe.log[0].url, 'http://192.168.0.55:18083/v1/quiz-evidence');
   check('query에는 토픽만', qeBody.query, '텔레칩스');
   check('전용 profile과 구조화 옵션',
-    [qeBody.schema_version, qeBody.profile, qeBody.reference_date, qeBody.quiz_type,
+    [Object.prototype.hasOwnProperty.call(qeBody, 'schema_version'), qeBody.profile, qeBody.reference_date, qeBody.quiz_type,
      qeBody.material_count, qeBody.distractor_count, qeBody.stable_only],
-    [2, 'quiz_evidence', '2026-08-26', 'multi', 5, 4, true]);
+    [false, 'quiz_evidence', '2026-08-26', 'multi', 5, 4, true]);
   check('제외 정답은 별도 배열·중복 제거', qeBody.exclude_answers, ['TOPST']);
   check('구조화 소재·실제 URL 출처 수신',
     [qeResult.materials.length, qeResult.materials[0].distractors.length, qeResult.sources[0].url],
