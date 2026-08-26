@@ -697,7 +697,7 @@ def assert_javascript_contract() -> None:
         'generationEvidenceError(data, candidateEvidence, answerText)',
         'safeScalarChoiceSet(data.choices, answerText)',
         '객관식 오답 명칭 검증 실패: 선택 소재의 verified_distractors에 없음:',
-        'sanitizeAcceptableAliases(data, customTopic ? candidateEvidence : null, String(data.answer), customTopic ? topic : "")',
+        'if (!customTopic) sanitizeAcceptableAliases(data, null, String(data.answer), "");',
         'var auditScalarSet = (wantMulti && data._verifiedChoiceMode === "scalar")',
         'evidence_exempt_distractor_indices: auditScalarSet ? auditScalarSet.exemptIndices : []',
         'localQuizPolicyError(data, referenceDate, !!customTopic, !!topicEvidence)',
