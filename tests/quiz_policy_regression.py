@@ -692,6 +692,8 @@ def assert_javascript_contract() -> None:
         'var MAX_GENERATION_GATEWAY_SEARCHES = 2;',
         'var QUIZ_EVIDENCE_MATERIAL_COUNT = 5;',
         'shouldRetrySameQuizMaterial(lastError) && !sameMaterialRetryUsed',
+        'data.acceptable = verifiedMaterialAliasNames(currentMaterial);',
+        'auditTarget.verified_answer_aliases = evidence._verifiedAliasEntries || [];',
         'generationEvidenceError(data, candidateEvidence, answerText)',
         'safeScalarChoiceSet(data.choices, answerText)',
         '객관식 오답 명칭 검증 실패: 선택 소재의 verified_distractors에 없음:',

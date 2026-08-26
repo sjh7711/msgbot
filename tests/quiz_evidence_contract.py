@@ -1,6 +1,6 @@
-"""퀴즈 근거 전용 API compact v3와 상식퀴즈봇 사이의 계약 회귀 테스트.
+"""퀴즈 근거 전용 API v4와 상식퀴즈봇 사이의 계약 회귀 테스트.
 
-실제 검색/Gemini를 호출하지 않는다. v3의 핵심인 토픽 의미 고정과
+실제 검색/Gemini를 호출하지 않는다. v4의 핵심인 토픽 의미 고정과
 material별 정답·오답 묶음을 Python으로 미러링한다.
 """
 
@@ -21,6 +21,8 @@ ANSWER_TYPES = {
     "event", "year", "date", "count", "measurement",
 }
 SCALAR_TYPES = {"year", "date", "count", "measurement"}
+GROUNDED_ALIAS_KINDS = {"official", "abbreviation", "synonym"}
+SYNTHETIC_ALIAS_KINDS = {"transliteration", "numeric"}
 
 
 def normalize_key(value: object) -> str:
@@ -51,9 +53,9 @@ def _evidence(raw: object, known: set[str]) -> list[dict[str, str]]:
 def validate_structured_response(
     payload: dict[str, object], *, requested_topic: str, required_distractor_count: int = 4
 ) -> dict[str, object]:
-    """lib/quiz-evidence.js validateSuccess의 compact v3 핵심 계약을 미러링한다."""
+    """lib/quiz-evidence.js validateSuccess의 v4 핵심 계약을 미러링한다."""
 
-    if payload.get("schema_version") != 3:
+    if payload.get("schema_version") != 4:
         raise ValueError("MODEL_OUTPUT_FORMAT")
 
     raw_sources = payload.get("sources")
@@ -107,6 +109,7 @@ def validate_structured_response(
         ids = _source_ids(raw.get("source_ids"), source_ids)
         _evidence(raw.get("evidence"), source_ids)
         raw_distractors = raw.get("distractors")
+        raw_aliases = raw.get("answer_aliases")
         if (
             not MATERIAL_ID_RE.fullmatch(material_id)
             or material_id in material_ids
@@ -119,14 +122,46 @@ def validate_structured_response(
             or answer not in fact
             or GENERATED_MARKUP_RE.search(f"{facet} {answer} {fact}")
             or normalize_key(answer) in material_answers
+            or not isinstance(raw_aliases, list)
+            or len(raw_aliases) > 6
             or not isinstance(raw_distractors, list)
         ):
             raise ValueError("MODEL_OUTPUT_FORMAT")
         if required_distractor_count and len(raw_distractors) != required_distractor_count:
             raise ValueError("INSUFFICIENT_DISTRACTORS")
 
-        distractors: list[dict[str, object]] = []
+        aliases: list[dict[str, object]] = []
         local_names = {normalize_key(answer)}
+        for raw_alias in raw_aliases:
+            assert isinstance(raw_alias, dict)
+            alias_name = str(raw_alias.get("name", "")).strip()
+            alias_key = normalize_key(alias_name)
+            alias_kind = str(raw_alias.get("kind", "")).strip()
+            if (
+                not alias_name
+                or alias_key in local_names
+                or GENERATED_MARKUP_RE.search(alias_name)
+            ):
+                raise ValueError("MODEL_OUTPUT_FORMAT")
+            if alias_kind in GROUNDED_ALIAS_KINDS:
+                alias_ids = _source_ids(raw_alias.get("source_ids"), source_ids)
+                if raw_alias.get("synthetic") is True:
+                    raise ValueError("MODEL_OUTPUT_FORMAT")
+                aliases.append(
+                    {"name": alias_name, "kind": alias_kind,
+                     "source_ids": alias_ids, "synthetic": False}
+                )
+            elif alias_kind in SYNTHETIC_ALIAS_KINDS:
+                if raw_alias.get("synthetic") is not True or "source_ids" in raw_alias:
+                    raise ValueError("MODEL_OUTPUT_FORMAT")
+                aliases.append(
+                    {"name": alias_name, "kind": alias_kind, "synthetic": True}
+                )
+            else:
+                raise ValueError("MODEL_OUTPUT_FORMAT")
+            local_names.add(alias_key)
+
+        distractors: list[dict[str, object]] = []
         for raw_distractor in raw_distractors:
             assert isinstance(raw_distractor, dict)
             name = str(raw_distractor.get("name", "")).strip()
@@ -155,6 +190,7 @@ def validate_structured_response(
                 "answer_type": answer_type,
                 "choice_mode": choice_mode,
                 "quote": quote,
+                "answer_aliases": aliases,
                 "distractors": distractors,
                 "verified": {normalize_key(answer), *local_names},
             }
@@ -163,7 +199,7 @@ def validate_structured_response(
         material_answers.add(normalize_key(answer))
 
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "resolved_topic": resolved,
         "materials": materials,
         "sources": sources,
@@ -180,6 +216,7 @@ def fixture(
     *,
     answer_type: str = "term",
     choice_mode: str = "grounded",
+    answer_aliases: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     assert topic and answer in fact
     names = distractor_names or ["알파", "베타", "감마", "델타"]
@@ -192,7 +229,7 @@ def fixture(
             for name in names
         ]
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "resolved_topic": {"name": topic, "sense": f"{topic} 퀴즈 대상", "aliases": [topic]},
         "materials": [
             {
@@ -204,6 +241,7 @@ def fixture(
                 "fact": fact,
                 "source_ids": ["S1"],
                 "evidence": [{"source_id": "S1", "quote": fact}],
+                "answer_aliases": answer_aliases or [],
                 "distractors": distractors,
             }
         ],
@@ -250,14 +288,44 @@ class QuizEvidenceContractTests(unittest.TestCase):
         self.assertIn("url", result["sources"][0])
         self.assertNotIn("url", prompt_sources[0])
 
+    def test_grounded_and_synthetic_answer_aliases(self) -> None:
+        aliases: list[dict[str, object]] = [
+            {"name": "돌핀", "kind": "official", "source_ids": ["S1"]},
+            {"name": "돌핀3", "kind": "transliteration", "synthetic": True},
+            {"name": "돌핀 쓰리", "kind": "transliteration", "synthetic": True},
+        ]
+        result = validate_structured_response(
+            fixture(
+                "텔레칩스", "Dolphin3", "텔레칩스는 Dolphin3를 공개했다.",
+                answer_aliases=aliases,
+            ),
+            requested_topic="텔레칩스",
+        )
+        self.assertEqual(
+            [alias["name"] for alias in result["materials"][0]["answer_aliases"]],
+            ["돌핀", "돌핀3", "돌핀 쓰리"],
+        )
+
+        invalid = fixture(
+            "텔레칩스", "Dolphin3", "텔레칩스는 Dolphin3를 공개했다.",
+            answer_aliases=[
+                {
+                    "name": "돌핀3", "kind": "transliteration",
+                    "synthetic": True, "source_ids": ["S1"],
+                }
+            ],
+        )
+        with self.assertRaisesRegex(ValueError, "MODEL_OUTPUT_FORMAT"):
+            validate_structured_response(invalid, requested_topic="텔레칩스")
+
     def test_legacy_schemas_and_contract_violations_are_rejected(self) -> None:
         base = fixture("수박", "시트룰린", "수박에는 시트룰린이 들어 있다.")
         v1 = {key: value for key, value in base.items() if key != "schema_version"}
         with self.assertRaisesRegex(ValueError, "MODEL_OUTPUT_FORMAT"):
             validate_structured_response(v1, requested_topic="수박")
-        v2 = {**base, "schema_version": 2}
+        v3 = {**base, "schema_version": 3}
         with self.assertRaisesRegex(ValueError, "MODEL_OUTPUT_FORMAT"):
-            validate_structured_response(v2, requested_topic="수박")
+            validate_structured_response(v3, requested_topic="수박")
 
         bad_url = {**base, "materials": [dict(base["materials"][0])]}
         bad_url["materials"][0]["fact"] += " https://fake.example/"
@@ -303,7 +371,7 @@ class QuizEvidenceContractTests(unittest.TestCase):
         payload["partial"] = True
         payload["warnings"] = ["불완전한 소재 4개를 제외했습니다."]
         result = validate_structured_response(payload, requested_topic="텔레칩스")
-        self.assertEqual(result["schema_version"], 3)
+        self.assertEqual(result["schema_version"], 4)
         self.assertTrue(result["partial"])
         self.assertEqual(len(result["materials"]), 1)
 

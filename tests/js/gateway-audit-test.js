@@ -61,18 +61,23 @@ function groundedDs(names) {
   return names.map((name) => ({ name, source_ids: ['S1'] }));
 }
 const STRUCTURED_TELECHIPS = {
-  schema_version: 3,
+  schema_version: 4,
   resolved_topic: { name: '텔레칩스', sense: '대한민국 팹리스 반도체 기업', aliases: ['텔레칩스'] },
   materials: [
     { id: 'M1', facet: '제품·기술', answer: 'Dolphin3',
       answer_type: 'product', choice_mode: 'grounded',
       fact: '텔레칩스는 Dolphin3 차량용 프로세서를 공개했다.', source_ids: ['S1'],
       evidence: [{ source_id: 'S1', quote: '텔레칩스는 Dolphin3 차량용 프로세서를 공개했다.' }],
+      answer_aliases: [
+        { name: '돌핀3', kind: 'transliteration', synthetic: true },
+        { name: '돌핀 쓰리', kind: 'transliteration', synthetic: true }
+      ],
       distractors: groundedDs(['VCP', 'N-Dolphin', 'AXON', 'TCC8050']) },
     { id: 'M2', facet: '플랫폼', answer: 'TOPST',
       answer_type: 'product', choice_mode: 'grounded',
       fact: '텔레칩스는 TOPST 개발 플랫폼을 제공한다.', source_ids: ['S1'],
       evidence: [{ source_id: 'S1', quote: '텔레칩스는 TOPST 개발 플랫폼을 제공한다.' }],
+      answer_aliases: [],
       distractors: groundedDs(['Raspberry Pi', 'Arduino', 'Jetson Nano', 'BeagleBone']) }
   ],
   sources: [{ id: 'S1', title: 'Telechips Products', url: 'https://www.telechips.com/' }],
@@ -129,7 +134,7 @@ console.log('\n[1] 요청 형태');
   qeShort.mod.fetchEvidence('텔레칩스', {
     referenceDate: '2026-08-26', quizType: 'short', distractorCount: 4
   });
-  check('주관식 요청도 v3 고정 distractor_count=4 전송',
+  check('주관식 요청도 v4 고정 distractor_count=4 전송',
     JSON.parse(qeShort.log[0].body).distractor_count, 4);
   const invalidCount = loadQuizEvidence(() => ({ code: 200, text: JSON.stringify(STRUCTURED_TELECHIPS) }));
   check('고정값이 아닌 distractor_count는 전송 전 거부',
@@ -137,9 +142,10 @@ console.log('\n[1] 요청 형태');
       referenceDate: '2026-08-26', distractorCount: 3
     }).errorCode, invalidCount.log.length], ['INVALID_REQUEST', 0]);
   check('구조화 소재·실제 URL 출처 수신',
-    [qeResult.schema_version, qeResult.materials.length, qeResult.materials[0].distractors.length,
+    [qeResult.schema_version, qeResult.materials.length, qeResult.materials[0].answer_aliases.length,
+     qeResult.materials[0].distractors.length,
      Object.keys(qeResult.materials[0].distractors[0]).sort(), qeResult.sources[0].url],
-    [3, 2, 4, ['name', 'source_ids', 'synthetic'], 'https://www.telechips.com/']);
+    [4, 2, 2, 4, ['name', 'source_ids', 'synthetic'], 'https://www.telechips.com/']);
   const partial = JSON.parse(JSON.stringify(STRUCTURED_TELECHIPS));
   partial.partial = true;
   partial.materials = partial.materials.slice(0, 1);
@@ -154,6 +160,14 @@ console.log('\n[1] 요청 형태');
     loadQuizEvidence(() => ({ code: 200, text: JSON.stringify(tooFew) }))
       .mod.fetchEvidence('텔레칩스', { referenceDate: '2026-08-26', quizType: 'multi' }).errorCode,
     'INSUFFICIENT_DISTRACTORS');
+  const badAlias = JSON.parse(JSON.stringify(STRUCTURED_TELECHIPS));
+  badAlias.materials[0].answer_aliases[0] = {
+    name: '돌핀3', kind: 'transliteration', synthetic: true, source_ids: ['S1']
+  };
+  check('합성 별칭에 source_ids를 섞으면 클라이언트가 거부',
+    loadQuizEvidence(() => ({ code: 200, text: JSON.stringify(badAlias) }))
+      .mod.fetchEvidence('텔레칩스', { referenceDate: '2026-08-26', quizType: 'short' }).errorCode,
+    'MODEL_OUTPUT_FORMAT');
   const qeLong = loadQuizEvidence(() => ({ code: 200, text: JSON.stringify(STRUCTURED_TELECHIPS) }));
   check('전용 API도 300자 초과 토픽을 전송하지 않음',
     [qeLong.mod.fetchEvidence('가'.repeat(301), { referenceDate: '2026-08-26' }).errorCode,
@@ -178,7 +192,7 @@ console.log('\n[2] 실패는 예외 대신 { error } — 호출 측이 fail-clos
   const insufficient = loadQuizEvidence(() => ({ code: 422, text: JSON.stringify({
     error: { code: 'INSUFFICIENT_DISTRACTORS', message: '근거 있는 오답 부족', retryable: false }
   }) })).mod.fetchEvidence('창팝', { referenceDate: '2026-08-26' });
-  check('v3의 422 의미 오류 보존',
+  check('v4의 422 의미 오류 보존',
     [insufficient.errorCode, insufficient.retryable, insufficient.httpStatus],
     ['INSUFFICIENT_DISTRACTORS', false, 422]);
   const unsafe = JSON.parse(JSON.stringify(STRUCTURED_TELECHIPS));
@@ -229,8 +243,8 @@ console.log('\n[3] 상식퀴즈봇 배선');
     return [multi.wantMulti,multi.materials.length,multi.materials[0].answer,multi.fallback,
       invalid.wantMulti,invalid.materials.length,invalid.fallback,short.wantMulti,short.materials.length];
   })()`, queryCtx);
-  check('v3는 소재별 오답 4개가 완전한 객관식 소재만 사용', formatFallbackChecks,
-    [true, 1, 'CFOP', '', true, 0, 'invalid_v3_material', false, 1]);
+  check('v4는 소재별 오답 4개가 완전한 객관식 소재만 사용', formatFallbackChecks,
+    [true, 1, 'CFOP', '', true, 0, 'invalid_v4_material', false, 1]);
   const exactChecks = vm.runInContext(`[
     evidenceSentenceHasExactToken('후보가 13위였다', '3위'),
     evidenceSentenceHasExactToken('공식 제품 Dolphin3이 있다', 'Dolphin'),
@@ -299,11 +313,11 @@ console.log('\n[3] 상식퀴즈봇 배선');
      direct.calls[0].options.excludeAnswers],
     ['텔레칩스', '2026-08-26', 'multi', 5, ['TOPST']]);
   const scopedEvidence = direct.ctx.scopedEvidenceForMaterial(directEvidence, directEvidence.materials[0]);
-  check('material별 정답·오답을 선택 소재 인용 검증으로만 투영',
+  check('material별 정답·별칭·오답을 선택 소재 검증값으로만 투영',
     [directEvidence.materials.length, directEvidence.materials[0].distractors.length,
      !!scopedEvidence._verifiedItems['$dolphin3'], !!scopedEvidence._verifiedItems['$vcp'],
-     !!scopedEvidence._verifiedItems['$raspberrypi']],
-    [2, 4, true, true, false]);
+     !!scopedEvidence._verifiedItems['$raspberrypi'], !!scopedEvidence._verifiedAliases['$돌핀3']],
+    [2, 4, true, true, false, true]);
   const exactMaterialChoices = vm.runInContext(`(function(){
     var m=normalizeStructuredQuizEvidence(${JSON.stringify(STRUCTURED_TELECHIPS)},'텔레칩스').materials[0];
     var good={choices:['AXON','Dolphin3','VCP','TCC8050','N-Dolphin']};
@@ -331,7 +345,7 @@ console.log('\n[3] 상식퀴즈봇 배선');
   ]`, queryCtx);
   check('형식 오류만 같은 소재에서 교정하고 사실·중복은 다음 소재로 이동', retryStrategy,
     [true, true, true, false, false, false]);
-  check('compact v3 소재는 최초·보강 모두 5개 요청',
+  check('v4 소재는 최초·보강 모두 5개 요청',
     /var QUIZ_EVIDENCE_MATERIAL_COUNT = 5;/.test(QSRC) &&
     (QSRC.match(/materialCount: QUIZ_EVIDENCE_MATERIAL_COUNT/g) || []).length === 2, true);
   check('소재별 교정 1회와 다음 소재 이동 상태를 분리',
@@ -346,7 +360,9 @@ console.log('\n[3] 상식퀴즈봇 배선');
     /선택 소재의 verified_distractors에 없음/.test(genBody) &&
     /fetchDistractorEvidence\(topic, data\.question, missingChoices, referenceDate\)/.test(genBody) === false, true);
   check('숫자 예외는 엄격한 템플릿 검사', /function safeScalarChoiceSet\(choices, answerText\)/.test(QSRC), true);
-  check('근거 없는 주관식 별칭만 제거', /sanitizeAcceptableAliases\(data, customTopic \? candidateEvidence : null, String\(data\.answer\), customTopic \? topic : ""\)/.test(genBody), true);
+  check('맞춤 주관식은 v4 별칭으로 덮어쓰고 기본 분야만 모델 별칭 정리',
+    /data\.acceptable = verifiedMaterialAliasNames\(currentMaterial\)/.test(genBody) &&
+    /if \(!customTopic\) sanitizeAcceptableAliases\(data, null, String\(data\.answer\), ""\)/.test(genBody), true);
   check('근거 판정은 출처가 붙은 정확 명칭 문장을 공유', /verifiedEvidenceSentencesForItems\(evidence, \[String\(data\.choices\[ci\]\)\], false\)/.test(QSRC), true);
   check('문제·보기·정답의 출처 표식 위장 차단', /문제\/보기\/정답에 출처 ID 표식 누출/.test(genBody), true);
   check('생성 프롬프트에는 선택 material의 오답 목록만 제공',
@@ -362,7 +378,7 @@ console.log('\n[3] 상식퀴즈봇 배선');
   check('모듈 경계 sources 배열 호환', /typeof result\.sources\.length !== "number"/.test(QSRC), true);
   check('근거 미지원 핵심 주장은 하드 반려', /unsupported_by_evidence: \{ label: "검색 근거에 없는 핵심 주장", hard: true \}/.test(QSRC), true);
   check('  → 숫자 면제는 감사에도 명시', /evidence_exempt_distractor_indices/.test(QSRC) && /동일 템플릿 거짓 숫자 대안/.test(QSRC), true);
-  check('  → scalar 면제는 검증된 v3 choice_mode에서만 감사 직전 재계산',
+  check('  → scalar 면제는 검증된 v4 choice_mode에서만 감사 직전 재계산',
     /data\._verifiedChoiceMode === "scalar"/.test(QSRC) &&
     /var auditScalarSet = \(wantMulti && data\._verifiedChoiceMode === "scalar"\)/.test(QSRC), true);
   check('  → 기본 토픽 적용 불가 오탐 무시', /if \(!evidence\) v\.unsupported_by_evidence = false;/.test(QSRC), true);
