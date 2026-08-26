@@ -108,7 +108,10 @@ function normSources(arr) {
 //          connectFailed 는 서버에 닿지도 못한 경우 — 호출 측에서 로컬 Gemini 키로
 //          내려갈지 판단하는 데 쓴다.
 function ask(query) {
-  var q = String(query == null ? "" : query);
+  // 게이트웨이는 query 에 제어 문자(개행 등)가 있으면 422 로 거절한다.
+  // 카톡은 여러 줄 메시지를 흔히 보내므로 공백 하나로 접는다 — 이걸 안 하면
+  // 줄바꿈이 든 질문은 전부 "답변을 만들지 못했습니다" 로 끝난다.
+  var q = String(query == null ? "" : query).replace(/\s+/g, " ").replace(/^\s+|\s+$/g, "");
   var key = readApiKey();
   if (!key) return { error: "게이트웨이 API 키 파일을 읽을 수 없습니다(" + KEY_PATH + ")." };
 
