@@ -2254,10 +2254,11 @@ class JavaScriptGroundingContractTests(unittest.TestCase):
         source = js_path.read_text(encoding="utf-8")
 
         expected = (
-            "❗ 신뢰할 검색 근거를 찾지 못해 출제하지 않았습니다.",
-            "검증 가능한 정보가 부족합니다.",
-            "더 넓거나 다른 표현으로 요청해주세요.",
-            "❗ 사실 검증을 완료하지 못해 출제하지 않았습니다.",
+            "❗ 검색 근거를 확보하지 못해 출제할 수 없습니다.",
+            "현재 요청은 종료되었습니다. 다른 주제를 이용해주세요.",
+            "검증 가능한 퀴즈 소재가 부족합니다.",
+            "범위를 넓히거나 다른 주제를 요청해주세요.",
+            "❗ 사실 검증을 완료하지 못해 출제할 수 없습니다.",
         )
         missing = [message for message in expected if message not in source]
         self.assertFalse(missing, "간결한 출제 실패 안내 누락: " + " | ".join(missing))
@@ -2266,6 +2267,7 @@ class JavaScriptGroundingContractTests(unittest.TestCase):
             "모델의 기억만으로 문제를 만들지 않습니다.",
             "⚠️ 토픽 검증 불가\\n",
             "미검증 문제는 안전을 위해 공개하지 않습니다.",
+            "잠시 후 다시 시도해주세요.",
         )
         remaining = [message for message in verbose_legacy_messages if message in source]
         self.assertFalse(remaining, "이전의 장문 안내가 남아 있음: " + " | ".join(remaining))
@@ -2276,12 +2278,15 @@ class JavaScriptGroundingContractTests(unittest.TestCase):
 
         required = (
             "compactEvidenceQueryJson",
-            "buildGenerationEvidenceQuery",
-            "buildExactGenerationEvidenceQuery",
+            "normalizeStructuredQuizEvidence",
+            "promptEvidenceSources",
             "generationEvidenceMatchesTopic",
             "buildAuditEvidenceQuery",
             "fetchGenerationEvidence",
-            "fetchDistractorEvidence",
+            "QUIZ_EVIDENCE.fetchEvidence(String(topic)",
+            "verified_distractors",
+            "getRecentTopicAnswers(topic, 50)",
+            "out.length < 100",
             "safeScalarChoiceSet",
             "sanitizeAcceptableAliases",
             "groundedQuoteForAnswer",
@@ -2289,11 +2294,66 @@ class JavaScriptGroundingContractTests(unittest.TestCase):
             "supporting_quote",
             "unsupported_by_evidence",
             "_evidenceUnavailable",
+            "_evidenceErrorCode",
             "evidence_source_ids",
             "evidence_excerpt",
         )
         missing = [token for token in required if token not in source]
         self.assertFalse(missing, "JavaScript grounding 계약 누락: " + ", ".join(missing))
+        self.assertNotIn(
+            "function buildGenerationEvidenceQuery",
+            source,
+            "전용 API 이전 뒤에도 자유형 생성 검색 프롬프트 빌더가 남아 있음",
+        )
+        self.assertNotIn(
+            "function fetchDistractorEvidence",
+            source,
+            "전용 API 목록 밖의 오답을 일반 검색으로 검증하는 경로가 남아 있음",
+        )
+
+        quiz_evidence_path = Path(__file__).resolve().parents[1] / "lib" / "quiz-evidence.js"
+        quiz_evidence_source = quiz_evidence_path.read_text(encoding="utf-8")
+        for snippet in (
+            'var BASE_URL = "http://192.168.0.55:18083/v1/quiz-evidence";',
+            'profile: "quiz_evidence"',
+            "reference_date: referenceDate",
+            "exclude_answers: cleanExcludeAnswers",
+            "requestPayload.distractor_count = requiredDistractorCount",
+            "distractors.length < requiredDistractorCount",
+            "payload.code",
+            '"MODEL_OUTPUT_FORMAT"',
+            '"TOPIC_NOT_FOUND"',
+        ):
+            self.assertIn(snippet, quiz_evidence_source)
+        self.assertIn(
+            "query: topic",
+            quiz_evidence_source,
+            "전용 API query가 순수 토픽이 아님",
+        )
+        self.assertIn(
+            "sources: promptEvidenceSources(topicEvidence)",
+            source,
+            "생성 프롬프트에서 source URL 투영을 제거하지 않음",
+        )
+        self.assertNotIn(
+            'evidence.sources[ei].title + " " + evidence.sources[ei].url',
+            source,
+            "감사 프롬프트에 source URL이 남아 있음",
+        )
+        for code in (
+            "GATEWAY_BUSY",
+            "SEARCH_TIMEOUT",
+            "NO_SOURCES",
+            "MODEL_OUTPUT_FORMAT",
+            "UNAUTHORIZED",
+            "GATEWAY_UNAVAILABLE",
+            "INVALID_REQUEST",
+        ):
+            self.assertIn(
+                f'evidenceCode === "{code}"',
+                source,
+                f"사용자 안내에서 전용 오류 코드 {code} 분기가 누락됨",
+            )
         gateway_path = Path(__file__).resolve().parents[1] / "lib" / "gateway.js"
         gateway_source = gateway_path.read_text(encoding="utf-8")
         self.assertIn(

@@ -692,7 +692,7 @@ def assert_javascript_contract() -> None:
         'var MAX_GENERATION_GATEWAY_SEARCHES = 2;',
         'generationEvidenceError(data, candidateEvidence, answerText)',
         'safeScalarChoiceSet(data.choices, answerText)',
-        'fetchDistractorEvidence(topic, data.question, missingChoices, referenceDate)',
+        '객관식 오답 명칭 검증 실패: 전용 API의 verified_distractors에 없음:',
         'sanitizeAcceptableAliases(data, customTopic ? topicEvidence : null, String(data.answer), customTopic ? topic : "")',
         'var auditScalarSet = wantMulti ? safeScalarChoiceSet(data.choices, answerText) : null;',
         'evidence_exempt_distractor_indices: auditScalarSet ? auditScalarSet.exemptIndices : []',
