@@ -91,5 +91,24 @@ console.log('\n[3] 상식퀴즈봇 배선');
         QSRC.indexOf('new java.lang.Thread') < QSRC.indexOf('data = generateQuiz(customTopic, room)'), true);
 }
 
+
+// ── 이의신청 근거 (2026-08-26 추가) ──────────────────────────────
+console.log('\n[4] 이의신청도 검색 근거를 쓴다');
+{
+  check('근거 조회 (토픽 조건 없음)', /var appealEvidence = fetchAuditEvidence\(/.test(QSRC), true);
+  check('  → round.topic 을 질의에 사용', /round\.topic \|\| "상식", round\.question, round\.choices/.test(QSRC), true);
+  check('  → topic 을 실제로 읽어옴 (SELECT)', /appeal_verdict, topic " \+/.test(QSRC), true);
+  check('  → readRoundCursor 가 채움', /topic: cur\.getString\(9\) \|\| ""/.test(QSRC), true);
+  check('프롬프트에 근거 블록', /evidenceBlock \+ "출제자 해설: "/.test(QSRC), true);
+  check('  → 근거 우선 지시', /이 근거가 다르면 근거를 우선하세요/.test(QSRC), true);
+  check('  → 미언급을 부정으로 보지 않게', /근거가 다루지 않은 내용은 부정된 것으로 보지 말고/.test(QSRC), true);
+  check('  → 근거 없으면 블록은 빈 문자열', /var evidenceBlock = "";/.test(QSRC), true);
+}
+{
+  // 실패해도 판정은 진행하되, 무엇에 기대어 판정했는지 밝힌다
+  check('사용 여부를 결과에 실음', /data\._evidenceUsed = !!appealEvidence;/.test(QSRC), true);
+  check('근거 있음 표시', /🔎 웹 검색 근거를 확인해 판정했습니다/.test(QSRC), true);
+  check('근거 없음 경고', /⚠ 검색 근거를 확인하지 못해 모델 지식만으로 판정했습니다/.test(QSRC), true);
+}
 console.log('\n' + (fail === 0 ? '✅ ' : '❌ ') + pass + ' 통과, ' + fail + ' 실패');
 process.exit(fail === 0 ? 0 : 1);

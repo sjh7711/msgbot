@@ -1364,7 +1364,7 @@ function getLatestRound(room) {
     var cur = null;
     try {
       cur = db.rawQuery(
-        "SELECT num, type, question, choices, answer, correct_index, explanation, appeal_state, appeal_verdict " +
+        "SELECT num, type, question, choices, answer, correct_index, explanation, appeal_state, appeal_verdict, topic " +
         "FROM quiz_round WHERE room=? ORDER BY num DESC LIMIT 1", [room]
       );
       if (!cur.moveToFirst()) return null;
@@ -1378,7 +1378,7 @@ function getRoundByNum(room, num) {
     var cur = null;
     try {
       cur = db.rawQuery(
-        "SELECT num, type, question, choices, answer, correct_index, explanation, appeal_state, appeal_verdict " +
+        "SELECT num, type, question, choices, answer, correct_index, explanation, appeal_state, appeal_verdict, topic " +
         "FROM quiz_round WHERE room=? AND num=?", [room, String(num)]
       );
       if (!cur.moveToFirst()) return null;
@@ -1397,7 +1397,9 @@ function readRoundCursor(cur) {
     correctIndex: cur.getInt(5),
     explanation: cur.getString(6),
     appealState: cur.getInt(7),
-    appealVerdict: cur.getString(8)
+    appealVerdict: cur.getString(8),
+    // topic: 이의신청 근거 검색 질의를 좁히는 데 쓴다. 옛 행은 NULL 이라 빈 문자열로.
+    topic: cur.getString(9) || ""
   };
 }
 
@@ -2562,13 +2564,31 @@ function verifyQuizAnswer(round, submittedAnswers, room) {
     }
   }
 
+  // 이의신청은 사람이 이미 이상하다고 짚은 건이라, 같은 모델에게 다시 묻기만 하면
+  // 자기가 틀리게 아는 사실을 그대로 옹호한다. 여기서는 토픽 조건 없이 항상
+  // 근거를 조회한다 — 빈도가 낮고(일일 한도), 지연에 민감하지 않으며(이미 끝난
+  // 문제), 판정이 승패·기록을 바꾸기 때문이다.
+  var appealEvidence = fetchAuditEvidence(
+    round.topic || "상식", round.question, round.choices, officialAnswer);
+  var evidenceBlock = "";
+  if (appealEvidence) {
+    var evSrc = [];
+    for (var es = 0; es < appealEvidence.sources.length; es++) {
+      evSrc.push(appealEvidence.sources[es].title + " " + appealEvidence.sources[es].url);
+    }
+    evidenceBlock =
+      "웹 문서에서 수집한 외부 근거:\n" + appealEvidence.answer + "\n" +
+      "근거 출처: " + evSrc.join(" | ") + "\n" +
+      "당신의 기억과 이 근거가 다르면 근거를 우선하세요. 근거가 다루지 않은 내용은 부정된 것으로 보지 말고 원래 기준대로 판정하세요.\n\n";
+  }
+
   var prompt =
     "다음 상식 퀴즈의 공식 정답이 사실관계상 정확한지, 그리고 참여자들이 제출한 각 답안이 정답으로 인정될 수 있는지 엄정히 검토하세요.\n\n" +
     "문제: " + round.question + "\n" +
     (choicesText ? "보기:\n" + choicesText : "") +
     "공식 정답: " + officialAnswer + "\n" +
     submittedBlock +
-    "출제자 해설: " + (round.explanation || "(없음)") + "\n\n" +
+    evidenceBlock + "출제자 해설: " + (round.explanation || "(없음)") + "\n\n" +
     "검토 항목:\n" +
     "1. 공식 정답이 사실에 부합하는가?\n" +
     "2. 문제 본문의 단서가 공식 정답과 모순되지 않는가?\n" +
@@ -2599,6 +2619,7 @@ function verifyQuizAnswer(round, submittedAnswers, room) {
       return { _error: "잘못된 verdict: " + data.verdict };
     }
     if (!data.submissions || !(data.submissions instanceof Array)) data.submissions = [];
+    data._evidenceUsed = !!appealEvidence;
     return data;
   } catch(e) {
     return { _error: "JSON 파싱 실패: " + (res.text || "").slice(0, 150) };
@@ -2862,6 +2883,12 @@ function processAppealResult(room, num, result, error, reviewees, appealerHash) 
   }
   if (reasoning) lines.push("사유: " + reasoning);
   if (better) lines.push("더 적절한 답: " + better);
+  // 근거 조회는 실패해도 판정을 막지 않는다(게이트웨이가 꺼져 있어도 이의신청은
+  // 되어야 한다). 대신 무엇에 기대어 판정했는지는 밝힌다 — 근거 없는 판정을
+  // 근거 있는 판정과 같은 무게로 받아들이면 안 된다.
+  lines.push(result._evidenceUsed
+    ? "🔎 웹 검색 근거를 확인해 판정했습니다."
+    : "⚠ 검색 근거를 확인하지 못해 모델 지식만으로 판정했습니다.");
 
   // 인정된 제출 답안(정규화 기준) 집합 구성
   var acceptedNorms = {};
