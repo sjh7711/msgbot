@@ -18,19 +18,48 @@ VAGUE_CLUE_CUES = (
     "특정", "독특한", "큰 화제", "관련된", "상징적인", "고유한", "어떤 대상", "일종의", "등으로 인해",
 )
 VOLATILE_FACT_RE = re.compile(
-    r"현재(?:\s|의|는|까지|기준)|지금|오늘|올해|최근(?:\s|의|까지|기준)|"
-    r"최신(?:\s|의|버전|기록)|현직|실시간|이번\s*(?:시즌|대회|분기|연도)"
+    r"현재(?:\s|의|는|까지|기준|도|로|상|시점)|지금|오늘|올해|"
+    r"최근(?:\s|의|까지|기준|에|작|판|버전|패치)|최신(?:\s|의|버전|기록|작|판|패치)|"
+    r"현직|현행|실시간|올\s*(?:시즌|해)|이번\s*(?:시즌|대회|분기|연도)"
 )
-HISTORICAL_ANCHOR_RE = re.compile(r"당시|그해|그 시기|그 시대|\d{3,4}년\s*(?:기준|시점)")
+IMPLICIT_CURRENT_FACT_RE = re.compile(
+    r"(?:대통령|국무총리|장관|시장|도지사|CEO|최고경영자|대표이사|회장|감독|총장|챔피언|"
+    r"소속팀|소속사|점유율|가격|인구|순위|기록|버전|패치)(?:은|는|이|가|의)[^.!?\r\n]{0,24}"
+    r"(?:누구|어디|무엇|몇|얼마|어느)"
+)
 EXPLICIT_FABRICATION_RE = re.compile(
     r"(?:해당|이|그)\s*(?:가상의?|가공의)\s*(?:인물|기관|단체|제품|용어|사건|기술|시스템)|"
     r"실제로\s*존재하지\s*않는\s*(?:인물|기관|단체|제품|용어|사건|기술|시스템)"
 )
 FICTION_SOURCE_RE = re.compile(r"소설|영화|드라마|게임|만화|애니메이션|작품|공식\s*설정|등장인물")
+CATALOG_ENTITY_RE = re.compile(
+    r"직업|캐릭터|클래스|종족|주자|제품|기종|버전|서비스|콘텐츠|아이템|보스|패치|스마트폰|게임"
+)
+CATALOG_LIFECYCLE_RE = re.compile(r"출시|발매|업데이트|정식\s*공개|서비스\s*(?:시작|종료)")
+CATALOG_ORDINAL_RE = re.compile(
+    r"(?:(?:[0-9]{1,4}|[일이삼사오육칠팔구십백천]+|첫|두|세|네|다섯|여섯|일곱|여덟|아홉|열|스무)"
+    r"\s*(?:번째|번\s*째)|몇\s*번째)"
+)
+CATALOG_COUNT_RE = re.compile(r"(?:총\s*)?[0-9]{1,4}\s*(?:개|명|종)(?:의|인|으로|을|를|이|가|\s|[,.!?]|$)")
+CATALOG_SEQUENCE_RE = re.compile(
+    r"(?:(?:에|를|뒤를)\s*이어(?:서|진)?|이후\s*(?:등장|출시|추가|합류|공개)|뒤이어|"
+    r"출시\s*순서|등장\s*순서|추가\s*순서|다음\s*주자|다음에\s*(?:등장|출시|추가|합류|나온)|"
+    r"보다\s*(?:먼저|나중에|뒤에)\s*(?:등장|출시|추가|합류|나온))"
+)
+CATALOG_FINALITY_RE = re.compile(
+    r"(?:마지막\s*(?:주자|직업|캐릭터|클래스|제품|기종|버전|멤버|으로\s*(?:등장|출시|추가|공개|도입|합류))|"
+    r"(?:끝으로|마지막에|마지막으로)\s*(?:등장|출시|추가|공개|도입|합류|나온))"
+)
+CATALOG_ABSOLUTE_RE = re.compile(
+    r"(?:(?:세계|국내|역대)\s*(?:최초|유일|최대|최소|최다|최고|최장)|최초(?:로|의|인|\s)|"
+    r"유일(?:한|하게|의|\s)|(?:최대|최소|최다|최고|최장)\s*(?:규모|기록|수치|점유율|판매량|이용자|제품|서비스|직업|캐릭터))"
+)
+CATALOG_RANK_RE = re.compile(r"(?:[0-9]{1,4}\s*위|가장\s*(?:먼저|늦게|많이|적게))")
 
 AUDIT_FLAGS = (
     "answer_leak",
     "fact_conflict",
+    "precision_claim_error",
     "outdated_fact",
     "fabricated_fact",
     "topic_unverified",
@@ -64,7 +93,24 @@ def looks_like_placeholder(value: object) -> bool:
     }
 
 
-def local_policy_error(candidate: dict, reference_date: str) -> str | None:
+def precision_claim_kinds(text: object) -> list[str]:
+    value = re.sub(r'《[^》]{1,80}》|「[^」]{1,80}」|『[^』]{1,80}』|"[^"]{1,80}"', " ", str(text or ""))
+    catalog_context = bool(CATALOG_ENTITY_RE.search(value) or CATALOG_LIFECYCLE_RE.search(value))
+    result: list[str] = []
+    if catalog_context and CATALOG_ORDINAL_RE.search(value):
+        result.append("서수")
+    if catalog_context and CATALOG_COUNT_RE.search(value):
+        result.append("정확한 개수")
+    if catalog_context and CATALOG_SEQUENCE_RE.search(value):
+        result.append("순서")
+    if CATALOG_FINALITY_RE.search(value) or (catalog_context and CATALOG_ABSOLUTE_RE.search(value)):
+        result.append("배타·최상급")
+    if catalog_context and CATALOG_RANK_RE.search(value):
+        result.append("순위")
+    return result
+
+
+def local_policy_error(candidate: dict, reference_date: str, custom_topic: bool = False) -> str | None:
     question = str(candidate.get("question", ""))
     explanation = str(candidate.get("explanation", ""))
     combined = f"{question} {explanation}"
@@ -73,17 +119,12 @@ def local_policy_error(candidate: dict, reference_date: str) -> str | None:
         return f"구체적 검증 단서 부족(모호 표현 {vague_count}개)"
     if EXPLICIT_FABRICATION_RE.search(combined) and vague_count >= 2 and not FICTION_SOURCE_RE.search(question):
         return "출처 없는 가상 대상을 사실처럼 서술함"
-    if VOLATILE_FACT_RE.search(combined):
-        year_match = re.search(r"(\d{3,4})년", combined)
-        if not year_match:
-            return "시점 없는 변동 가능 정보"
-        reference_year = reference_date[:4]
-        if (
-            not HISTORICAL_ANCHOR_RE.search(combined)
-            and reference_year
-            and year_match.group(1) != reference_year
-        ):
-            return f"기준일과 맞지 않는 현재성 표현({year_match.group(1)}년)"
+    if VOLATILE_FACT_RE.search(combined) or IMPLICIT_CURRENT_FACT_RE.search(combined):
+        return "검색 근거 없는 현재·최신 정보"
+    precision_kinds = precision_claim_kinds(combined)
+    if precision_kinds:
+        prefix = "맞춤 토픽의 " if custom_topic else ""
+        return f"{prefix}외부 근거 없는 카탈로그 정밀 주장({'/'.join(precision_kinds)})"
     return None
 
 
@@ -170,7 +211,7 @@ def validate_candidate(
     if any(looks_like_placeholder(value) for value in placeholder_targets):
         return "LOCAL_REJECT", "자리표시자/메타 텍스트 누출", answer_text
 
-    policy_error = local_policy_error(candidate, reference_date)
+    policy_error = local_policy_error(candidate, reference_date, custom_topic)
     if policy_error:
         return "LOCAL_REJECT", f"로컬 정책 반려: {policy_error}", answer_text
 
@@ -284,6 +325,45 @@ MAPLE_FABRICATION = quiz(
     "나비의 꿈 게이지는 루시드 보스전에서 파티원이 협력해 채우는 자원입니다.",
 )
 
+KMS_RELATION_FABRICATION = {
+    "status": "ok",
+    "reject_reason": "",
+    "type": "short",
+    "topic": "메이플스토리 kms",
+    "question": (
+        "한국 서비스 기준 200번째로 등장한 직업이자, 카데나와 아크에 이어 레프 종족의 "
+        "마지막 주자로서 마법 지팡이와 마도서를 무기로 사용하는 직업의 명칭은 무엇입니까?"
+    ),
+    "choices": [],
+    "answer": "일리움",
+    "acceptable": ["일리움", "Illium"],
+    "explanation": (
+        "일리움은 레프 종족의 마법사 계열 직업군으로 크리스탈을 활용한 전투 시스템을 사용하며 "
+        "한국 서비스의 200번째 직업으로 출시되었습니다."
+    ),
+}
+
+KMS_STABLE = {
+    "status": "ok",
+    "reject_reason": "",
+    "type": "short",
+    "topic": "메이플스토리 kms",
+    "question": (
+        "2017년 8월 10일 Ver.1.2.282 업데이트에서 추가되었고, 고대 크리스탈과 공명하며 "
+        "매직 건틀렛을 전용 무기로 사용하는 우든레프 마법사 직업은 무엇입니까?"
+    ),
+    "choices": [],
+    "answer": "일리움",
+    "acceptable": ["일리움", "Illium"],
+    "explanation": "공식 직업 소개는 이 우든레프 마법사의 전용 무기를 매직 건틀렛으로 안내합니다.",
+}
+
+KMS_WRONG_WEAPON_ONLY = {
+    **KMS_STABLE,
+    "question": "고대 크리스탈과 공명하며 마법 지팡이와 마도서를 무기로 사용하는 우든레프 마법사 직업은 무엇입니까?",
+    "explanation": "이 우든레프 마법사는 마법 지팡이와 마도서를 함께 사용합니다.",
+}
+
 HISTORICAL = quiz(
     "한국사",
     "1592년 당시 옥포 해전에서 조선 수군을 지휘해 첫 승리를 거둔 장수는 누구입니까?",
@@ -329,6 +409,40 @@ CASES = [
         "custom_topic": True,
         "candidate": MAPLE_FABRICATION,
         "audit": clean_audit(fact_conflict=True, fabricated_fact=True, reason="해당 보스전 자원이 존재하지 않음"),
+        "legacy_audit": {},
+        "old": "ACCEPT",
+        "new": "AUDIT_REJECT",
+    },
+    {
+        "name": "KMS 실재 요소 관계 합성 환각",
+        "topic": "메이플스토리 kms",
+        "custom_topic": True,
+        "want_multi": False,
+        "candidate": KMS_RELATION_FABRICATION,
+        # 감사가 또 전부 정상이라고 오판해도 로컬 정밀 주장 안전망이 먼저 막아야 한다.
+        "audit": clean_audit(),
+        "legacy_audit": {},
+        "old": "ACCEPT",
+        "new": "LOCAL_REJECT",
+    },
+    {
+        "name": "KMS 날짜 고정 안정 단서",
+        "topic": "메이플스토리 kms",
+        "custom_topic": True,
+        "want_multi": False,
+        "candidate": KMS_STABLE,
+        "audit": clean_audit(),
+        "legacy_audit": {},
+        "old": "ACCEPT",
+        "new": "ACCEPT",
+    },
+    {
+        "name": "KMS 무기 관계 오류 감사",
+        "topic": "메이플스토리 kms",
+        "custom_topic": True,
+        "want_multi": False,
+        "candidate": KMS_WRONG_WEAPON_ONLY,
+        "audit": clean_audit(precision_claim_error=True, fact_conflict=True, reason="공식 전용 무기는 매직 건틀렛임"),
         "legacy_audit": {},
         "old": "ACCEPT",
         "new": "AUDIT_REJECT",
@@ -449,6 +563,47 @@ CASES = [
     },
 ]
 
+# 감사 모델의 정답 플래그를 미리 주입하지 않고, 실제 JS/Python 로컬 정책 정규식 자체를 검증한다.
+RISK_CLAIM_CASES = [
+    ("숫자 서수 출시", "45번째로 추가된 직업은 무엇입니까?", "이 직업은 45번째로 출시되었습니다.", "정밀 주장"),
+    ("한글 서수 출시", "세 번째로 출시된 레프 직업은 무엇입니까?", "세 번째 주자입니다.", "정밀 주장"),
+    ("한자어 서수 출시", "이백 번째로 등장한 캐릭터는 무엇입니까?", "이백 번째 주자입니다.", "정밀 주장"),
+    ("질문형 서수", "이 캐릭터는 몇 번째로 등장했습니까?", "등장 순서를 묻습니다.", "정밀 주장"),
+    ("동종 서수 두 개", "45번째 직업과 46번째 직업은 무엇입니까?", "두 출시 서수를 묻습니다.", "정밀 주장"),
+    ("정확한 개수", "총 47개 직업 중 레프 직업은 무엇입니까?", "서비스에는 총 47개 직업이 있습니다.", "정밀 주장"),
+    ("출시 순서", "A와 B에 이어 출시된 직업은 무엇입니까?", "세 직업의 출시 순서를 따릅니다.", "정밀 주장"),
+    ("다음·이전 순서", "카데나 다음에 등장하고 아크보다 먼저 나온 직업은 무엇입니까?", "출시 순서를 묻습니다.", "정밀 주장"),
+    ("이후 출시", "아크 이후 출시된 레프 직업은 무엇입니까?", "이후 등장한 직업입니다.", "정밀 주장"),
+    ("종결 주장", "이 종족의 마지막 주자는 누구입니까?", "마지막 직업으로 추가되었습니다.", "정밀 주장"),
+    ("끝으로 합류", "끝으로 합류한 직업은 무엇입니까?", "마지막에 출시된 직업입니다.", "정밀 주장"),
+    ("최초 제품", "세계 최초로 이 기능을 도입한 스마트폰은 무엇입니까?", "최초 제품입니다.", "정밀 주장"),
+    ("유일 서비스", "이 기능을 유일하게 제공하는 서비스는 무엇입니까?", "유일한 서비스입니다.", "정밀 주장"),
+    ("같은 해 최신 패치", "2026년 최신 패치 기준 상향된 직업은 무엇입니까?", "최신 버전 기준입니다.", "현재·최신"),
+    ("같은 해 기준 현재", "2026년 기준 현재 국내 1위인 서비스는 무엇입니까?", "현재 순위입니다.", "현재·최신"),
+    ("역사 앵커 혼합 현재", "1592년 당시 시작되었고 현재도 운영 중인 서비스는 무엇입니까?", "현재 서비스 상태를 묻습니다.", "현재·최신"),
+    ("최근에 활용형", "최근에 출시된 직업은 무엇입니까?", "최근 패치에서 추가되었습니다.", "현재·최신"),
+    ("최신작 활용형", "최신작으로 공개된 게임은 무엇입니까?", "최신작입니다.", "현재·최신"),
+    ("현재도 활용형", "현재도 서비스 중인 기능은 무엇입니까?", "현재도 제공됩니다.", "현재·최신"),
+    ("암시적 현직 질문", "대한민국 대통령은 누구입니까?", "대통령의 이름을 묻습니다.", "현재·최신"),
+    ("해설에만 위험 주장", "고대 크리스탈을 사용하는 마법사 직업은 무엇입니까?", "세계 최초로 이 전투 기능을 도입한 직업입니다.", "정밀 주장"),
+]
+
+SAFE_CLAIM_CASES = [
+    ("역사 왕대", "조선의 제4대 왕으로 훈민정음을 창제한 인물은 누구입니까?", "조선 왕조의 계보입니다."),
+    ("날짜 고정 최초", "1969년 인류 최초로 달 표면을 걸은 인물은 누구입니까?", "1969년의 역사적 사건입니다."),
+    ("날짜 고정 마지막", "1907년에 즉위한 대한제국의 마지막 황제는 누구입니까?", "폐쇄된 역사 범위입니다."),
+    ("불변 수학 유일", "양의 소수 중 유일한 짝수는 무엇입니까?", "2는 유일한 짝수 소수입니다."),
+    ("고유 사건명 서수", "제1차 세계 대전이 발발한 해는 언제입니까?", "제1차 세계 대전은 사건명입니다."),
+    ("문장 구조 마지막", "이 단어의 마지막 음절은 무엇입니까?", "문자열 위치를 묻습니다."),
+    ("레벨 숫자", "200레벨에 수행하는 5차 전직 퀘스트는 무엇입니까?", "200번째라는 서수 주장이 아닙니다."),
+    ("날짜·버전 고정 업데이트", KMS_STABLE["question"], KMS_STABLE["explanation"]),
+    ("과거 대회 순위", "2024년 올림픽 결승에서 1위를 기록한 선수는 누구입니까?", "2024년 경기를 묻습니다."),
+    ("통계 최대우도", "이 통계 모델에서 최대우도법으로 모수를 추정하는 방법은 무엇입니까?", "최대우도는 고유한 통계 용어입니다."),
+    ("보안 최소 권한", "서비스 기능에 최소 권한 원칙을 적용하는 이유는 무엇입니까?", "최소 권한은 보안 원칙입니다."),
+    ("수학 유일해", "이 미분방정식 모델에서 유일한 해를 보장하는 정리는 무엇입니까?", "유일해 존재 조건을 묻습니다."),
+    ("인용 작품명", "게임 《마지막 직업》을 만든 제작자는 누구입니까?", "작품 제목 안의 단어는 정밀 주장이 아닙니다."),
+]
+
 
 def assert_javascript_contract() -> None:
     """Python 미러가 의존하는 핵심 정책이 실제 봇 파일에도 연결돼 있는지 확인한다."""
@@ -458,7 +613,12 @@ def assert_javascript_contract() -> None:
         'var QUIZ_GENERATION_OPTIONS = { temperature: 0.7, topP: 0.9 };',
         'var QUIZ_AUDIT_OPTIONS = { temperature: 0.1, topP: 0.8 };',
         'responseStatus === "unverifiable"',
-        'localQuizPolicyError(data, referenceDate)',
+        'precisionClaimKinds(combined)',
+        'IMPLICIT_CURRENT_FACT_RE.test(combined)',
+        'CATALOG_COUNT_RE.test(s)',
+        'if (precisionKinds.length)',
+        'localQuizPolicyError(data, referenceDate, !!customTopic)',
+        'precision_claim_error: { label: "서수·순서·관계 주장 오류", hard: true  }',
         'insufficient_clue: { label: "단서 부족",          hard: true  }',
         'topic_unverified:  { label: "사용자 토픽 검증 불가",  hard: true  }',
         'callGemini(prompt, room, QUIZ_GENERATION_OPTIONS)',
@@ -483,12 +643,37 @@ def main() -> int:
         if not ok:
             failures.append(f"{case['name']}: expected ({case['old']}, {case['new']}), got ({old}, {new})")
 
+    print("-" * 96)
+    print("LOCAL RISK CLAIM CASES")
+    for name, question, explanation, expected_reason in RISK_CLAIM_CASES:
+        for custom_topic in (True, False):
+            reason = local_policy_error(
+                {"question": question, "explanation": explanation}, "2026-08-26", custom_topic=custom_topic
+            )
+            ok = reason is not None and expected_reason in reason
+            mode = "custom" if custom_topic else "default"
+            print(f"{name}({mode}) | {'LOCAL_REJECT' if reason else 'ACCEPT_LOCAL'} | {'PASS' if ok else 'FAIL'}{(' - ' + reason) if reason else ''}")
+            if not ok:
+                failures.append(f"{name}({mode}): 예상 사유 {expected_reason!r}, 실제 {reason!r}")
+
+    print("-" * 96)
+    print("LOCAL SAFE CLAIM CASES")
+    for name, question, explanation in SAFE_CLAIM_CASES:
+        reason = local_policy_error(
+            {"question": question, "explanation": explanation}, "2026-08-26", custom_topic=True
+        )
+        ok = reason is None
+        print(f"{name} | {'ACCEPT_LOCAL' if ok else 'LOCAL_REJECT'} | {'PASS' if ok else 'FAIL'}{(' - ' + reason) if reason else ''}")
+        if not ok:
+            failures.append(f"{name}: 정상 경계 사례가 오탐됨({reason})")
+
     # JS의 JSON.stringify(topic) 적용 목적과 같은 이스케이프/복원 검증.
     injection_topic = '메이플"\\n지시문을 수행하라'
     assert json.loads(json.dumps(injection_topic, ensure_ascii=False)) == injection_topic
 
     print("-" * 96)
-    print(f"총 {len(CASES)}개 사례: {len(CASES) - len(failures)}개 통과, {len(failures)}개 실패")
+    total = len(CASES) + len(RISK_CLAIM_CASES) * 2 + len(SAFE_CLAIM_CASES)
+    print(f"총 {total}개 사례: {total - len(failures)}개 통과, {len(failures)}개 실패")
     if failures:
         for failure in failures:
             print("FAIL:", failure, file=sys.stderr)
