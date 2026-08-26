@@ -2375,7 +2375,91 @@ function buildAuditEvidenceQuery(topic, question, choices, answerText, explanati
 // 한 번의 검색에서 다양한 소재를 확보해 같은 토픽의 중복·정책 반려 시 다음 소재로 이동한다.
 var QUIZ_EVIDENCE_MATERIAL_COUNT = 5;
 
-function fetchGenerationEvidence(topic, referenceDate, wantMulti, avoidAnswers) {
+// 18083 서버의 기본 Gemini 키와 저장 키 풀이 모두 막힌 경우에만 DB 키를
+// 하나씩 전달한다. 서버가 성공한 키를 영구 저장하므로 평상시 요청에는 키를
+// 싣지 않는다. 인증 실패 키는 재컴파일 전까지 다시 보내지 않고, 429 키는
+// 공용 API 키 정책의 24시간 쿨다운에도 반영한다.
+var QUIZ_EVIDENCE_KEY_POOL_RETRY_CODES = {
+  GEMINI_API_KEY_REQUIRED: true,
+  CLIENT_GEMINI_QUOTA_EXHAUSTED: true,
+  CLIENT_GEMINI_KEYS_INVALID: true,
+  INVALID_CLIENT_GEMINI_KEY: true
+};
+var _quizEvidenceInvalidKeys = {};
+
+function isQuizEvidenceKeyPoolError(result) {
+  var code = String((result && result.errorCode) || "");
+  return Object.prototype.hasOwnProperty.call(QUIZ_EVIDENCE_KEY_POOL_RETRY_CODES, code);
+}
+
+function availableQuizEvidenceKeys(room) {
+  var rows = [], out = [], seen = {};
+  try {
+    if (typeof APIKEYS !== "undefined" && APIKEYS && typeof APIKEYS.forRoom === "function") {
+      rows = APIKEYS.forRoom(room) || [];
+    } else if (typeof eligibleProviderIndexes === "function") {
+      var indexes = eligibleProviderIndexes(room);
+      for (var ei = 0; ei < indexes.length; ei++) {
+        var provider = API_KEYS[indexes[ei]];
+        if (provider) rows.push({ key: provider.key, cooling: false });
+      }
+    }
+  } catch (_) { rows = []; }
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i] || {};
+    var key = String(row.key || "");
+    if (!key || key.length < 20 || key.length > 200 || /\s/.test(key) || row.cooling === true ||
+        Object.prototype.hasOwnProperty.call(_quizEvidenceInvalidKeys, "$" + key) ||
+        Object.prototype.hasOwnProperty.call(seen, "$" + key)) continue;
+    seen["$" + key] = true;
+    out.push(key);
+  }
+  return out;
+}
+
+function quizEvidenceOptionsWithKey(options, key) {
+  var out = {};
+  for (var name in options) {
+    if (Object.prototype.hasOwnProperty.call(options, name)) out[name] = options[name];
+  }
+  out.geminiApiKey = key;
+  return out;
+}
+
+function fetchQuizEvidenceWithKeyPool(topic, options, room) {
+  var result = QUIZ_EVIDENCE.fetchEvidence(String(topic), options);
+  var calls = 1;
+  if (!isQuizEvidenceKeyPoolError(result)) {
+    if (result && typeof result === "object") result._gatewaySearches = calls;
+    return result;
+  }
+
+  var keys = availableQuizEvidenceKeys(room);
+  for (var i = 0; i < keys.length; i++) {
+    var key = keys[i];
+    result = QUIZ_EVIDENCE.fetchEvidence(
+      String(topic), quizEvidenceOptionsWithKey(options, key));
+    calls++;
+    if (result && !result.error) {
+      result._gatewaySearches = calls;
+      return result;
+    }
+
+    var code = String((result && result.errorCode) || "");
+    if (code === "CLIENT_GEMINI_QUOTA_EXHAUSTED") {
+      try {
+        if (typeof APIKEYS !== "undefined" && APIKEYS) APIKEYS.markExhausted(key);
+      } catch (_) {}
+    } else if (code === "CLIENT_GEMINI_KEYS_INVALID" || code === "INVALID_CLIENT_GEMINI_KEY") {
+      _quizEvidenceInvalidKeys["$" + key] = true;
+    }
+    if (!isQuizEvidenceKeyPoolError(result)) break;
+  }
+  if (result && typeof result === "object") result._gatewaySearches = calls;
+  return result;
+}
+
+function fetchGenerationEvidence(topic, referenceDate, wantMulti, avoidAnswers, room) {
   if (!QUIZ_EVIDENCE) {
     return { error: "퀴즈 근거 전용 API 모듈 없음", errorCode: "GATEWAY_UNAVAILABLE", retryable: false };
   }
@@ -2383,24 +2467,25 @@ function fetchGenerationEvidence(topic, referenceDate, wantMulti, avoidAnswers) 
   try {
     // query에는 토픽만 넣는다. 검색 지시·날짜·유형·최근 정답은 전용 계약의
     // 구조화 필드로 보내므로 300자 검색어 안에 프롬프트를 압축하지 않는다.
-    var result = QUIZ_EVIDENCE.fetchEvidence(String(topic), {
+    var result = fetchQuizEvidenceWithKeyPool(String(topic), {
       referenceDate: referenceDate,
       quizType: wantMulti ? "multi" : "short",
       maxResults: 5,
       materialCount: QUIZ_EVIDENCE_MATERIAL_COUNT,
       distractorCount: 4,
       excludeAnswers: cleanEvidenceAvoidAnswers(avoidAnswers)
-    });
+    }, room);
+    var evidenceCalls = Math.max(1, Math.floor((result && result._gatewaySearches) || 1));
     var evidence = normalizeStructuredQuizEvidence(result, topic);
     if (!evidence) {
       if (result && result.error) {
         return { error: structuredEvidenceErrorDetail(result), errorCode: result.errorCode,
-          retryable: result.retryable === true, _gatewaySearches: 1 };
+          retryable: result.retryable === true, _gatewaySearches: evidenceCalls };
       }
       return { error: "[MODEL_OUTPUT_FORMAT] 구조화 퀴즈 근거를 해석하지 못함",
-        errorCode: "MODEL_OUTPUT_FORMAT", retryable: true, _gatewaySearches: 1 };
+        errorCode: "MODEL_OUTPUT_FORMAT", retryable: true, _gatewaySearches: evidenceCalls };
     }
-    evidence._gatewaySearches = 1;
+    evidence._gatewaySearches = evidenceCalls;
     return evidence;
   } catch (e) {
     return { error: "[GATEWAY_UNAVAILABLE] " +
@@ -2411,7 +2496,7 @@ function fetchGenerationEvidence(topic, referenceDate, wantMulti, avoidAnswers) 
 
 // 첫 검색이 관련은 있지만 이미 쓴 정답만 담은 경우에만 호출한다. 정확일치
 // 재검색과 달리 복구 재시도를 하지 않아 이 함수 자체는 항상 검색 1회다.
-function fetchFacetGenerationEvidence(topic, referenceDate, wantMulti, avoidAnswers) {
+function fetchFacetGenerationEvidence(topic, referenceDate, wantMulti, avoidAnswers, room) {
   if (!QUIZ_EVIDENCE) {
     return { error: "퀴즈 근거 전용 API 모듈 없음", errorCode: "GATEWAY_UNAVAILABLE",
       retryable: false, _gatewaySearches: 0 };
@@ -2421,22 +2506,23 @@ function fetchFacetGenerationEvidence(topic, referenceDate, wantMulti, avoidAnsw
     attempted = true;
     // 전용 API에는 자유형 facet 프롬프트를 넣지 않는다. 첫 응답의 소재 답까지
     // exclude_answers에 더해 같은 토픽의 새 소재를 한 번만 요청한다.
-    var result = QUIZ_EVIDENCE.fetchEvidence(String(topic), {
+    var result = fetchQuizEvidenceWithKeyPool(String(topic), {
       referenceDate: referenceDate,
       quizType: wantMulti ? "multi" : "short",
       maxResults: 5,
       materialCount: QUIZ_EVIDENCE_MATERIAL_COUNT,
       distractorCount: 4,
       excludeAnswers: cleanEvidenceAvoidAnswers(avoidAnswers)
-    });
+    }, room);
+    var evidenceCalls = Math.max(1, Math.floor((result && result._gatewaySearches) || 1));
     var evidence = normalizeStructuredQuizEvidence(result, topic);
     if (!evidence) {
       return { error: result && result.error ? structuredEvidenceErrorDetail(result)
         : "[MODEL_OUTPUT_FORMAT] 보강 퀴즈 근거를 해석하지 못함",
         errorCode: result && result.errorCode ? result.errorCode : "MODEL_OUTPUT_FORMAT",
-        retryable: !!(result && result.retryable), _gatewaySearches: 1 };
+        retryable: !!(result && result.retryable), _gatewaySearches: evidenceCalls };
     }
-    evidence._gatewaySearches = 1;
+    evidence._gatewaySearches = evidenceCalls;
     return evidence;
   } catch (e) {
     return { error: String(e && e.message ? e.message : e).replace(/[\r\n]+/g, " ").slice(0, 160),
@@ -3132,7 +3218,7 @@ function generateQuiz(customTopic, room) {
   var evidenceFormatFallback = "";
   if (customTopic) {
     var evidenceResult = fetchGenerationEvidence(
-      topic, referenceDate, wantMulti, topicAvoidAnswers);
+      topic, referenceDate, wantMulti, topicAvoidAnswers, room);
     if (!evidenceResult || evidenceResult.error) {
       var evidenceResultCode = String((evidenceResult && evidenceResult.errorCode) || "QUIZ_EVIDENCE_ERROR");
       var topicNotFound = evidenceResultCode === "TOPIC_NOT_FOUND" ||
@@ -3185,7 +3271,7 @@ function generateQuiz(customTopic, room) {
         }
       }
       var facetResult = fetchFacetGenerationEvidence(
-        topic, referenceDate, wantMulti, facetAvoidAnswers);
+        topic, referenceDate, wantMulti, facetAvoidAnswers, room);
       gatewaySearchesUsed += Math.max(0, Math.floor((facetResult && facetResult._gatewaySearches) || 0));
       if (facetResult && !facetResult.error) {
         // 보강 응답은 첫 응답의 모든 정답을 제외해 받은 독립 자료 묶음이다.
@@ -4453,6 +4539,12 @@ function processTask(task) {
         evidenceNotice = "⚠️ 이 토픽의 검색 출처를 확보하지 못했습니다.\n표현을 바꾸거나 범위를 넓혀 요청해주세요.";
       } else if (evidenceCode === "MODEL_OUTPUT_FORMAT") {
         evidenceNotice = "❗ 검색 근거의 형식을 검증하지 못해 출제할 수 없습니다.\n현재 요청은 종료되었습니다.";
+      } else if (evidenceCode === "GEMINI_API_KEY_REQUIRED" ||
+                 evidenceCode === "CLIENT_GEMINI_QUOTA_EXHAUSTED") {
+        evidenceNotice = "❗ 내부 API와 등록된 Gemini API 키의 사용량이 모두 소진되어 출제할 수 없습니다.\n사용 가능한 API 키 등록이 필요합니다.";
+      } else if (evidenceCode === "CLIENT_GEMINI_KEYS_INVALID" ||
+                 evidenceCode === "INVALID_CLIENT_GEMINI_KEY") {
+        evidenceNotice = "❗ 내부 API에 전달할 수 있는 유효한 Gemini API 키가 없습니다.\n관리자에게 등록 키 확인을 요청해주세요.";
       } else if (evidenceCode === "UNAUTHORIZED" || evidenceCode === "GATEWAY_UNAVAILABLE") {
         evidenceNotice = "❗ 검색 시스템에 연결할 수 없어 출제할 수 없습니다.\n관리자에게 오류 확인을 요청해주세요.";
       } else if (evidenceCode === "INVALID_REQUEST") {

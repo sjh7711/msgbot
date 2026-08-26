@@ -34,6 +34,12 @@ function loadGw(responder, opts) {
                  setDoOutput: () => {}, setConnectTimeout: (v) => { req.ct = v; }, setReadTimeout: (v) => { req.rt = v; },
                  getOutputStream: () => out,
                  getResponseCode: () => { req.res = responder(req); return req.res.code; },
+                 getHeaderField: (name) => {
+                   const hs = (req.res && req.res.headers) || {};
+                   const wanted = String(name).toLowerCase();
+                   for (const k of Object.keys(hs)) if (k.toLowerCase() === wanted) return String(hs[k]);
+                   return null;
+                 },
                  getInputStream: () => ({ _t: req.res.text }), getErrorStream: () => ({ _t: req.res.text }),
                  disconnect: () => {} }; }; } },
     },
@@ -85,17 +91,21 @@ const STRUCTURED_TELECHIPS = {
 };
 function quizNormalize(s) { return String(s == null ? '' : s).trim().toLowerCase().replace(/\s+/g, '')
   .replace(/[·．。．.,，'"`\-–—!?()（）「」<>《》]/g, ''); }
-function loadEvidenceFlow(responses) {
+function loadEvidenceFlow(responses, options) {
+  const o = options || {};
   const queue = responses.slice(), calls = [];
+  const exhaustedKeys = [];
   const ctx = { JSON, String, Math, MAX_TOPIC_EVIDENCE_CHARS: 12000, normalize: quizNormalize,
     QUIZ_EVIDENCE: { fetchEvidence: (query, options) => { calls.push({ query, options });
       return queue.length ? queue.shift() : { error: '준비된 응답 없음', errorCode: 'NO_SOURCES' }; } },
+    APIKEYS: { forRoom: (room) => (o.keyRows || []).map((row) => Object.assign({}, row, { seenRoom: room })),
+      markExhausted: (key) => { exhaustedKeys.push(key); } },
     GATEWAY: { search: () => ({ error: '이의신청 테스트 응답 없음' }) } };
   vm.createContext(ctx);
   const start = QSRC.indexOf('function compactEvidenceQueryJson(');
   const end = QSRC.indexOf('\nfunction generateQuiz(', start);
   vm.runInContext(QSRC.slice(start, end), ctx);
-  return { ctx, calls };
+  return { ctx, calls, exhaustedKeys };
 }
 
 console.log('\n[1] 요청 형태');
@@ -130,6 +140,28 @@ console.log('\n[1] 요청 형태');
      qeBody.material_count, qeBody.distractor_count, qeBody.stable_only],
     [false, 'quiz_evidence', '2026-08-26', 'multi', 5, 4, true]);
   check('제외 정답은 별도 배열·중복 제거', qeBody.exclude_answers, ['TOPST']);
+  check('평상시에는 Gemini 키 헤더를 보내지 않음',
+    Object.prototype.hasOwnProperty.call(qe.log[0].headers, 'X-Gemini-API-Key'), false);
+  const delegatedKey = 'AIzaDelegatedQuizEvidenceKey1234567890';
+  const delegated = loadQuizEvidence(() => ({ code: 200, text: JSON.stringify(STRUCTURED_TELECHIPS), headers: {
+    'X-Gemini-Key-Stored': 'added', 'X-Gemini-Key-Pool-Size': '3',
+    'X-Gemini-Credential-Source': 'client'
+  } }));
+  const delegatedResult = delegated.mod.fetchEvidence('텔레칩스', {
+    referenceDate: '2026-08-26', quizType: 'multi', geminiApiKey: delegatedKey
+  });
+  check('선택된 Gemini 키는 전용 헤더로만 전송',
+    [delegated.log[0].headers['X-Gemini-API-Key'],
+     Object.prototype.hasOwnProperty.call(JSON.parse(delegated.log[0].body), 'gemini_api_key')],
+    [delegatedKey, false]);
+  check('키 풀 응답 헤더 보존',
+    [delegatedResult.geminiKeyStored, delegatedResult.geminiKeyPoolSize,
+     delegatedResult.geminiCredentialSource], ['added', 3, 'client']);
+  const invalidDelegated = loadQuizEvidence(() => ({ code: 200, text: JSON.stringify(STRUCTURED_TELECHIPS) }));
+  check('개행·공백이 든 위임 키는 전송 전 차단',
+    [invalidDelegated.mod.fetchEvidence('텔레칩스', {
+      referenceDate: '2026-08-26', geminiApiKey: 'bad key\nheader'
+    }).errorCode, invalidDelegated.log.length], ['INVALID_CLIENT_GEMINI_KEY', 0]);
   const qeShort = loadQuizEvidence(() => ({ code: 200, text: JSON.stringify(STRUCTURED_TELECHIPS) }));
   qeShort.mod.fetchEvidence('텔레칩스', {
     referenceDate: '2026-08-26', quizType: 'short', distractorCount: 4
@@ -291,9 +323,9 @@ console.log('\n[3] 상식퀴즈봇 배선');
     [1, '1999년', '역사·사건', 0]);
   check('임의 오답 사후 검색 경로 제거',
     /function buildDistractorEvidenceQuery|function fetchDistractorEvidence|function mergeGenerationEvidence/.test(QSRC), false);
-  check('생성용 근거 조회 함수', /function fetchGenerationEvidence\(topic, referenceDate, wantMulti, avoidAnswers\)/.test(QSRC), true);
+  check('생성용 근거 조회 함수', /function fetchGenerationEvidence\(topic, referenceDate, wantMulti, avoidAnswers, room\)/.test(QSRC), true);
   check('생성 query는 토픽만, 옵션은 별도 필드',
-    /QUIZ_EVIDENCE\.fetchEvidence\(String\(topic\), \{/.test(QSRC) &&
+    /fetchQuizEvidenceWithKeyPool\(String\(topic\), \{/.test(QSRC) &&
     /excludeAnswers: cleanEvidenceAvoidAnswers\(avoidAnswers\)/.test(QSRC), true);
   check('  → QUIZ_EVIDENCE 없으면 오류 상태', /if \(!QUIZ_EVIDENCE\)/.test(QSRC), true);
   check('사용자 지정 토픽은 검색 실패 시 fail-closed',
@@ -305,13 +337,32 @@ console.log('\n[3] 상식퀴즈봇 배선');
     [rejected.calls.length, rejectedEvidence.errorCode, !!rejectedEvidence.error],
     [1, 'TOPIC_NOT_FOUND', true]);
   const direct = loadEvidenceFlow([STRUCTURED_TELECHIPS]);
-  const directEvidence = direct.ctx.fetchGenerationEvidence('텔레칩스', '2026-08-26', true, ['TOPST']);
+  const directEvidence = direct.ctx.fetchGenerationEvidence('텔레칩스', '2026-08-26', true, ['TOPST'], '테스트방');
   check('구조화 근거는 검색 1회', direct.calls.length, 1);
   check('전용 호출은 토픽과 구조화 옵션을 분리',
     [direct.calls[0].query, direct.calls[0].options.referenceDate,
      direct.calls[0].options.quizType, direct.calls[0].options.materialCount,
      direct.calls[0].options.excludeAnswers],
     ['텔레칩스', '2026-08-26', 'multi', 5, ['TOPST']]);
+  const key1 = 'AIzaEvidenceFallbackKey111111111111';
+  const key2 = 'AIzaEvidenceFallbackKey222222222222';
+  const poolFallback = loadEvidenceFlow([
+    { error: '서버 키 소진', errorCode: 'GEMINI_API_KEY_REQUIRED', retryable: true, httpStatus: 429 },
+    { error: '저장 키 소진', errorCode: 'CLIENT_GEMINI_QUOTA_EXHAUSTED', retryable: true, httpStatus: 429 },
+    STRUCTURED_TELECHIPS
+  ], { keyRows: [
+    { key: key1, priority: 9, cooling: false },
+    { key: key2, priority: 1, cooling: false },
+    { key: 'AIzaCoolingKey333333333333333333', priority: 9, cooling: true }
+  ] });
+  const recoveredEvidence = poolFallback.ctx.fetchGenerationEvidence(
+    '텔레칩스', '2026-08-26', true, [], '방 전용 키 등록방');
+  check('키 풀 오류 때 방 전용 키를 포함해 다음 DB 키를 순서대로 전송',
+    [poolFallback.calls.length, poolFallback.calls[0].options.geminiApiKey,
+     poolFallback.calls[1].options.geminiApiKey, poolFallback.calls[2].options.geminiApiKey,
+     recoveredEvidence._gatewaySearches],
+    [3, undefined, key1, key2, 3]);
+  check('429를 낸 DB 키는 공용 쿨다운에 반영', poolFallback.exhaustedKeys, [key1]);
   const scopedEvidence = direct.ctx.scopedEvidenceForMaterial(directEvidence, directEvidence.materials[0]);
   check('material별 정답·별칭·오답을 선택 소재 검증값으로만 투영',
     [directEvidence.materials.length, directEvidence.materials[0].distractors.length,
