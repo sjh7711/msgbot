@@ -110,5 +110,28 @@ console.log('\n[4] 이의신청도 검색 근거를 쓴다');
   check('근거 있음 표시', /🔎 웹 검색 근거를 확인해 판정했습니다/.test(QSRC), true);
   check('근거 없음 경고', /⚠ 검색 근거를 확인하지 못해 모델 지식만으로 판정했습니다/.test(QSRC), true);
 }
+
+console.log('\n[5] 출제 실패 기록 (2026-08-26)');
+{
+  check('실패 테이블', /CREATE TABLE IF NOT EXISTS quiz_gen_failure/.test(QSRC), true);
+  check('  → 후보 원문까지 저장', /" question TEXT," \+/.test(QSRC) && /" choices TEXT," \+/.test(QSRC), true);
+  check('기록 함수', /function logGenFailure\(room, topic, isCustom, attempt, reason, cand\)/.test(QSRC), true);
+  check('  → 보관 상한', /GEN_FAILURE_KEEP = 300/.test(QSRC), true);
+  check('  → 오래된 것부터 정리', /DELETE FROM quiz_gen_failure WHERE rowid NOT IN/.test(QSRC), true);
+  check('반복 상단에서 직전 후보 기록',
+        /logGenFailure\(room, topic, !!customTopic, attempt, lastError, data\)/.test(QSRC), true);
+  check('마지막 시도도 기록',
+        /logGenFailure\(room, topic, !!customTopic, MAX_GEN_ATTEMPTS, lastError, data\)/.test(QSRC), true);
+  check('토픽 검증 불가 즉시종료 경로도 기록',
+        /logGenFailure\(room, topic, true, attempt \+ 1, lastError, data\)/.test(QSRC), true);
+  check('조회 명령', /var FAIL_CMD = "!출제실패";/.test(QSRC), true);
+  check('  → 관리자만 (아니면 무응답)',
+        /function handleGenFailure[\s\S]{0,160}ADMIN\.isAdmin\(msg\.author\.hash\)\) return;/.test(QSRC), true);
+  check('  → 디스패치', /text === FAIL_CMD \|\| text\.indexOf\(FAIL_CMD \+ " "\) === 0/.test(QSRC), true);
+  const help = fs.readFileSync('e:/msgbot/Bots/도움말봇/도움말봇.js', 'utf8');
+  const rows = help.split('\n').filter((l) => /"!출제실패"/.test(l));
+  check('도움말 2개 전부 숨김', [rows.length, rows.filter((l) => /admin: true/.test(l)).length], [2, 2]);
+}
+
 console.log('\n' + (fail === 0 ? '✅ ' : '❌ ') + pass + ' 통과, ' + fail + ' 실패');
 process.exit(fail === 0 ? 0 : 1);

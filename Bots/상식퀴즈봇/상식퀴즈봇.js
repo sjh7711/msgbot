@@ -394,6 +394,27 @@ function initDB() {
     );
     db.execSQL("CREATE INDEX IF NOT EXISTS idx_qal_created ON quiz_answer_log(created DESC)");
     db.execSQL("CREATE INDEX IF NOT EXISTS idx_qal_norm ON quiz_answer_log(norm)");
+
+    // quiz_gen_failure: 출제가 반려된 후보를 통째로 남긴다.
+    //  - 예전엔 실패 사유를 화면에만 뿌리고 버려서, "왜 이 토픽만 계속 실패하나" 를
+    //    되짚을 방법이 없었다. 후보 원문이 있어야 사유가 타당했는지 볼 수 있다.
+    //  - 성공한 문제는 quiz_round 에 남으므로 여기는 실패분만 쌓인다.
+    db.execSQL(
+      "CREATE TABLE IF NOT EXISTS quiz_gen_failure (" +
+      " created INTEGER NOT NULL," +
+      " room TEXT," +
+      " topic TEXT," +
+      " custom_topic INTEGER NOT NULL DEFAULT 0," +
+      " attempt INTEGER NOT NULL," +
+      " reason TEXT NOT NULL," +
+      " question TEXT," +
+      " choices TEXT," +
+      " answer TEXT," +
+      " explanation TEXT" +
+      ")"
+    );
+    db.execSQL("CREATE INDEX IF NOT EXISTS idx_qgf_created ON quiz_gen_failure(created DESC)");
+    db.execSQL("CREATE INDEX IF NOT EXISTS idx_qgf_topic ON quiz_gen_failure(topic)");
     // 구버전(컬럼 없던 시절) 테이블 대비 — question/topic 없으면 추가 (기존 행은 NULL 로 남고 이후 백필).
     var qalCols = db.rawQuery("PRAGMA table_info(quiz_answer_log)", []);
     var qalHasQuestion = false, qalHasTopic = false;
@@ -1694,6 +1715,136 @@ function duplicateChoiceText(choices) {
 }
 
 // ── 퀴즈 생성 ────────────────────────────────────────────────────────
+// 반려된 후보를 통째로 남긴다. 사유만으로는 판정이 타당했는지 알 수 없다 —
+// 문제 원문이 있어야 "이건 막을 만했다 / 과했다" 를 나중에 가릴 수 있다.
+// 어떤 실패도 출제를 막지 않도록 통째로 삼킨다.
+var GEN_FAILURE_KEEP = 300;   // 태블릿 저장소를 무한정 먹지 않도록
+// ── !출제실패 — 반려된 후보 되짚어보기 (관리자) ────────────────────────
+//   !출제실패            최근 7일 사유·토픽별 집계
+//   !출제실패 상세        최근 5건 원문
+//   !출제실패 [토픽]      그 토픽의 최근 5건 원문
+var FAIL_CMD = "!출제실패";
+var FAIL_DETAIL_MAX = 5;
+
+function failCut(s, n) {
+  // 개행을 공백으로 접는다. 정규식 리터럴에 이스케이프를 쓰지 않으려고
+  // fromCharCode 로 CR/LF 를 직접 만든다.
+  var t = String(s == null ? "" : s)
+    .split(String.fromCharCode(13)).join(" ")
+    .split(String.fromCharCode(10)).join(" ");
+  return t.length > n ? t.slice(0, n - 1) + "…" : t;
+}
+
+function genFailureSummary() {
+  return DBH.withDB(DB_PATH, function(db) {
+    var since = nowMs() - 7 * 24 * 60 * 60 * 1000;
+    var lines = [], cur = null, total = 0;
+    try {
+      cur = db.rawQuery("SELECT COUNT(*) FROM quiz_gen_failure WHERE created >= ?", [String(since)]);
+      if (cur.moveToFirst()) total = cur.getInt(0);
+      cur.close(); cur = null;
+      if (!total) return "[출제 실패] 최근 7일간 반려 기록이 없습니다.";
+
+      lines.push("[출제 실패] 최근 7일 " + total + "건");
+      lines.push("");
+      lines.push("· 사유별");
+      cur = db.rawQuery("SELECT reason, COUNT(*) c FROM quiz_gen_failure WHERE created >= ? " +
+                        "GROUP BY reason ORDER BY c DESC LIMIT 8", [String(since)]);
+      while (cur.moveToNext()) lines.push("  " + cur.getInt(1) + "회  " + failCut(cur.getString(0), 60));
+      cur.close(); cur = null;
+
+      lines.push("");
+      lines.push("· 토픽별 (지정 토픽만)");
+      cur = db.rawQuery("SELECT topic, COUNT(*) c FROM quiz_gen_failure " +
+                        "WHERE created >= ? AND custom_topic = 1 AND topic <> '' " +
+                        "GROUP BY topic ORDER BY c DESC LIMIT 8", [String(since)]);
+      var any = false;
+      while (cur.moveToNext()) { lines.push("  " + cur.getInt(1) + "회  " + failCut(cur.getString(0), 40)); any = true; }
+      if (!any) lines.push("  (없음)");
+    } catch (e) { return "출제 실패 조회 오류: " + (e && e.message ? e.message : e); }
+    finally { if (cur) cur.close(); }
+
+    lines.push("");
+    lines.push("원문 보기: " + FAIL_CMD + " 상세   또는   " + FAIL_CMD + " [토픽]");
+    return lines.join(String.fromCharCode(10));
+  });
+}
+
+function genFailureDetail(topicFilter) {
+  return DBH.withDB(DB_PATH, function(db) {
+    var lines = [], cur = null, n = 0;
+    try {
+      if (topicFilter) {
+        cur = db.rawQuery("SELECT created, topic, attempt, reason, question, choices, answer " +
+                          "FROM quiz_gen_failure WHERE topic LIKE ? ORDER BY created DESC LIMIT " + FAIL_DETAIL_MAX,
+                          ["%" + topicFilter + "%"]);
+      } else {
+        cur = db.rawQuery("SELECT created, topic, attempt, reason, question, choices, answer " +
+                          "FROM quiz_gen_failure ORDER BY created DESC LIMIT " + FAIL_DETAIL_MAX, []);
+      }
+      while (cur.moveToNext()) {
+        n++;
+        lines.push("");
+        lines.push(n + ") " + tsFmtShort(cur.getLong(0)) + "  [" + failCut(cur.getString(1), 24) + "] " +
+                   cur.getInt(2) + "회차");
+        lines.push("   사유: " + failCut(cur.getString(3), 90));
+        var q = String(cur.getString(4) || "");
+        lines.push("   문제: " + (q ? failCut(q, 110) : "(후보 없음 — 파싱/API 단계 실패)"));
+        var ch = String(cur.getString(5) || "");
+        if (ch) lines.push("   보기: " + failCut(ch, 110));
+        var a = String(cur.getString(6) || "");
+        if (a) lines.push("   정답: " + failCut(a, 40));
+      }
+    } catch (e) { return "출제 실패 조회 오류: " + (e && e.message ? e.message : e); }
+    finally { if (cur) cur.close(); }
+    if (!n) return "해당하는 반려 기록이 없습니다.";
+    return ("[출제 실패 원문] " + (topicFilter ? "'" + topicFilter + "' " : "") + "최근 " + n + "건") + lines.join(String.fromCharCode(10));
+  });
+}
+
+// created(ms) → "MM-dd HH:mm" (KST)
+function tsFmtShort(ms) {
+  try {
+    var f = new java.text.SimpleDateFormat("MM-dd HH:mm");
+    f.setTimeZone(java.util.TimeZone.getTimeZone("Asia/Seoul"));
+    return String(f.format(new java.util.Date(Number(ms))));
+  } catch (_) { return "?"; }
+}
+
+function handleGenFailure(msg, arg) {
+  if (!ADMIN || !ADMIN.isAdmin(msg.author.hash)) return;   // 무응답
+  var a = String(arg || "").replace(/^\s+|\s+$/g, "");
+  if (!a) { msg.reply(genFailureSummary()); return; }
+  if (a === "상세") { msg.reply(genFailureDetail(null)); return; }
+  msg.reply(genFailureDetail(a));
+}
+
+function logGenFailure(room, topic, isCustom, attempt, reason, cand) {
+  try {
+    DBH.withDB(DB_PATH, function(db) {
+      var st = db.compileStatement(
+        "INSERT INTO quiz_gen_failure (created, room, topic, custom_topic, attempt, reason, " +
+        "question, choices, answer, explanation) VALUES (?,?,?,?,?,?,?,?,?,?)");
+      st.bindLong(1, nowMs());
+      st.bindString(2, String(room || ""));
+      st.bindString(3, String(topic || ""));
+      st.bindLong(4, isCustom ? 1 : 0);
+      st.bindLong(5, Number(attempt) || 0);
+      st.bindString(6, String(reason || "원인 미상").slice(0, 300));
+      // 후보가 없을 수도 있다(JSON 파싱 실패·API 오류). 그 경우도 사유는 남긴다.
+      var c = cand || {};
+      st.bindString(7, String(c.question || "").slice(0, 500));
+      st.bindString(8, (c.choices && c.choices.length) ? JSON.stringify(c.choices).slice(0, 600) : "");
+      st.bindString(9, String(c.answer || "").slice(0, 200));
+      st.bindString(10, String(c.explanation || "").slice(0, 500));
+      st.execute(); st.close();
+      // 오래된 것부터 정리 (rowid 는 삽입 순서라 그대로 쓸 수 있다)
+      db.execSQL("DELETE FROM quiz_gen_failure WHERE rowid NOT IN " +
+                 "(SELECT rowid FROM quiz_gen_failure ORDER BY created DESC LIMIT " + GEN_FAILURE_KEEP + ")");
+    });
+  } catch (_) {}
+}
+
 function generateQuiz(customTopic, room) {
   var topic = customTopic || pick(TOPICS);
   var wantMulti = Math.random() < 0.7; // 객관식 70%, 주관식 30%
@@ -1846,7 +1997,11 @@ function generateQuiz(customTopic, room) {
   var attemptErrors = [];   // 시도별 실패 사유 누적 (성공 시 return 으로 빠져나가므로 실패분만 쌓임)
   var MAX_GEN_ATTEMPTS = 4;
   for (var attempt = 0; attempt < MAX_GEN_ATTEMPTS; attempt++) {
-    if (attempt > 0) attemptErrors.push(lastError);   // 직전 시도가 실패했음(성공이면 이미 return) → 사유 기록
+    if (attempt > 0) {
+      attemptErrors.push(lastError);   // 직전 시도가 실패했음(성공이면 이미 return)
+      // data 는 var 라 함수 스코프 — 이 시점엔 아직 직전 후보를 들고 있다.
+      logGenFailure(room, topic, !!customTopic, attempt, lastError, data);
+    }
     // 직전 시도의 실패 사유(로컬검증·감사 반려 포함)를 다음 프롬프트에 피드백으로 주입해 같은 실수를 교정시킨다.
     var feedback = (attempt > 0)
       ? ("⚠ 직전에 만든 문제는 다음 이유로 반려되었습니다. 그 부분을 반드시 고쳐서 새로 출제하세요:\n  - " + lastError + "\n\n")
@@ -1880,6 +2035,8 @@ function generateQuiz(customTopic, room) {
       lastError = "토픽 검증 불가: " + rejectReason;
       if (customTopic) {
         attemptErrors.push(lastError);
+        // 즉시 포기하는 경로라 반복 상단 기록을 못 탄다 — 여기서 직접 남긴다.
+        logGenFailure(room, topic, true, attempt + 1, lastError, data);
         return { _error: lastError, _attempts: attemptErrors, _unverifiable: true, _topic: topic };
       }
       continue;
@@ -2039,6 +2196,7 @@ function generateQuiz(customTopic, room) {
     return data;
   }
   attemptErrors.push(lastError);   // 마지막 시도 실패 사유
+  logGenFailure(room, topic, !!customTopic, MAX_GEN_ATTEMPTS, lastError, data);
   return { _error: lastError, _attempts: attemptErrors };
 }
 
@@ -2677,6 +2835,7 @@ function isGameCommand(text) {
   if (text === VERIFY_CMD || text.indexOf(VERIFY_CMD + " ") === 0) return true;
   if (text === DELETE_CMD || text.indexOf(DELETE_CMD + " ") === 0) return true;
   if (text === LIST_CMD) return true;
+  if (text === FAIL_CMD || text.indexOf(FAIL_CMD + " ") === 0) return true;
   if (text === PRIMARY_CMD || text.indexOf(PRIMARY_CMD + " ") === 0) return true;
   if (text === SECONDARY_CMD || text.indexOf(SECONDARY_CMD + " ") === 0) return true;
   if (text === ROOMONLY_CMD || text.indexOf(ROOMONLY_CMD + " ") === 0) return true;
@@ -3093,6 +3252,11 @@ function handleMessage(msg) {
 
     // 목록 전용 이름. 인자는 받지 않는다 — 여기서 지울 수 있으면 이름이 거짓말이 된다.
     if (text === LIST_CMD) { handleApiDelete(msg, ""); return; }
+
+    if (text === FAIL_CMD || text.indexOf(FAIL_CMD + " ") === 0) {
+      handleGenFailure(msg, text.slice(FAIL_CMD.length));
+      return;
+    }
 
     if (text === PRIMARY_CMD || text.indexOf(PRIMARY_CMD + " ") === 0) {
       handleApiPriority(msg, text.slice(PRIMARY_CMD.length), APIKEYS ? APIKEYS.PRIORITY_PRIMARY : 0);

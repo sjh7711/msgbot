@@ -64,6 +64,8 @@ var REGISTRY = [
       { display: "!api검증 [KEY]",       triggers: ["!api검증"],      desc: "그 키가 아직 살아 있는지 실제로 호출해 확인", admin: false },
       { display: "!api검증 전체",        triggers: ["!api검증"],      desc: "등록된 모든 키의 유효성 점검 (관리자)", admin: true },
       { display: "!api목록",            triggers: ["!api목록"],      desc: "등록된 키 목록을 번호와 함께 표시 (관리자)", admin: true },
+      { display: "!출제실패",              triggers: ["!출제실패"],     desc: "반려된 퀴즈 후보 집계 (최근 7일, 사유·토픽별)", admin: true },
+      { display: "!출제실패 상세/[토픽]",    triggers: ["!출제실패"],     desc: "반려된 후보의 문제 원문 확인 (최근 5건)", admin: true },
       { display: "!api삭제 [번호]",      triggers: ["!api삭제"],      desc: "그 번호의 키 삭제. primary 키는 '확인'을 한 번 더 받음", admin: true },
       { display: "!api기본 [번호]",      triggers: ["!api기본"],      desc: "그 키를 primary 로 승격 (모든 방에서 가장 먼저 사용). 기존 primary 는 secondary 로", admin: true },
       { display: "!api보조 [번호]",      triggers: ["!api보조"],      desc: "그 키를 secondary 로 (모든 방, primary 가 한도 초과일 때 사용). 여러 개 지정 가능", admin: true },
