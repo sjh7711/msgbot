@@ -61,7 +61,7 @@ function loadEvidenceFlow(responses) {
       return queue.length ? queue.shift() : { error: '준비된 응답 없음' }; } } };
   vm.createContext(ctx);
   const start = QSRC.indexOf('function compactEvidenceQueryJson(');
-  const end = QSRC.indexOf('\n// 생성 모델이 검색 자료와 무관한 정답을', start);
+  const end = QSRC.indexOf('\nfunction generateQuiz(', start);
   vm.runInContext(QSRC.slice(start, end), ctx);
   return { ctx, calls };
 }
@@ -103,27 +103,100 @@ console.log('\n[3] 상식퀴즈봇 배선');
   const genStart = QSRC.indexOf('function generateQuiz(');
   const genEnd = QSRC.indexOf('\n// 2차 감사', genStart);
   const genBody = QSRC.slice(genStart, genEnd);
-  const fetchPos = genBody.indexOf('fetchGenerationEvidence(topic, referenceDate, wantMulti)');
+  const fetchPos = genBody.indexOf('fetchGenerationEvidence(');
   const loopPos = genBody.indexOf('for (var attempt = 0;');
   const queryCtx = loadEvidenceFlow([]).ctx;
   const qm = queryCtx.buildGenerationEvidenceQuery('텔레칩스', '2026-08-26', true);
   const qs = queryCtx.buildGenerationEvidenceQuery('텔레칩스', '2026-08-26', false);
+  const qa = queryCtx.buildGenerationEvidenceQuery('텔레칩스', '2026-08-26', true,
+    ['TOPST', 'Dolphin3', 'VCP', 'N-Dolphin', 'AXON']);
   const qe = queryCtx.buildGenerationEvidenceQuery(('"\\').repeat(40) + '\u0000\n명령', '2026-08-26', true);
   const qx = queryCtx.buildExactGenerationEvidenceQuery(('"\\').repeat(40) + '\u0000\n명령', '2026-08-26', true);
+  const qf = queryCtx.buildFacetGenerationEvidenceQuery('텔레칩스', '2026-08-26', true,
+    ['TOPST'], ['제품·기술', '역사·사건']);
   const validCaution = { answer: '텔레칩스는 공개 정보가 부족하지만 TOPST를 운영한다. [S1]', sources: TELECHIPS.sources };
   const unrelatedComposite = { answer: '메이플스토리는 게임이다. [S1] Key Management Service(KMS)는 별개다. [S2]',
     sources: [{ id: 'S1' }, { id: 'S2' }] };
   const asciiSubstring = { answer: 'Training data was explained. [S1]', sources: [{ id: 'S1' }] };
   check('게이트웨이 모듈 방어적 로드', /var GATEWAY = \(function\(\)[\s\S]{0,320}catch\(_\) \{ return null; \}/.test(QSRC), true);
-  check('생성·재검색어 300자 이하', [qm.length <= 300, qs.length <= 300, qe.length <= 300, qx.length <= 300], [true, true, true, true]);
+  check('생성·재검색·보강 검색어 300자 이하',
+    [qm.length <= 300, qs.length <= 300, qa.length <= 300, qe.length <= 300, qx.length <= 300, qf.length <= 300],
+    [true, true, true, true, true, true]);
   check('텔레칩스 검색어에 TOPIK 오인 단어 없음', [qm.indexOf('토픽'), qs.indexOf('토픽')], [-1, -1]);
-  check('객관식·주관식 소재 요구 유지', [qm.indexOf('동급 오답 4개') >= 0, qs.indexOf('이표기') >= 0], [true, true]);
+  check('객관식·주관식 소재 풀 요구 유지',
+    [qm.indexOf('동급 오답 4개') >= 0, qs.indexOf('검증된 별칭') >= 0,
+     qm.indexOf('[M#|측면|정답]') >= 0, qa.indexOf('최근정답 제외') >= 0,
+     qf.indexOf('미사용 하위 소재 보강 검색') >= 0],
+    [true, true, true, true, true]);
   check('관련성 문장·ASCII 경계', [
     queryCtx.generationEvidenceMatchesTopic(validCaution, '텔레칩스'),
     queryCtx.generationEvidenceMatchesTopic(unrelatedComposite, '메이플스토리 KMS'),
     queryCtx.generationEvidenceMatchesTopic(asciiSubstring, 'AI')], [true, false, false]);
-  check('생성용 근거 조회 함수', /function fetchGenerationEvidence\(topic, referenceDate, wantMulti\)/.test(QSRC), true);
-  check('생성 검색은 300자 빌더 사용', /var q = buildGenerationEvidenceQuery\(topic, referenceDate, wantMulti\);/.test(genBody), true);
+  const scalarChecks = vm.runInContext(`[
+    !!safeScalarChoiceSet(['2020년 5월 10일','2021년 5월 10일','2022년 5월 10일','2023년 5월 10일','2024년 5월 10일'], '2022년 5월 10일'),
+    !!safeScalarChoiceSet(['제38대 검찰총장','제40대 검찰총장','제43대 검찰총장','제45대 검찰총장','제41대 검찰총장'], '제43대 검찰총장'),
+    safeScalarChoiceSet(['제38대 대법원장','제40대 헌법재판소장','제43대 검찰총장','제45대 법무부장관','제41대 서울고등법원장'], '제43대 검찰총장') === null,
+    safeScalarChoiceSet(['RoadChip 2020','RoadChip 2021','TOPST','RoadChip 2023','RoadChip 2024'], 'TOPST') === null
+  ]`, queryCtx);
+  check('날짜·서수만 면제하고 혼합 직책·제품 숫자는 차단', scalarChecks, [true, true, true, true]);
+  const exactChecks = vm.runInContext(`[
+    evidenceSentenceHasExactToken('후보가 13위였다', '3위'),
+    evidenceSentenceHasExactToken('공식 제품 Dolphin3이 있다', 'Dolphin'),
+    evidenceSentenceHasExactToken('C++ 언어', 'C'),
+    evidenceSentenceHasExactToken('현대건설은 회사다', '현대건설'),
+    verifiedEvidenceSentencesForItems({answer:'2022년 5월 10일이 아니다. [S1]',sources:[{id:'S1'}]}, ['2022년 5월 10일'], false) === null,
+    verifiedEvidenceSentencesForItems({answer:'2022년 5월 10일이 아니라 다른 날이다. [S1]',sources:[{id:'S1'}]}, ['2022년 5월 10일'], false) === null,
+    verifiedEvidenceSentencesForItems({answer:'RoadChip is not a real product. [S1]',sources:[{id:'S1'}]}, ['RoadChip'], true) === null,
+    verifiedEvidenceSentencesForItems({answer:'게임의 가상 캐릭터 루시드는 공식 등장인물이다. [S1]',sources:[{id:'S1'}]}, ['루시드'], false) !== null,
+    verifiedEvidenceSentencesForItems({answer:'국회의원이 아닌 검찰총장 출신이다. [S1]',sources:[{id:'S1'}]}, ['검찰총장'], false) !== null,
+    verifiedEvidenceSentencesForItems({answer:'Node.js는 실제 런타임이다. [S1]',sources:[{id:'S1'}]}, ['Node.js'], false) !== null,
+    verifiedEvidenceSentencesForItems({answer:'날짜는 2022.5.10이다. [S1]',sources:[{id:'S1'}]}, ['2022.5.10'], false) !== null
+  ]`, queryCtx);
+  check('정확 명칭 경계·항목별 부정·점 포함 명칭', exactChecks,
+    [false, false, false, true, true, true, true, true, true, true, true]);
+  const duplicateSourceIds = vm.runInContext(`[
+    normalizeGenerationEvidence({answer:'첫째 [S1]. 둘째 [S1]',sources:[
+      {id:'S1',title:'a',url:'https://a'},{id:'S1',title:'b',url:'https://b'}]}) === null,
+    normalizeGenerationEvidence({answer:'첫째 [S1]. 둘째 [S1]',sources:[
+      {id:'S!1',title:'a',url:'https://a'},{id:'S1',title:'b',url:'https://b'}]}) === null
+  ]`, queryCtx);
+  check('중복·정제 충돌 출처 ID는 fail-closed', duplicateSourceIds, [true, true]);
+  const wiringChecks = vm.runInContext(`(function(){
+    var ev={answer:'현대건설의 정식 영문명은 Hyundai Engineering & Construction이다. [S1]',
+      sources:[{id:'S1',title:'공식',url:'https://official'}]};
+    var short={supporting_quote:ev.answer,acceptable:['건설','Hyundai Engineering & Construction']};
+    sanitizeAcceptableAliases(short,ev,'현대건설','이명박');
+    var bad={supporting_quote:'RoadChip은 제품이 아니다. [S1]',choices:['1위','2위','3위','4위','5위']};
+    var badEv={answer:bad.supporting_quote,sources:[{id:'S1',title:'x',url:'https://x'}]};
+    return [short.acceptable.join('|'), generationCoreEvidenceError(bad,badEv,'3위') !== null];
+  })()`, queryCtx);
+  check('실제 core·alias 배선도 helper 정책 적용', wiringChecks,
+    ['Hyundai Engineering & Construction', true]);
+  const materialChecks = vm.runInContext(`(function(){
+    var ev={answer:'[M1|제품·기술|TOPST] 텔레칩스는 TOPST 플랫폼을 운영한다. [S1]\\n' +
+      '[M2|역사·사건|1999년] 텔레칩스는 1999년에 설립되었다. [S2]',
+      sources:[{id:'S1',title:'제품',url:'https://official/p'},{id:'S2',title:'연혁',url:'https://official/h'}]};
+    var pool=buildEvidenceMaterialPool(ev,'텔레칩스',{'$topst':true},['TOPST']);
+    var markerOnly={answer:'[M1|제품·기술|RoadChip] 텔레칩스는 제품을 개발한다. [S1]',sources:[ev.sources[0]]};
+    return [pool.length,pool[0]&&pool[0].answer,pool[0]&&pool[0].facet,
+      buildEvidenceMaterialPool(markerOnly,'텔레칩스',{},[]).length];
+  })()`, queryCtx);
+  check('소재 풀은 기출 정답·표식뿐인 가짜 정답을 제거', materialChecks,
+    [1, '1999년', '역사·사건', 0]);
+  const remapped = queryCtx.mergeGenerationEvidence(
+    { answer: '기본 [B1]', sources: [{ id: 'B1' }] },
+    { answer: '첫째 [S1]. 둘째 [D1]', sources: [{ id: 'S1' }, { id: 'D1' }] });
+  check('추가 근거 ID는 연쇄 오염 없이 단일 치환',
+    [remapped.answer.indexOf('첫째 [D1]') >= 0, remapped.answer.indexOf('둘째 [D2]') >= 0],
+    [true, true]);
+  const distractorQuery = queryCtx.buildDistractorEvidenceQuery(
+    '아일릿', '다음 중 이 그룹의 구성원은?', ['해원', '설윤', '카즈하', '혜인'], '2026-08-26');
+  check('오답 묶음 검색도 300자 이하', !!distractorQuery && distractorQuery.length <= 300, true);
+  check('보기 안 출처 표식·제어문자는 검색 전 차단', [
+    queryCtx.buildDistractorEvidenceQuery('주제', '문제', ['RoadChip [S1]'], '2026-08-26'),
+    queryCtx.buildDistractorEvidenceQuery('주제', '문제', ['줄\n바꿈'], '2026-08-26')], [null, null]);
+  check('생성용 근거 조회 함수', /function fetchGenerationEvidence\(topic, referenceDate, wantMulti, avoidAnswers\)/.test(QSRC), true);
+  check('생성 검색은 300자 빌더 사용', /var q = buildGenerationEvidenceQuery\(topic, referenceDate, wantMulti, avoidAnswers\);/.test(QSRC), true);
   check('  → GATEWAY 없으면 오류 상태', /if \(!GATEWAY\) return \{ error: "검색 게이트웨이 모듈 없음" \};/.test(QSRC), true);
   check('사용자 지정 토픽은 검색 실패 시 fail-closed', /_evidenceUnavailable: true/.test(genBody), true);
   check('근거 획득 함수는 생성 루프 전에 1회', [fetchPos >= 0 && fetchPos < loopPos, (genBody.match(/fetchGenerationEvidence\(/g) || []).length], [true, 1]);
@@ -137,16 +210,32 @@ console.log('\n[3] 상식퀴즈봇 배선');
   const direct = loadEvidenceFlow([TELECHIPS]);
   direct.ctx.fetchGenerationEvidence('텔레칩스', '2026-08-26', true);
   check('첫 근거가 관련 있으면 검색 1회', direct.calls.length, 1);
+  const markerTopic = loadEvidenceFlow([TELECHIPS]);
+  const markerTopicResult = markerTopic.ctx.fetchGenerationEvidence('아일릿 [S1]', '2026-08-26', true);
+  check('토픽의 출처 표식 위장은 검색 전 차단', [markerTopic.calls.length, !!markerTopicResult.error], [0, true]);
   check('후보 기반 확인편향 검색 없음', /fetchAuditEvidence\(topic, data\.question/.test(genBody), false);
-  check('검색 근거를 생성 프롬프트에 선주입', /promptHead \+ groundingBlock \+ feedback/.test(genBody), true);
-  check('정답·보기·인용문 로컬 grounding', /generationEvidenceError\(data, topicEvidence, answerText\)/.test(genBody), true);
-  check('같은 근거를 감사에 재사용', /auditQuiz\(data, topic, wantMulti, answerText, room, referenceDate, !!customTopic, topicEvidence\)/.test(genBody), true);
+  check('검색 근거와 회전 소재를 생성 프롬프트에 선주입', /promptHead \+ groundingBlock \+ materialFocusBlock \+ feedback/.test(genBody), true);
+  check('기존 정답 로그를 검색 단계에서 재사용', /getRecentTopicAnswers\(topic, 8\)/.test(genBody), true);
+  check('미사용 소재가 0개일 때만 보강 검색', /if \(!topicMaterials\.length && gatewaySearchesUsed < MAX_GENERATION_GATEWAY_SEARCHES\)/.test(genBody), true);
+  check('생성 검색 총예산 2회', /var MAX_GENERATION_GATEWAY_SEARCHES = 2;/.test(genBody) &&
+    /gatewaySearchesUsed >= MAX_GENERATION_GATEWAY_SEARCHES/.test(genBody), true);
+  check('정답·보기·인용문 로컬 grounding', /generationEvidenceError\(data, candidateEvidence, answerText\)/.test(genBody), true);
+  check('후보별 검증 근거를 감사에 전달', /auditQuiz\(data, topic, wantMulti, answerText, room, referenceDate, !!customTopic, candidateEvidence\)/.test(genBody), true);
+  check('정답·출처 core 검사는 유지', /function generationCoreEvidenceError\(data, evidence, answerText\)/.test(QSRC), true);
+  check('인용문은 근거 문장에서만 복원', /function groundedQuoteForAnswer\(evidence, answerText\)/.test(QSRC), true);
+  check('고유명사 오답은 별도 묶음 검증', /fetchDistractorEvidence\(topic, data\.question, missingChoices, referenceDate\)/.test(genBody), true);
+  check('숫자 예외는 엄격한 템플릿 검사', /function safeScalarChoiceSet\(choices, answerText\)/.test(QSRC), true);
+  check('근거 없는 주관식 별칭만 제거', /sanitizeAcceptableAliases\(data, customTopic \? topicEvidence : null, String\(data\.answer\), customTopic \? topic : ""\)/.test(genBody), true);
+  check('근거 판정은 출처가 붙은 정확 명칭 문장을 공유', /verifiedEvidenceSentencesForItems\(evidence, \[String\(data\.choices\[ci\]\)\], false\)/.test(QSRC), true);
+  check('문제·보기·정답의 출처 표식 위장 차단', /문제\/보기\/정답에 출처 ID 표식 누출/.test(genBody), true);
+  check('오답 검색 캐시는 안전한 소유 키와 문맥 사용', /Object\.prototype\.hasOwnProperty\.call\(distractorEvidenceCache, cacheKey\)/.test(genBody) && /"q:" \+ normalize\(data\.question\)/.test(genBody), true);
   check('근거를 감사 대상에 실음', /auditTarget\.evidence = evidence\.answer;/.test(QSRC), true);
   check('출처도 함께', /auditTarget\.evidence_sources = srcList;/.test(QSRC), true);
   check('출처 ID도 보존', /srcList\.push\("\[" \+ evidence\.sources\[ei\]\.id \+ "\] "/.test(QSRC), true);
   check('모듈 경계 sources 배열 호환', /typeof result\.sources\.length !== "number"/.test(QSRC), true);
   check('근거 미지원 핵심 주장은 하드 반려', /unsupported_by_evidence: \{ label: "검색 근거에 없는 핵심 주장", hard: true \}/.test(QSRC), true);
-  check('  → 근거 미언급도 반려 지시', /evidence가 다루지 않은 핵심 주장은 확인된 것으로 추정하지 말고 unsupported_by_evidence=true/.test(QSRC), true);
+  check('  → 숫자 면제는 감사에도 명시', /evidence_exempt_distractor_indices/.test(QSRC) && /동일 템플릿 거짓 숫자 대안/.test(QSRC), true);
+  check('  → 면제 메타데이터는 감사 직전 코드 재계산', /var auditScalarSet = wantMulti \? safeScalarChoiceSet\(data\.choices, answerText\) : null;/.test(QSRC), true);
   check('  → 기본 토픽 적용 불가 오탐 무시', /if \(!evidence\) v\.unsupported_by_evidence = false;/.test(QSRC), true);
   check('생성은 별도 스레드 (워커 안 막음)',
         QSRC.indexOf('new java.lang.Thread') < QSRC.indexOf('data = generateQuiz(customTopic, room)'), true);
@@ -189,17 +278,26 @@ console.log('\n[5] 출제 실패 기록 (2026-08-26)');
 {
   check('실패 테이블', /CREATE TABLE IF NOT EXISTS quiz_gen_failure/.test(QSRC), true);
   check('  → 후보 원문까지 저장', /" question TEXT," \+/.test(QSRC) && /" choices TEXT," \+/.test(QSRC), true);
-  check('기록 함수', /function logGenFailure\(room, topic, isCustom, attempt, reason, cand\)/.test(QSRC), true);
+  check('기록 함수', /function logGenFailure\(room, topic, isCustom, attempt, reason, cand, evidence\)/.test(QSRC), true);
+  check('  → 인용·출처·검색구간 컬럼', /" supporting_quote TEXT," \+/.test(QSRC) && /" evidence_source_ids TEXT," \+/.test(QSRC) && /" evidence_excerpt TEXT" \+/.test(QSRC), true);
+  check('  → 기존 DB 마이그레이션', /PRAGMA table_info\(quiz_gen_failure\)/.test(QSRC) && /ALTER TABLE quiz_gen_failure ADD COLUMN supporting_quote TEXT/.test(QSRC), true);
+  check('  → 마이그레이션 불완전 시 구형 로그 폴백', /QGF_EVIDENCE_COLUMNS_READY/.test(QSRC) && /var extendedLog = QGF_EVIDENCE_COLUMNS_READY;/.test(QSRC) && /var hasEvidenceDetail = QGF_EVIDENCE_COLUMNS_READY;/.test(QSRC), true);
   check('  → 보관 상한', /GEN_FAILURE_KEEP = 300/.test(QSRC), true);
   check('  → 오래된 것부터 정리', /DELETE FROM quiz_gen_failure WHERE rowid NOT IN/.test(QSRC), true);
   check('반복 상단에서 직전 후보 기록',
-        /logGenFailure\(room, topic, !!customTopic, attempt, lastError, data\)/.test(QSRC), true);
+        /logGenFailure\(room, topic, !!customTopic, attempt, lastError, data, failureEvidence\)/.test(QSRC), true);
   check('마지막 시도도 기록',
-        /logGenFailure\(room, topic, !!customTopic, MAX_GEN_ATTEMPTS, lastError, data\)/.test(QSRC), true);
+        /logGenFailure\(room, topic, !!customTopic, MAX_GEN_ATTEMPTS, lastError, data, failureEvidence\)/.test(QSRC), true);
   check('토픽 검증 불가 즉시종료 경로도 기록',
-         /logGenFailure\(room, topic, true, attempt \+ 1, lastError, data\)/.test(QSRC), true);
+         /logGenFailure\(room, topic, true, attempt \+ 1, lastError, data, failureEvidence\)/.test(QSRC), true);
+  check('감사 시스템 중단 경로도 근거와 함께 기록',
+         /logGenFailure\(room, topic, !!customTopic, attempt \+ 1, lastError, data, candidateEvidence\)/.test(QSRC), true);
+  check('상세에 진단 필드 표시', /근거 인용: /.test(QSRC) && /허용 출처 ID: /.test(QSRC) && /검색 근거: /.test(QSRC), true);
   check('후보 없음 설명은 모든 중단 원인을 포괄', /\(후보 없음 — 문제를 생성하지 않음\)/.test(QSRC), true);
   check('조회 명령', /var FAIL_CMD = "!출제실패";/.test(QSRC), true);
+  check('중복 실패는 정답별 원문이 아니라 원인 범주로 합산',
+        /var reasonLabel = summarizeGenError\(cur\.getString\(0\)\)/.test(QSRC) &&
+        /return "최근 출제 정답 중복"/.test(QSRC), true);
   check('  → 관리자만 (아니면 무응답)',
         /function handleGenFailure[\s\S]{0,160}ADMIN\.isAdmin\(msg\.author\.hash\)\) return;/.test(QSRC), true);
   check('  → 디스패치', /text === FAIL_CMD \|\| text\.indexOf\(FAIL_CMD \+ " "\) === 0/.test(QSRC), true);
@@ -220,6 +318,7 @@ console.log('\n[6] 쓰이지 않는 필드는 반려가 아니라 정규화');
   check('정답 번호 형식은 여전히 반려', /"객관식 정답 형식 오류: "/.test(QSRC), true);
   check('보기 수 오류도 여전히 반려', /"객관식 보기 수 오류"/.test(QSRC), true);
   check('주관식 허용답안 수는 여전히 검사', /"주관식 허용답안 수 오류: "/.test(QSRC), true);
+  check('  → 0개 허용, 10개 초과만 반려', /if \(data\.acceptable\.length > 10\)/.test(QSRC), true);
   const py = fs.readFileSync('e:/msgbot/tests/quiz_policy_regression.py', 'utf8');
   check('Python 미러도 같이 바뀜',
         /candidate\["acceptable"\] = \[\]/.test(py) && /candidate\["choices"\] = \[\]/.test(py), true);
@@ -234,11 +333,11 @@ console.log('\n[7] 근거가 있으면 현재·최신 사전 차단을 푼다');
   check('  → 지정 토픽 + 근거일 때만 통과',
         /if \(!\(isCustomTopic && hasEvidence\) &&/.test(QSRC), true);
   check('근거를 로컬 정책보다 먼저 조회',
-        QSRC.indexOf('fetchGenerationEvidence(topic, referenceDate, wantMulti)') < QSRC.indexOf('var localPolicyError = localQuizPolicyError'), true);
+        QSRC.indexOf('fetchGenerationEvidence(') < QSRC.indexOf('var localPolicyError = localQuizPolicyError'), true);
   check('  → 정책에 넘긴다',
         /localQuizPolicyError\(data, referenceDate, !!customTopic, !!topicEvidence\)/.test(QSRC), true);
   check('감사에도 같은 근거를 넘긴다 (재조회 없음)',
-        /auditQuiz\(data, topic, wantMulti, answerText, room, referenceDate, !!customTopic, topicEvidence\)/.test(QSRC), true);
+        /auditQuiz\(data, topic, wantMulti, answerText, room, referenceDate, !!customTopic, candidateEvidence\)/.test(QSRC), true);
   check('  → 감사는 넘겨받은 것만 씀', /var evidence = preEvidence \|\| null;/.test(QSRC), true);
   check('  → 감사 안에서 다시 조회하지 않음', /var evidence = isCustomTopic\s*\n\s*\? fetchAuditEvidence/.test(QSRC), false);
   const py = fs.readFileSync('e:/msgbot/tests/quiz_policy_regression.py', 'utf8');

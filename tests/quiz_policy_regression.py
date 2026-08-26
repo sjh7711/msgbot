@@ -207,7 +207,7 @@ def validate_candidate(
         if not candidate["answer"].strip():
             return "LOCAL_REJECT", "주관식 정답 비어있음", ""
         acceptable = candidate["acceptable"]
-        if not 2 <= len(acceptable) <= 10:
+        if len(acceptable) > 10:
             return "LOCAL_REJECT", "주관식 허용답안 수 오류", ""
         if any(not isinstance(item, str) or not item.strip() for item in acceptable):
             return "LOCAL_REJECT", "주관식 허용답안 타입/빈값 오류", ""
@@ -567,7 +567,7 @@ CASES = [
         "new": "LOCAL_REJECT",
     },
     {
-        "name": "주관식 허용답안 수 부족",
+        "name": "주관식 허용답안 1개 허용",
         "topic": "화학",
         "want_multi": False,
         "candidate": {
@@ -584,7 +584,7 @@ CASES = [
         "audit": clean_audit(),
         "legacy_audit": {},
         "old": "ACCEPT",
-        "new": "LOCAL_REJECT",
+        "new": "ACCEPT",
     },
     {
         "name": "토픽 문자열 JSON 이스케이프",
@@ -687,8 +687,15 @@ def assert_javascript_contract() -> None:
         'IMPLICIT_CURRENT_FACT_RE.test(combined)',
         'CATALOG_COUNT_RE.test(s)',
         'if (precisionKinds.length && !(isCustomTopic && hasEvidence))',
-        'fetchGenerationEvidence(topic, referenceDate, wantMulti)',
-        'generationEvidenceError(data, topicEvidence, answerText)',
+        'fetchGenerationEvidence(\n      topic, referenceDate, wantMulti, topicAvoidAnswers)',
+        'buildEvidenceMaterialPool(',
+        'var MAX_GENERATION_GATEWAY_SEARCHES = 2;',
+        'generationEvidenceError(data, candidateEvidence, answerText)',
+        'safeScalarChoiceSet(data.choices, answerText)',
+        'fetchDistractorEvidence(topic, data.question, missingChoices, referenceDate)',
+        'sanitizeAcceptableAliases(data, customTopic ? topicEvidence : null, String(data.answer), customTopic ? topic : "")',
+        'var auditScalarSet = wantMulti ? safeScalarChoiceSet(data.choices, answerText) : null;',
+        'evidence_exempt_distractor_indices: auditScalarSet ? auditScalarSet.exemptIndices : []',
         'localQuizPolicyError(data, referenceDate, !!customTopic, !!topicEvidence)',
         'precision_claim_error: { label: "서수·순서·관계 주장 오류", hard: true  }',
         'unsupported_by_evidence: { label: "검색 근거에 없는 핵심 주장", hard: true }',
