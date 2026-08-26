@@ -2088,11 +2088,15 @@ function generateQuiz(customTopic, room) {
       if (choicesHaveBadType) { lastError = "객관식 보기 타입/빈값 오류"; continue; }
       var dupChoice = duplicateChoiceText(data.choices);
       if (dupChoice !== null) { lastError = "객관식 보기 중복/빈값: " + dupChoice; continue; }
-      if (data.acceptable.length !== 0) { lastError = "객관식 허용답안 배열이 비어있지 않음"; continue; }
+      // 객관식은 번호로 채점하므로 acceptable 은 쓰이지 않는다. 모델이 습관적으로
+      // 채워 보내는데, 그걸 반려하면 멀쩡한 문제가 형식 하나로 버려진다
+      // (실측: 서울시립대학교 4시도 중 3시도가 이 사유로 날아갔다). 비우고 진행한다.
+      if (data.acceptable.length !== 0) data.acceptable = [];
       var ansNum = String(data.answer).trim();
       if (!/^[1-5]$/.test(ansNum)) { lastError = "객관식 정답 형식 오류: " + ansNum; continue; }
     } else {
-      if (data.choices.length !== 0) { lastError = "주관식 보기 배열이 비어있지 않음"; continue; }
+      // 주관식은 answer/acceptable 로 채점하므로 choices 는 쓰이지 않는다. 위와 같은 이유로 비운다.
+      if (data.choices.length !== 0) data.choices = [];
       if (!String(data.answer).trim()) { lastError = "주관식 정답 비어있음"; continue; }
       if (data.acceptable.length < 2 || data.acceptable.length > 10) {
         lastError = "주관식 허용답안 수 오류: " + data.acceptable.length;

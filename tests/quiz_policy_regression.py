@@ -182,15 +182,18 @@ def validate_candidate(
         normalized_choices = [normalize(choice) for choice in choices]
         if len(set(normalized_choices)) != 5:
             return "LOCAL_REJECT", "객관식 보기 중복/빈값", ""
+        # 객관식은 번호로 채점하므로 acceptable 은 쓰이지 않는다. 반려 대신 비운다
+        # (봇도 동일: 형식 하나로 멀쩡한 문제를 버리지 않는다).
         if candidate["acceptable"]:
-            return "LOCAL_REJECT", "객관식 허용답안 배열이 비어있지 않음", ""
+            candidate["acceptable"] = []
         if not re.fullmatch(r"[1-5]", candidate["answer"].strip()):
             return "LOCAL_REJECT", "객관식 정답 형식 오류", ""
         answer_text = choices[int(candidate["answer"]) - 1]
         leak_candidates = [answer_text]
     else:
+        # 주관식은 answer/acceptable 로 채점하므로 choices 는 쓰이지 않는다. 같은 이유로 비운다.
         if candidate["choices"]:
-            return "LOCAL_REJECT", "주관식 보기 배열이 비어있지 않음", ""
+            candidate["choices"] = []
         if not candidate["answer"].strip():
             return "LOCAL_REJECT", "주관식 정답 비어있음", ""
         acceptable = candidate["acceptable"]

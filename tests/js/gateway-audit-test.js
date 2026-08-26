@@ -133,5 +133,22 @@ console.log('\n[5] 출제 실패 기록 (2026-08-26)');
   check('도움말 2개 전부 숨김', [rows.length, rows.filter((l) => /admin: true/.test(l)).length], [2, 2]);
 }
 
+console.log('\n[6] 쓰이지 않는 필드는 반려가 아니라 정규화');
+{
+  // 실측: !상식 서울시립대학교 4시도 중 3시도가 이 형식 하나로 날아갔다.
+  // 문제 자체는 멀쩡했고, 채점에 쓰지도 않는 필드였다.
+  check('객관식 acceptable → 비움', /if \(data\.acceptable\.length !== 0\) data\.acceptable = \[\];/.test(QSRC), true);
+  check('  → 더는 반려하지 않음', /"객관식 허용답안 배열이 비어있지 않음"/.test(QSRC), false);
+  check('주관식 choices → 비움', /if \(data\.choices\.length !== 0\) data\.choices = \[\];/.test(QSRC), true);
+  check('  → 더는 반려하지 않음', /"주관식 보기 배열이 비어있지 않음"/.test(QSRC), false);
+  // 진짜 형식 오류는 그대로 반려해야 한다
+  check('정답 번호 형식은 여전히 반려', /"객관식 정답 형식 오류: "/.test(QSRC), true);
+  check('보기 수 오류도 여전히 반려', /"객관식 보기 수 오류"/.test(QSRC), true);
+  check('주관식 허용답안 수는 여전히 검사', /"주관식 허용답안 수 오류: "/.test(QSRC), true);
+  const py = fs.readFileSync('e:/msgbot/tests/quiz_policy_regression.py', 'utf8');
+  check('Python 미러도 같이 바뀜',
+        /candidate\["acceptable"\] = \[\]/.test(py) && /candidate\["choices"\] = \[\]/.test(py), true);
+}
+
 console.log('\n' + (fail === 0 ? '✅ ' : '❌ ') + pass + ' 통과, ' + fail + ' 실패');
 process.exit(fail === 0 ? 0 : 1);
