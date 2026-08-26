@@ -61,6 +61,11 @@ console.log('\n[1] 요청 형태');
   check('연결 타임아웃 짧게', g.log[0].ct <= 5000, true);
   check('읽기 타임아웃 20초', g.log[0].rt, 20000);
   check('결과', [r.answer, r.sources.length], ['호영과 라라는 아니마 [S1]', 1]);
+  const gLong = loadGw(OK);
+  const longR = gLong.mod.search('가'.repeat(400), 5);
+  check('300자 초과 질의는 중간 절단하지 않고 거부', longR.error, '질의가 너무 깁니다(최대 300자).');
+  check('초과 질의는 서버에 보내지 않음', gLong.log.length, 0);
+  check('서버 제한 공개', g.mod.MAX_QUERY, 300);
 }
 
 console.log('\n[2] 실패는 예외 대신 { error } — 호출 측이 fail-closed 여부를 결정한다');
@@ -82,8 +87,19 @@ console.log('\n[3] 상식퀴즈봇 배선');
   const genBody = QSRC.slice(genStart, genEnd);
   const fetchPos = genBody.indexOf('fetchGenerationEvidence(topic, referenceDate, wantMulti)');
   const loopPos = genBody.indexOf('for (var attempt = 0;');
+  const queryStart = QSRC.indexOf('function compactEvidenceQueryJson(');
+  const queryEnd = QSRC.indexOf('\nfunction fetchGenerationEvidence(', queryStart);
+  const queryCtx = { JSON, String, Math };
+  vm.createContext(queryCtx);
+  vm.runInContext(QSRC.slice(queryStart, queryEnd), queryCtx);
+  const qm = queryCtx.buildGenerationEvidenceQuery('텔레칩스', '2026-08-26', true);
+  const qs = queryCtx.buildGenerationEvidenceQuery('텔레칩스', '2026-08-26', false);
+  const qe = queryCtx.buildGenerationEvidenceQuery(('"\\').repeat(40) + '\u0000\n명령', '2026-08-26', true);
   check('게이트웨이 모듈 방어적 로드', /var GATEWAY = \(function\(\)[\s\S]{0,320}catch\(_\) \{ return null; \}/.test(QSRC), true);
+  check('생성 검색어 300자 이하', [qm.length <= 300, qs.length <= 300, qe.length <= 300], [true, true, true]);
+  check('객관식·주관식 소재 요구 유지', [qm.indexOf('동급 오답 4개') >= 0, qs.indexOf('이표기') >= 0], [true, true]);
   check('생성용 근거 조회 함수', /function fetchGenerationEvidence\(topic, referenceDate, wantMulti\)/.test(QSRC), true);
+  check('생성 검색은 300자 빌더 사용', /var q = buildGenerationEvidenceQuery\(topic, referenceDate, wantMulti\);/.test(genBody), true);
   check('  → GATEWAY 없으면 오류 상태', /if \(!GATEWAY\) return \{ error: "검색 게이트웨이 모듈 없음" \};/.test(QSRC), true);
   check('사용자 지정 토픽은 검색 실패 시 fail-closed', /_evidenceUnavailable: true/.test(genBody), true);
   check('검색은 생성 루프 전에 1회', [fetchPos >= 0 && fetchPos < loopPos, (genBody.match(/fetchGenerationEvidence\(/g) || []).length], [true, 1]);
@@ -94,6 +110,7 @@ console.log('\n[3] 상식퀴즈봇 배선');
   check('근거를 감사 대상에 실음', /auditTarget\.evidence = evidence\.answer;/.test(QSRC), true);
   check('출처도 함께', /auditTarget\.evidence_sources = srcList;/.test(QSRC), true);
   check('출처 ID도 보존', /srcList\.push\("\[" \+ evidence\.sources\[ei\]\.id \+ "\] "/.test(QSRC), true);
+  check('모듈 경계 sources 배열 호환', /typeof result\.sources\.length !== "number"/.test(QSRC), true);
   check('근거 미지원 핵심 주장은 하드 반려', /unsupported_by_evidence: \{ label: "검색 근거에 없는 핵심 주장", hard: true \}/.test(QSRC), true);
   check('  → 근거 미언급도 반려 지시', /evidence가 다루지 않은 핵심 주장은 확인된 것으로 추정하지 말고 unsupported_by_evidence=true/.test(QSRC), true);
   check('  → 기본 토픽 적용 불가 오탐 무시', /if \(!evidence\) v\.unsupported_by_evidence = false;/.test(QSRC), true);
@@ -105,6 +122,19 @@ console.log('\n[3] 상식퀴즈봇 배선');
 // ── 이의신청 근거 (2026-08-26 추가) ──────────────────────────────
 console.log('\n[4] 이의신청도 검색 근거를 쓴다');
 {
+  const queryStart = QSRC.indexOf('function compactEvidenceQueryJson(');
+  const queryEnd = QSRC.indexOf('\nfunction fetchGenerationEvidence(', queryStart);
+  const queryCtx = { JSON, String, Math };
+  vm.createContext(queryCtx);
+  vm.runInContext(QSRC.slice(queryStart, queryEnd), queryCtx);
+  const aqm = queryCtx.buildAuditEvidenceQuery(
+    '가'.repeat(100), '문제'.repeat(150), ['보기'.repeat(40), '다른 보기'.repeat(30)],
+    '정답'.repeat(80), '해설'.repeat(100), '2026-08-26');
+  const aqs = queryCtx.buildAuditEvidenceQuery(
+    ('"\\').repeat(40) + '\u0000', '문제'.repeat(150), [], '정답'.repeat(80),
+    '해설'.repeat(100), '2026-08-26');
+  check('이의신청 검색어도 300자 이하', [aqm.length, aqs.length], [300, 300]);
+  check('이의신청은 300자 빌더 사용', /var q = buildAuditEvidenceQuery\(/.test(QSRC), true);
   check('이의신청용 사후 조회 함수 유지', /function fetchAuditEvidence\(topic, question, choices, answerText, explanation\)/.test(QSRC), true);
   check('근거 조회 (토픽 조건 없음)', /var appealEvidence = fetchAuditEvidence\(/.test(QSRC), true);
   check('  → 문제·보기·정답·해설을 전달', /round\.topic \|\| "상식", round\.question, round\.choices, officialAnswer, round\.explanation/.test(QSRC), true);
