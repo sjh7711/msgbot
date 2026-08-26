@@ -62,6 +62,7 @@ AUDIT_FLAGS = (
     "precision_claim_error",
     "outdated_fact",
     "fabricated_fact",
+    "unsupported_by_evidence",
     "topic_unverified",
     "topic_as_answer",
     "wrong_choice",
@@ -130,7 +131,7 @@ def local_policy_error(
     ):
         return "검색 근거 없는 현재·최신 정보"
     precision_kinds = precision_claim_kinds(combined)
-    if precision_kinds:
+    if precision_kinds and not (custom_topic and evidence_available):
         prefix = "맞춤 토픽의 " if custom_topic else ""
         return f"{prefix}외부 근거 없는 카탈로그 정밀 주장({'/'.join(precision_kinds)})"
     return None
@@ -143,6 +144,7 @@ def validate_candidate(
     requested_topic: str,
     custom_topic: bool,
     reference_date: str = "2026-08-26",
+    evidence_available: bool = False,
 ) -> tuple[str, str, str]:
     """JS 생성 envelope/로컬 검증을 미러링한다.
 
@@ -222,7 +224,9 @@ def validate_candidate(
     if any(looks_like_placeholder(value) for value in placeholder_targets):
         return "LOCAL_REJECT", "자리표시자/메타 텍스트 누출", answer_text
 
-    policy_error = local_policy_error(candidate, reference_date, custom_topic)
+    policy_error = local_policy_error(
+        candidate, reference_date, custom_topic, evidence_available
+    )
     if policy_error:
         return "LOCAL_REJECT", f"로컬 정책 반려: {policy_error}", answer_text
 
@@ -237,7 +241,9 @@ def validate_candidate(
     return "ACCEPT_LOCAL", "", answer_text
 
 
-def evaluate_audit(audit: object, question: str) -> tuple[str, str]:
+def evaluate_audit(
+    audit: object, question: str, *, evidence_available: bool = False
+) -> tuple[str, str]:
     """JS auditQuiz의 fail-closed 스키마/플래그 집행을 미러링한다."""
     if not isinstance(audit, dict):
         return "AUDIT_UNAVAILABLE", "사실 감사 응답 형식 오류"
@@ -253,6 +259,10 @@ def evaluate_audit(audit: object, question: str) -> tuple[str, str]:
         if len(leak) < 2 or leak not in normalize(question):
             checked["answer_leak"] = False
 
+    # JS와 동일: evidence가 없는 기본 토픽에는 적용 불가인 플래그 오탐을 무시한다.
+    if not evidence_available:
+        checked["unsupported_by_evidence"] = False
+
     violations = [key for key in AUDIT_FLAGS if checked[key]]
     if violations:
         return "AUDIT_REJECT", ",".join(violations)
@@ -265,10 +275,15 @@ def improved_decision(case: dict) -> tuple[str, str]:
         want_multi=case.get("want_multi", True),
         requested_topic=case["topic"],
         custom_topic=case.get("custom_topic", False),
+        evidence_available=case.get("evidence_available", False),
     )
     if local != "ACCEPT_LOCAL":
         return local, reason
-    return evaluate_audit(case.get("audit"), case["candidate"]["question"])
+    return evaluate_audit(
+        case.get("audit"),
+        case["candidate"]["question"],
+        evidence_available=case.get("evidence_available", False),
+    )
 
 
 def legacy_decision(case: dict) -> str:
@@ -524,6 +539,15 @@ CASES = [
         "new": "AUDIT_REJECT",
     },
     {
+        "name": "기본 토픽 근거 플래그 오탐 무시",
+        "topic": "물리학",
+        "candidate": NORMAL,
+        "audit": clean_audit(unsupported_by_evidence=True, reason="적용 불가 플래그 오탐"),
+        "legacy_audit": {},
+        "old": "ACCEPT",
+        "new": "ACCEPT",
+    },
+    {
         "name": "감사 호출 실패",
         "topic": "물리학",
         "candidate": NORMAL,
@@ -662,9 +686,12 @@ def assert_javascript_contract() -> None:
         'precisionClaimKinds(combined)',
         'IMPLICIT_CURRENT_FACT_RE.test(combined)',
         'CATALOG_COUNT_RE.test(s)',
-        'if (precisionKinds.length)',
-        'localQuizPolicyError(data, referenceDate, !!customTopic, !!evidence)',
+        'if (precisionKinds.length && !(isCustomTopic && hasEvidence))',
+        'fetchGenerationEvidence(topic, referenceDate, wantMulti)',
+        'generationEvidenceError(data, topicEvidence, answerText)',
+        'localQuizPolicyError(data, referenceDate, !!customTopic, !!topicEvidence)',
         'precision_claim_error: { label: "서수·순서·관계 주장 오류", hard: true  }',
+        'unsupported_by_evidence: { label: "검색 근거에 없는 핵심 주장", hard: true }',
         'insufficient_clue: { label: "단서 부족",          hard: true  }',
         'topic_unverified:  { label: "사용자 토픽 검증 불가",  hard: true  }',
         'callGemini(prompt, room, QUIZ_GENERATION_OPTIONS)',
