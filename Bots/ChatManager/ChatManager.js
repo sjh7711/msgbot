@@ -705,6 +705,10 @@ var WATCH_PATH = Packages.android.os.Environment.getExternalStorageDirectory()
 var WATCH_LOG_PATH = Packages.android.os.Environment.getExternalStorageDirectory()
     .getAbsolutePath() + "/msgbot/botwatch.log";
 var WATCH_TICK_MS   = 30 * 1000;        // 확인 주기 (폴러 안에서 스로틀)
+// 꺼진 걸 봤다고 바로 손대지 않는다. 재컴파일(!깃풀 / !compile) 중에는 몇 초 동안
+// getPower() 가 false 로 읽히는데, 그걸 고장으로 세면 배포할 때마다 복구 카운터가
+// 올라 멀쩡한 봇이 "복구 포기" 로 밀려난다. 이만큼 계속 꺼져 있어야 진짜로 본다.
+var WATCH_CONFIRM_MS = 90 * 1000;
 var WATCH_STABLE_MS = 10 * 60 * 1000;   // 이만큼 켜져 있으면 "안정" → 백오프 리셋
 var WATCH_BACKOFF_MS = [60000, 300000, 1800000];   // 1분 → 5분 → 30분, 그 다음은 포기
 var WATCH_NOTIFY_ROOM = "신쫑";         // lib/admin.js 의 ADMIN_ROOMS 와 같은 방
@@ -757,7 +761,7 @@ function _setWatchWant(name, want) {
     _watchWant[nm] = { want: !!want, at: _watchStamp() };
     _saveWatchWant();
   } catch(_) {}
-  _watchState[nm] = { tries: 0, nextAt: 0, okSince: 0, gaveUp: false };
+  _watchState[nm] = { tries: 0, nextAt: 0, okSince: 0, offSince: 0, gaveUp: false };
 }
 
 function _watchLog(line) {
@@ -786,8 +790,11 @@ function _watchFlushNotices() {
   }
 }
 
+// 알림에 발생 시각을 박아 둔다. 큐에 쌓였다가 나중에 한꺼번에 나가면 카톡 시각은
+// 전부 "지금" 으로 찍혀서, 새벽에 40분에 걸쳐 일어난 일이 방금 연달아 터진 것처럼
+// 보인다. 실제로 그렇게 읽혀 원인 추적이 한참 헤맸다.
 function _watchNotify(text) {
-  _watchPending.push(String(text));
+  _watchPending.push("[" + _watchStamp() + "] " + String(text));
   while (_watchPending.length > WATCH_PENDING_MAX) _watchPending.shift();
   _watchFlushNotices();
 }
@@ -818,19 +825,20 @@ function _watchTick() {
   for (var i = 0; i < names.length; i++) {
     var nm = names[i];
     if (!_watchWantOf(nm)) continue;                    // 일부러 꺼둔 봇
-    if (!_watchState[nm]) _watchState[nm] = { tries: 0, nextAt: 0, okSince: 0, gaveUp: false };
+    if (!_watchState[nm]) _watchState[nm] = { tries: 0, nextAt: 0, okSince: 0, offSince: 0, gaveUp: false };
     var st = _watchState[nm];
 
     var on = null;
     try { on = BotManager.getPower(nm); } catch(_) { continue; }   // 조회 실패는 판단 보류
 
     if (on) {
+      st.offSince = 0;                    // 켜져 있으면 "꺼진 채 지속" 계측 초기화
       // 켜져 있음. 복구 이력이 있으면 충분히 버텼는지 보고 백오프를 푼다.
       if (st.tries > 0) {
         if (!st.okSince) st.okSince = now;
         else if (now - st.okSince >= WATCH_STABLE_MS) {
           _watchLog(nm + " 안정 — 복구 카운터 리셋 (" + st.tries + "회 후)");
-          _watchState[nm] = { tries: 0, nextAt: 0, okSince: 0, gaveUp: false };
+          _watchState[nm] = { tries: 0, nextAt: 0, okSince: 0, offSince: 0, gaveUp: false };
         }
       }
       continue;
@@ -839,6 +847,10 @@ function _watchTick() {
     st.okSince = 0;
     if (st.gaveUp) continue;              // 포기한 봇은 수동 개입(!onoff) 전까지 그대로 둔다
     if (now < st.nextAt) continue;        // 백오프 대기 중
+
+    // 꺼진 걸 처음 본 시점을 기록하고, 충분히 지속됐을 때만 손댄다.
+    if (!st.offSince) { st.offSince = now; continue; }
+    if (now - st.offSince < WATCH_CONFIRM_MS) continue;
 
     // 판정은 "시도하기 전"에 한다. 시도한 뒤에 포기를 정하면, 마지막 시도가 성공했는데도
     // "복구를 멈춥니다" 를 보내게 된다.
