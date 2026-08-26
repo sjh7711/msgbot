@@ -1671,7 +1671,7 @@ function precisionClaimKinds(text) {
   return out;
 }
 
-function localQuizPolicyError(data, referenceDate, isCustomTopic) {
+function localQuizPolicyError(data, referenceDate, isCustomTopic, hasEvidence) {
   var question = String((data && data.question) || "");
   var explanation = String((data && data.explanation) || "");
   var combined = question + " " + explanation;
@@ -1692,7 +1692,12 @@ function localQuizPolicyError(data, referenceDate, isCustomTopic) {
   // 실행 연도와 같은 숫자를 붙여도 모델의 지식이 그 날짜까지 최신이라는 보장은 없다.
   // 과거 연도나 '당시'라는 단어가 문장 어딘가에 있어도 별개의 현재 주장을 검증해 주지는 않는다.
   // 검색 grounding 이 없는 모드에서는 명시적/암시적 현재 정보를 모두 보수적으로 차단한다.
-  if (VOLATILE_FACT_RE.test(combined) || IMPLICIT_CURRENT_FACT_RE.test(combined)) {
+  // 지정 토픽에서 검색 근거를 확보했으면 여기서 미리 막지 않고 감사에 맡긴다.
+  // 근거로 검증할 수 있는데 사전 차단하면 정상 문항이 통째로 날아간다 — 실측:
+  // "서울시립대학교" 4시도가 모두 이 사유로 반려됐는데, 문항은 전신 기관·상징동물
+  // 같은 역사·안정 사실이었고 "현재"는 대상을 가리키는 지시어였다.
+  if (!(isCustomTopic && hasEvidence) &&
+      (VOLATILE_FACT_RE.test(combined) || IMPLICIT_CURRENT_FACT_RE.test(combined))) {
     return "검색 근거 없는 현재·최신 정보";
   }
 
@@ -2153,7 +2158,12 @@ function generateQuiz(customTopic, room) {
     }
     if (phBad) { lastError = "자리표시자/메타 텍스트 누출: " + phBad; continue; }
 
-    var localPolicyError = localQuizPolicyError(data, referenceDate, !!customTopic);
+    // 검색 근거는 로컬 정책보다 먼저 확보한다. 정책이 "근거가 있으면 통과"를
+    // 판단해야 하고, 여기서 받은 것을 감사에도 그대로 넘겨 두 번 조회하지 않는다.
+    var evidence = customTopic
+      ? fetchAuditEvidence(topic, data.question, data.choices, answerText) : null;
+
+    var localPolicyError = localQuizPolicyError(data, referenceDate, !!customTopic, !!evidence);
     if (localPolicyError) { lastError = "로컬 정책 반려: " + localPolicyError; continue; }
 
     // 이번 생성 호출 안에서는 반려된 답도 다시 나오지 않게 회피 목록에 추가한다.
@@ -2188,7 +2198,7 @@ function generateQuiz(customTopic, room) {
     // 2차: 생성과 분리된 감사(audit). 코드로 못 잡는 의미적 위반(정답 노출/정의 복붙, 문제·해설 사실모순,
     // 분야 혼합, 진부함, 단서 부족 등)을 별도 LLM 호출로 체크리스트 판정. ok=false 만 reject(→ 사유가 다음 시도 피드백으로 전달).
     // 감사 호출/파싱 실패도 미검증 문제를 내보내지 않도록 반려한다(fail-closed).
-    var audit = auditQuiz(data, topic, wantMulti, answerText, room, referenceDate, !!customTopic);
+    var audit = auditQuiz(data, topic, wantMulti, answerText, room, referenceDate, !!customTopic, evidence);
     if (audit.unavailable) {
       lastError = audit.reason || "사실 감사 시스템 사용 불가";
       attemptErrors.push(lastError);
@@ -2248,7 +2258,7 @@ function fetchAuditEvidence(topic, question, choices, answerText) {
   } catch (_) { return null; }
 }
 
-function auditQuiz(data, topic, wantMulti, answerText, room, referenceDate, isCustomTopic) {
+function auditQuiz(data, topic, wantMulti, answerText, room, referenceDate, isCustomTopic, preEvidence) {
   // 후보 전체를 JSON 데이터로 감싸 프롬프트 안의 문장을 지시문으로 오인하지 않게 한다.
   var auditTarget = {
     reference_date: referenceDate || kstDateString(),
@@ -2265,8 +2275,9 @@ function auditQuiz(data, topic, wantMulti, answerText, room, referenceDate, isCu
 
   // 사용자 지정 토픽만 외부 근거를 붙인다. 매 문제 검색하면 게이트웨이(동시 1건)가
   // 병목이 되고, 일반 출제는 지금 속도를 유지하는 편이 낫다. (실측 +약 5초)
-  var evidence = isCustomTopic
-    ? fetchAuditEvidence(topic, data.question, data.choices, answerText) : null;
+  // 근거는 generateQuiz 가 로컬 정책 판단에 쓰려고 이미 조회해 넘겨준다.
+  // 여기서 다시 부르면 같은 질의를 두 번 던지고 5초를 더 쓴다.
+  var evidence = preEvidence || null;
   if (evidence) {
     auditTarget.evidence = evidence.answer;
     var srcList = [];

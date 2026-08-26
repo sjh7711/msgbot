@@ -81,7 +81,7 @@ console.log('\n[3] 상식퀴즈봇 배선');
   check('근거 조회 함수', /function fetchAuditEvidence\(topic, question, choices, answerText\)/.test(QSRC), true);
   check('  → GATEWAY 없으면 즉시 null', /if \(!GATEWAY\) return null;/.test(QSRC), true);
   check('  → 어떤 실패도 null (출제 계속)', /catch \(_\) \{ return null; \}/.test(QSRC), true);
-  check('사용자 지정 토픽에서만', /var evidence = isCustomTopic\s*[\r\n]+\s*\? fetchAuditEvidence/.test(QSRC), true);
+  check('사용자 지정 토픽에서만 (조회 위치: generateQuiz)', /var evidence = customTopic\s*[\r\n]+\s*\? fetchAuditEvidence/.test(QSRC), true);
   check('근거를 감사 대상에 실음', /auditTarget\.evidence = evidence\.answer;/.test(QSRC), true);
   check('출처도 함께', /auditTarget\.evidence_sources = srcList;/.test(QSRC), true);
   check('근거 우선 지시', /기억과 evidence 가 다르면 evidence 를 우선/.test(QSRC), true);
@@ -148,6 +148,28 @@ console.log('\n[6] 쓰이지 않는 필드는 반려가 아니라 정규화');
   const py = fs.readFileSync('e:/msgbot/tests/quiz_policy_regression.py', 'utf8');
   check('Python 미러도 같이 바뀜',
         /candidate\["acceptable"\] = \[\]/.test(py) && /candidate\["choices"\] = \[\]/.test(py), true);
+}
+
+console.log('\n[7] 근거가 있으면 현재·최신 사전 차단을 푼다');
+{
+  // 실측: "!상식 서울시립대학교" 4시도가 모두 이 사유로 반려됐다. 문항은 전신 기관·
+  // 상징동물 같은 역사·안정 사실이었고 "현재"는 대상을 가리키는 지시어였다.
+  check('정책이 근거 여부를 받는다',
+        /function localQuizPolicyError\(data, referenceDate, isCustomTopic, hasEvidence\)/.test(QSRC), true);
+  check('  → 지정 토픽 + 근거일 때만 통과',
+        /if \(!\(isCustomTopic && hasEvidence\) &&/.test(QSRC), true);
+  check('근거를 로컬 정책보다 먼저 조회',
+        QSRC.indexOf('var evidence = customTopic') < QSRC.indexOf('var localPolicyError = localQuizPolicyError'), true);
+  check('  → 정책에 넘긴다',
+        /localQuizPolicyError\(data, referenceDate, !!customTopic, !!evidence\)/.test(QSRC), true);
+  check('감사에도 같은 근거를 넘긴다 (재조회 없음)',
+        /auditQuiz\(data, topic, wantMulti, answerText, room, referenceDate, !!customTopic, evidence\)/.test(QSRC), true);
+  check('  → 감사는 넘겨받은 것만 씀', /var evidence = preEvidence \|\| null;/.test(QSRC), true);
+  check('  → 감사 안에서 다시 조회하지 않음', /var evidence = isCustomTopic\s*\n\s*\? fetchAuditEvidence/.test(QSRC), false);
+  const py = fs.readFileSync('e:/msgbot/tests/quiz_policy_regression.py', 'utf8');
+  check('Python 미러도 같은 게이트', /evidence_available: bool = False/.test(py), true);
+  check('  → 게이트 회귀 단언 존재', /def assert_evidence_gate\(\)/.test(py), true);
+  check('  → main 에서 실행', /assert_evidence_gate\(\)\s*\n\s*assert_javascript_contract\(\)/.test(py), true);
 }
 
 console.log('\n' + (fail === 0 ? '✅ ' : '❌ ') + pass + ' 통과, ' + fail + ' 실패');

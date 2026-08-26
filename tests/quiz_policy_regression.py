@@ -110,7 +110,12 @@ def precision_claim_kinds(text: object) -> list[str]:
     return result
 
 
-def local_policy_error(candidate: dict, reference_date: str, custom_topic: bool = False) -> str | None:
+def local_policy_error(
+    candidate: dict,
+    reference_date: str,
+    custom_topic: bool = False,
+    evidence_available: bool = False,
+) -> str | None:
     question = str(candidate.get("question", ""))
     explanation = str(candidate.get("explanation", ""))
     combined = f"{question} {explanation}"
@@ -119,7 +124,10 @@ def local_policy_error(candidate: dict, reference_date: str, custom_topic: bool 
         return f"구체적 검증 단서 부족(모호 표현 {vague_count}개)"
     if EXPLICIT_FABRICATION_RE.search(combined) and vague_count >= 2 and not FICTION_SOURCE_RE.search(question):
         return "출처 없는 가상 대상을 사실처럼 서술함"
-    if VOLATILE_FACT_RE.search(combined) or IMPLICIT_CURRENT_FACT_RE.search(combined):
+    # 지정 토픽에서 검색 근거를 확보했으면 사전 차단하지 않고 감사에 맡긴다(봇과 동일).
+    if not (custom_topic and evidence_available) and (
+        VOLATILE_FACT_RE.search(combined) or IMPLICIT_CURRENT_FACT_RE.search(combined)
+    ):
         return "검색 근거 없는 현재·최신 정보"
     precision_kinds = precision_claim_kinds(combined)
     if precision_kinds:
@@ -608,6 +616,41 @@ SAFE_CLAIM_CASES = [
 ]
 
 
+def assert_evidence_gate() -> None:
+    """지정 토픽 + 검색 근거가 있으면 현재·최신 사전 차단을 풀어야 한다.
+
+    실측 사례: "!상식 서울시립대학교" 4시도가 모두 이 사유로 반려됐다. 문항은
+    전신 기관·상징동물 같은 역사·안정 사실이었고, '현재'는 대상을 가리키는
+    지시어였다. 근거로 검증할 수 있는데 사전 차단하면 토픽 자체를 못 쓴다.
+    """
+    candidate = {
+        "topic": "서울시립대학교",
+        "question": (
+            "다음 중 1918년에 설립되어 현재의 서울시립대학교의 전신 중 하나로 "
+            "기능했던, 일제강점기 당시의 교육기관 명칭은 무엇인가?"
+        ),
+        "choices": ["경성제국대학", "경성공립농림학교", "휘문고등보통학교", "중앙고등보통학교", "배재학당"],
+        "answer": "2",
+        "acceptable": [],
+        "explanation": "경성공립농림학교가 전신이다.",
+    }
+    ref = "2026-08-26"
+    cases = [
+        (True, False, "검색 근거 없는 현재·최신 정보"),   # 근거 없으면 그대로 차단
+        (True, True, None),                              # 근거 있으면 감사에 맡김
+        (False, True, "검색 근거 없는 현재·최신 정보"),   # 랜덤 토픽은 근거를 안 받으므로 차단 유지
+    ]
+    for custom, evidence, expected in cases:
+        got = local_policy_error(
+            dict(candidate), ref, custom_topic=custom, evidence_available=evidence
+        )
+        if got != expected:
+            raise AssertionError(
+                "근거 게이트 불일치 (custom=%s, evidence=%s): 기대 %r, 실제 %r"
+                % (custom, evidence, expected, got)
+            )
+
+
 def assert_javascript_contract() -> None:
     """Python 미러가 의존하는 핵심 정책이 실제 봇 파일에도 연결돼 있는지 확인한다."""
     js_path = Path(__file__).resolve().parents[1] / "Bots" / "상식퀴즈봇" / "상식퀴즈봇.js"
@@ -620,7 +663,7 @@ def assert_javascript_contract() -> None:
         'IMPLICIT_CURRENT_FACT_RE.test(combined)',
         'CATALOG_COUNT_RE.test(s)',
         'if (precisionKinds.length)',
-        'localQuizPolicyError(data, referenceDate, !!customTopic)',
+        'localQuizPolicyError(data, referenceDate, !!customTopic, !!evidence)',
         'precision_claim_error: { label: "서수·순서·관계 주장 오류", hard: true  }',
         'insufficient_clue: { label: "단서 부족",          hard: true  }',
         'topic_unverified:  { label: "사용자 토픽 검증 불가",  hard: true  }',
@@ -634,6 +677,7 @@ def assert_javascript_contract() -> None:
 
 def main() -> int:
     failures: list[str] = []
+    assert_evidence_gate()
     assert_javascript_contract()
     print("JavaScript/Python 핵심 정책 계약: PASS")
     print("CASE | BEFORE | AFTER | RESULT")
