@@ -43,3 +43,7 @@ Thumbs.db
 
 # ===== Windows-reserved name (real file on the tablet/Linux side; blocks git on Windows) =====
 /NUL
+
+# Python 캐시 (테스트 실행 산출물)
+__pycache__/
+*.pyc
