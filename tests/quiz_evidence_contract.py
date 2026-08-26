@@ -1,8 +1,7 @@
-"""퀴즈 근거 전용 API와 상식퀴즈봇 사이의 구조화 계약 회귀 테스트.
+"""퀴즈 근거 전용 API v2와 상식퀴즈봇 사이의 구조화 계약 회귀 테스트.
 
-실제 검색/Gemini를 호출하지 않는다. 서버가 유효한 구조화 응답을 반환했을 때
-일반명사·과학·의학·대중문화 토픽이 클라이언트 단계에서 임의 차단되지 않는지,
-반대로 출처/URL/정답 계약 위반은 fail-closed 되는지를 Python으로 미러링한다.
+실제 검색/Gemini를 호출하지 않는다. v2의 핵심인 토픽 의미 고정과
+material별 정답·오답 묶음을 Python으로 미러링한다.
 """
 
 from __future__ import annotations
@@ -17,16 +16,30 @@ MATERIAL_ID_RE = re.compile(r"^M[1-9][0-9]*$")
 GENERATED_MARKUP_RE = re.compile(
     r"https?://|www\.|\[[^\]]+\]\s*\(|</?[A-Za-z][^>]*>", re.I
 )
+ANSWER_TYPES = {
+    "person", "organization", "place", "work", "product", "method", "term",
+    "event", "year", "date", "count", "measurement",
+}
+SCALAR_TYPES = {"year", "date", "count", "measurement"}
 
 
 def normalize_key(value: object) -> str:
     return re.sub(r"\s+", "", str(value).strip().lower())
 
 
+def _source_ids(raw: object, known: set[str]) -> list[str]:
+    if not isinstance(raw, list) or not raw or any(str(item) not in known for item in raw):
+        raise ValueError("MODEL_OUTPUT_FORMAT")
+    return list(dict.fromkeys(map(str, raw)))
+
+
 def validate_structured_response(
-    payload: dict[str, object], *, required_distractor_count: int = 4
+    payload: dict[str, object], *, requested_topic: str, required_distractor_count: int = 4
 ) -> dict[str, object]:
-    """lib/quiz-evidence.js validateSuccess의 핵심 계약을 미러링한다."""
+    """lib/quiz-evidence.js validateSuccess의 v2 핵심 계약을 미러링한다."""
+
+    if payload.get("schema_version") != 2:
+        raise ValueError("MODEL_OUTPUT_FORMAT")
 
     raw_sources = payload.get("sources")
     if not isinstance(raw_sources, list) or not raw_sources:
@@ -48,84 +61,146 @@ def validate_structured_response(
         source_ids.add(source_id)
         sources.append({"id": source_id, "title": title, "url": url})
 
+    resolved = payload.get("resolved_topic")
+    if not isinstance(resolved, dict) or not isinstance(resolved.get("aliases"), list):
+        raise ValueError("MODEL_OUTPUT_FORMAT")
+    resolved_name = str(resolved.get("name", "")).strip()
+    resolved_sense = str(resolved.get("sense", "")).strip()
+    resolved_names = {normalize_key(resolved_name), *map(normalize_key, resolved["aliases"])}
+    if (
+        not resolved_name
+        or not resolved_sense
+        or GENERATED_MARKUP_RE.search(f"{resolved_name} {resolved_sense}")
+        or normalize_key(requested_topic) not in resolved_names
+    ):
+        raise ValueError("MODEL_OUTPUT_FORMAT")
+
     raw_materials = payload.get("materials")
     if not isinstance(raw_materials, list) or not raw_materials:
         raise ValueError("TOPIC_NOT_FOUND")
     materials: list[dict[str, object]] = []
-    verified: dict[str, str] = {}
+    material_answers: set[str] = set()
+    material_ids: set[str] = set()
     for raw in raw_materials[:5]:
         assert isinstance(raw, dict)
         material_id = str(raw.get("id", "")).strip()
         facet = str(raw.get("facet", "")).strip()
         answer = str(raw.get("answer", "")).strip()
+        answer_type = str(raw.get("answer_type", "")).strip()
+        choice_mode = str(raw.get("choice_mode", "")).strip()
         fact = str(raw.get("fact", "")).strip()
-        ids = raw.get("source_ids")
+        ids = _source_ids(raw.get("source_ids"), source_ids)
+        raw_distractors = raw.get("distractors")
         if (
             not MATERIAL_ID_RE.fullmatch(material_id)
+            or material_id in material_ids
             or not facet
             or not answer
+            or answer_type not in ANSWER_TYPES
+            or choice_mode not in {"grounded_entities", "scalar"}
+            or (choice_mode == "scalar" and answer_type not in SCALAR_TYPES)
             or not fact
             or answer not in fact
             or GENERATED_MARKUP_RE.search(f"{facet} {answer} {fact}")
-            or not isinstance(ids, list)
-            or not ids
-            or any(str(source_id) not in source_ids for source_id in ids)
-            or normalize_key(answer) in verified
+            or normalize_key(answer) in material_answers
+            or not isinstance(raw_distractors, list)
         ):
             raise ValueError("MODEL_OUTPUT_FORMAT")
-        quote = fact + " " + "".join(f"[{source_id}]" for source_id in ids)
-        verified[normalize_key(answer)] = quote
-        materials.append(
-            {"id": material_id, "facet": facet, "answer": answer, "quote": quote}
-        )
+        if required_distractor_count and len(raw_distractors) != required_distractor_count:
+            raise ValueError("INSUFFICIENT_DISTRACTORS")
 
-    distractors: list[dict[str, str]] = []
-    for raw in payload.get("distractors", []):
-        assert isinstance(raw, dict)
-        name = str(raw.get("name", "")).strip()
-        ids = raw.get("source_ids")
-        if (
-            not name
-            or GENERATED_MARKUP_RE.search(name)
-            or not isinstance(ids, list)
-            or not ids
-            or any(str(source_id) not in source_ids for source_id in ids)
-            or normalize_key(name) in verified
-        ):
-            raise ValueError("MODEL_OUTPUT_FORMAT")
-        quote = name + "은(는) 검색 문서에서 확인된 실제 객관식 후보 명칭이다 " + "".join(
-            f"[{source_id}]" for source_id in ids
+        distractors: list[dict[str, object]] = []
+        local_names = {normalize_key(answer)}
+        for raw_distractor in raw_distractors:
+            assert isinstance(raw_distractor, dict)
+            name = str(raw_distractor.get("name", "")).strip()
+            name_key = normalize_key(name)
+            if not name or name_key in local_names or GENERATED_MARKUP_RE.search(name):
+                raise ValueError("MODEL_OUTPUT_FORMAT")
+            if choice_mode == "scalar":
+                if raw_distractor.get("synthetic") is not True:
+                    raise ValueError("MODEL_OUTPUT_FORMAT")
+                distractors.append({"name": name, "synthetic": True})
+            else:
+                distractor_fact = str(raw_distractor.get("fact", "")).strip()
+                why_wrong = str(raw_distractor.get("why_wrong", "")).strip()
+                distractor_ids = _source_ids(raw_distractor.get("source_ids"), source_ids)
+                if (
+                    not distractor_fact
+                    or name not in distractor_fact
+                    or not why_wrong
+                    or GENERATED_MARKUP_RE.search(f"{distractor_fact} {why_wrong}")
+                ):
+                    raise ValueError("MODEL_OUTPUT_FORMAT")
+                quote = distractor_fact + " " + why_wrong + " " + "".join(
+                    f"[{source_id}]" for source_id in distractor_ids
+                )
+                distractors.append({"name": name, "quote": quote, "synthetic": False})
+            local_names.add(name_key)
+
+        quote = fact + " " + "".join(f"[{source_id}]" for source_id in ids)
+        materials.append(
+            {
+                "id": material_id,
+                "facet": facet,
+                "answer": answer,
+                "answer_type": answer_type,
+                "choice_mode": choice_mode,
+                "quote": quote,
+                "distractors": distractors,
+                "verified": {normalize_key(answer), *local_names},
+            }
         )
-        verified[normalize_key(name)] = quote
-        distractors.append({"name": name, "quote": quote})
-    if len(distractors) < required_distractor_count:
-        raise ValueError("MODEL_OUTPUT_FORMAT")
+        material_ids.add(material_id)
+        material_answers.add(normalize_key(answer))
 
     return {
+        "schema_version": 2,
+        "resolved_topic": resolved,
         "materials": materials,
-        "distractors": distractors,
         "sources": sources,
-        "verified": verified,
     }
 
 
 def fixture(
-    topic: str, answer: str, fact: str, distractor_names: list[str] | None = None
+    topic: str,
+    answer: str,
+    fact: str,
+    distractor_names: list[str] | None = None,
+    *,
+    answer_type: str = "term",
+    choice_mode: str = "grounded_entities",
 ) -> dict[str, object]:
     assert topic and answer in fact
     names = distractor_names or ["알파", "베타", "감마", "델타"]
     assert len(names) == 4 and answer not in names
+    if choice_mode == "scalar":
+        distractors = [{"name": name, "synthetic": True} for name in names]
+    else:
+        distractors = [
+            {
+                "name": name,
+                "fact": f"{name}은 검증된 실제 후보다.",
+                "why_wrong": f"{name}은 이 문제의 정답인 {answer}이 아니다.",
+                "source_ids": ["S1"],
+            }
+            for name in names
+        ]
     return {
+        "schema_version": 2,
+        "resolved_topic": {"name": topic, "sense": f"{topic} 퀴즈 대상", "aliases": [topic]},
         "materials": [
             {
                 "id": "M1",
                 "facet": "검증 소재",
                 "answer": answer,
+                "answer_type": answer_type,
+                "choice_mode": choice_mode,
                 "fact": fact,
                 "source_ids": ["S1"],
+                "distractors": distractors,
             }
         ],
-        "distractors": [{"name": name, "source_ids": ["S1"]} for name in names],
         "sources": [
             {"id": "S1", "title": f"{topic} 검증 문서", "url": "https://example.test/source"}
         ],
@@ -151,14 +226,17 @@ class QuizEvidenceContractTests(unittest.TestCase):
         }
         for topic, (answer, fact, distractors) in cases.items():
             with self.subTest(topic=topic):
-                result = validate_structured_response(fixture(topic, answer, fact, distractors))
-                self.assertEqual(result["materials"][0]["answer"], answer)
-                self.assertEqual(len(result["distractors"]), 4)
-                self.assertIn(normalize_key(answer), result["verified"])
+                result = validate_structured_response(
+                    fixture(topic, answer, fact, distractors), requested_topic=topic
+                )
+                material = result["materials"][0]
+                self.assertEqual(material["answer"], answer)
+                self.assertEqual([item["name"] for item in material["distractors"]], distractors)
 
     def test_source_url_is_allowed_but_not_projected_to_model(self) -> None:
         result = validate_structured_response(
-            fixture("루빅스큐브", "CFOP", "루빅스큐브의 해법에는 CFOP가 있다.")
+            fixture("루빅스큐브", "CFOP", "루빅스큐브의 해법에는 CFOP가 있다."),
+            requested_topic="루빅스큐브",
         )
         prompt_sources = [
             {"id": source["id"], "title": source["title"]} for source in result["sources"]
@@ -166,26 +244,62 @@ class QuizEvidenceContractTests(unittest.TestCase):
         self.assertIn("url", result["sources"][0])
         self.assertNotIn("url", prompt_sources[0])
 
-    def test_generated_url_unknown_source_and_missing_answer_are_rejected(self) -> None:
+    def test_v1_and_contract_violations_are_rejected(self) -> None:
         base = fixture("수박", "시트룰린", "수박에는 시트룰린이 들어 있다.")
+        v1 = {key: value for key, value in base.items() if key != "schema_version"}
+        with self.assertRaisesRegex(ValueError, "MODEL_OUTPUT_FORMAT"):
+            validate_structured_response(v1, requested_topic="수박")
+
         bad_url = {**base, "materials": [dict(base["materials"][0])]}
         bad_url["materials"][0]["fact"] += " https://fake.example/"
         with self.assertRaisesRegex(ValueError, "MODEL_OUTPUT_FORMAT"):
-            validate_structured_response(bad_url)
+            validate_structured_response(bad_url, requested_topic="수박")
 
         bad_source = {**base, "materials": [dict(base["materials"][0])]}
         bad_source["materials"][0]["source_ids"] = ["S9"]
         with self.assertRaisesRegex(ValueError, "MODEL_OUTPUT_FORMAT"):
-            validate_structured_response(bad_source)
+            validate_structured_response(bad_source, requested_topic="수박")
 
-        missing_answer = {**base, "materials": [dict(base["materials"][0])]}
-        missing_answer["materials"][0]["fact"] = "수박은 박과의 식물이다."
-        with self.assertRaisesRegex(ValueError, "MODEL_OUTPUT_FORMAT"):
-            validate_structured_response(missing_answer)
+        too_few = {**base, "materials": [dict(base["materials"][0])]}
+        too_few["materials"][0]["distractors"] = list(base["materials"][0]["distractors"][:3])
+        with self.assertRaisesRegex(ValueError, "INSUFFICIENT_DISTRACTORS"):
+            validate_structured_response(too_few, requested_topic="수박")
 
-        too_few_distractors = {**base, "distractors": list(base["distractors"][:3])}
+    def test_material_distractors_are_isolated(self) -> None:
+        payload = fixture(
+            "루빅스큐브", "CFOP", "루빅스큐브의 해법에는 CFOP가 있다.",
+            ["Roux", "ZZ", "Petrus", "Corners-first"], answer_type="method",
+        )
+        second = fixture(
+            "루빅스큐브", "1974년", "루빅스큐브는 1974년에 발명되었다.",
+            ["1971년", "1972년", "1973년", "1975년"],
+            answer_type="year", choice_mode="scalar",
+        )["materials"][0]
+        second["id"] = "M2"
+        payload["materials"].append(second)
+        # v1의 전역 필드가 있어도 어느 material의 보기 집합에도 합쳐지지 않는다.
+        payload["distractors"] = [{"name": "1985년"}]
+        result = validate_structured_response(payload, requested_topic="루빅스큐브")
+        self.assertEqual(
+            [item["name"] for item in result["materials"][0]["distractors"]],
+            ["Roux", "ZZ", "Petrus", "Corners-first"],
+        )
+        self.assertEqual(
+            [item["name"] for item in result["materials"][1]["distractors"]],
+            ["1971년", "1972년", "1973년", "1975년"],
+        )
+
+    def test_scalar_distractors_must_be_synthetic(self) -> None:
+        payload = fixture(
+            "루빅스큐브", "1974년", "루빅스큐브는 1974년에 발명되었다.",
+            ["1971년", "1972년", "1973년", "1975년"],
+            answer_type="year", choice_mode="scalar",
+        )
+        result = validate_structured_response(payload, requested_topic="루빅스큐브")
+        self.assertTrue(all(item["synthetic"] for item in result["materials"][0]["distractors"]))
+        payload["materials"][0]["distractors"][0]["synthetic"] = False
         with self.assertRaisesRegex(ValueError, "MODEL_OUTPUT_FORMAT"):
-            validate_structured_response(too_few_distractors)
+            validate_structured_response(payload, requested_topic="루빅스큐브")
 
     def test_javascript_messages_do_not_promise_retry(self) -> None:
         source = (

@@ -2315,11 +2315,15 @@ class JavaScriptGroundingContractTests(unittest.TestCase):
         quiz_evidence_source = quiz_evidence_path.read_text(encoding="utf-8")
         for snippet in (
             'var BASE_URL = "http://192.168.0.55:18083/v1/quiz-evidence";',
+            "var SCHEMA_VERSION = 2;",
+            "schema_version: SCHEMA_VERSION",
             'profile: "quiz_evidence"',
             "reference_date: referenceDate",
+            "stable_only: true",
             "exclude_answers: cleanExcludeAnswers",
             "requestPayload.distractor_count = requiredDistractorCount",
-            "distractors.length < requiredDistractorCount",
+            "material.distractors.length !== requiredDistractorCount",
+            'choiceMode !== "grounded_entities" && choiceMode !== "scalar"',
             "payload.code",
             '"MODEL_OUTPUT_FORMAT"',
             '"TOPIC_NOT_FOUND"',
@@ -2331,7 +2335,7 @@ class JavaScriptGroundingContractTests(unittest.TestCase):
             "전용 API query가 순수 토픽이 아님",
         )
         self.assertIn(
-            "sources: promptEvidenceSources(topicEvidence)",
+            "sources: promptEvidenceSources(evidence)",
             source,
             "생성 프롬프트에서 source URL 투영을 제거하지 않음",
         )
