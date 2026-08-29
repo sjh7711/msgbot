@@ -2284,6 +2284,8 @@ class JavaScriptGroundingContractTests(unittest.TestCase):
             "buildAuditEvidenceQuery",
             "fetchGenerationEvidence",
             "fetchQuizEvidenceWithKeyPool",
+            "shortTopicEvidenceSearchQuery",
+            "shouldExpandShortEvidenceTopic",
             "availableQuizEvidenceKeys",
             "GEMINI_API_KEY_REQUIRED",
             "CLIENT_GEMINI_QUOTA_EXHAUSTED",
@@ -2350,9 +2352,9 @@ class JavaScriptGroundingContractTests(unittest.TestCase):
         ):
             self.assertIn(snippet, quiz_evidence_source)
         self.assertIn(
-            "query: topic",
+            "query: searchTopic",
             quiz_evidence_source,
-            "전용 API query가 순수 토픽이 아님",
+            "전용 API의 검증 토픽과 검색용 query가 분리되지 않음",
         )
         request_block = quiz_evidence_source.split("var requestPayload = {", 1)[1].split("};", 1)[0]
         self.assertNotIn(

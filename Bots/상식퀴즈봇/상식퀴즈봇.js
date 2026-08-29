@@ -2426,6 +2426,28 @@ function quizEvidenceOptionsWithKey(options, key) {
   return out;
 }
 
+function shortTopicEvidenceSearchQuery(topic) {
+  var text = String(topic || "").replace(/[\r\n]+/g, " ").replace(/^\s+|\s+$/g, "");
+  return text ? (text + " 뜻 개요 역사 구성 특징") : text;
+}
+
+function quizEvidenceOptionsWithSearch(options, searchQuery) {
+  var out = {};
+  for (var name in options) {
+    if (Object.prototype.hasOwnProperty.call(options, name)) out[name] = options[name];
+  }
+  out.searchQuery = searchQuery;
+  return out;
+}
+
+function shouldExpandShortEvidenceTopic(result, topic, alreadyExpanded) {
+  if (alreadyExpanded || !result || !result.error) return false;
+  var compactLength = String(topic || "").replace(/\s+/g, "").length;
+  var code = String(result.errorCode || "");
+  return compactLength >= 2 && compactLength <= 4 &&
+    (code === "TOPIC_NOT_FOUND" || code === "NO_SOURCES");
+}
+
 function fetchQuizEvidenceWithKeyPool(topic, options, room) {
   var result = QUIZ_EVIDENCE.fetchEvidence(String(topic), options);
   var calls = 1;
@@ -2465,17 +2487,33 @@ function fetchGenerationEvidence(topic, referenceDate, wantMulti, avoidAnswers, 
   }
   if (containsEvidenceMarkerSyntax(topic)) return { error: "토픽에 예약된 출처 ID 표식을 사용할 수 없음" };
   try {
-    // query에는 토픽만 넣는다. 검색 지시·날짜·유형·최근 정답은 전용 계약의
-    // 구조화 필드로 보내므로 300자 검색어 안에 프롬프트를 압축하지 않는다.
-    var result = fetchQuizEvidenceWithKeyPool(String(topic), {
+    // 한 글자 한국어 토픽은 서버의 기존 최소 길이 제약을 피하고 검색 의미를
+    // 확보하기 위해 처음부터 검색용 표현을 확장한다. 2~4글자는 정확 토픽을
+    // 먼저 보내고 검색 결과가 없을 때만 같은 범위의 일반 측면을 한 번 덧붙인다.
+    var compactTopicLength = String(topic || "").replace(/\s+/g, "").length;
+    var evidenceOptions = {
       referenceDate: referenceDate,
       quizType: wantMulti ? "multi" : "short",
       maxResults: 5,
       materialCount: QUIZ_EVIDENCE_MATERIAL_COUNT,
       distractorCount: 4,
       excludeAnswers: cleanEvidenceAvoidAnswers(avoidAnswers)
-    }, room);
+    };
+    var initiallyExpanded = compactTopicLength === 1;
+    if (initiallyExpanded) {
+      evidenceOptions = quizEvidenceOptionsWithSearch(
+        evidenceOptions, shortTopicEvidenceSearchQuery(topic));
+    }
+    var result = fetchQuizEvidenceWithKeyPool(String(topic), evidenceOptions, room);
     var evidenceCalls = Math.max(1, Math.floor((result && result._gatewaySearches) || 1));
+    if (shouldExpandShortEvidenceTopic(result, topic, initiallyExpanded)) {
+      var expandedResult = fetchQuizEvidenceWithKeyPool(
+        String(topic), quizEvidenceOptionsWithSearch(
+          evidenceOptions, shortTopicEvidenceSearchQuery(topic)), room);
+      evidenceCalls += Math.max(1, Math.floor(
+        (expandedResult && expandedResult._gatewaySearches) || 1));
+      result = expandedResult;
+    }
     var evidence = normalizeStructuredQuizEvidence(result, topic);
     if (!evidence) {
       if (result && result.error) {
@@ -2506,14 +2544,19 @@ function fetchFacetGenerationEvidence(topic, referenceDate, wantMulti, avoidAnsw
     attempted = true;
     // 전용 API에는 자유형 facet 프롬프트를 넣지 않는다. 첫 응답의 소재 답까지
     // exclude_answers에 더해 같은 토픽의 새 소재를 한 번만 요청한다.
-    var result = fetchQuizEvidenceWithKeyPool(String(topic), {
+    var facetOptions = {
       referenceDate: referenceDate,
       quizType: wantMulti ? "multi" : "short",
       maxResults: 5,
       materialCount: QUIZ_EVIDENCE_MATERIAL_COUNT,
       distractorCount: 4,
       excludeAnswers: cleanEvidenceAvoidAnswers(avoidAnswers)
-    }, room);
+    };
+    if (String(topic || "").replace(/\s+/g, "").length === 1) {
+      facetOptions = quizEvidenceOptionsWithSearch(
+        facetOptions, shortTopicEvidenceSearchQuery(topic));
+    }
+    var result = fetchQuizEvidenceWithKeyPool(String(topic), facetOptions, room);
     var evidenceCalls = Math.max(1, Math.floor((result && result._gatewaySearches) || 1));
     var evidence = normalizeStructuredQuizEvidence(result, topic);
     if (!evidence) {

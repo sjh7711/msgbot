@@ -89,6 +89,20 @@ const STRUCTURED_TELECHIPS = {
   sources: [{ id: 'S1', title: 'Telechips Products', url: 'https://www.telechips.com/' }],
   partial: false, warnings: []
 };
+function structuredShortTopic(topic, answer, fact) {
+  return {
+    schema_version: 4,
+    resolved_topic: { name: topic, sense: topic + ' 관련 일반 상식 주제', aliases: [topic] },
+    materials: [{ id: 'M1', facet: '개요', answer,
+      answer_type: 'term', choice_mode: 'grounded', fact, source_ids: ['S1'],
+      evidence: [{ source_id: 'S1', quote: fact }], answer_aliases: [],
+      distractors: groundedDs(['오답A', '오답B', '오답C', '오답D']) }],
+    sources: [{ id: 'S1', title: topic + ' 참고 자료', url: 'https://example.com/topic' }],
+    partial: true, warnings: []
+  };
+}
+const STRUCTURED_BOOK = structuredShortTopic('책', '도서', '책은 도서라고도 부르는 기록 매체다.');
+const STRUCTURED_BIBLE = structuredShortTopic('성경', '구약성경', '성경에는 구약성경이 포함된다.');
 function quizNormalize(s) { return String(s == null ? '' : s).trim().toLowerCase().replace(/\s+/g, '')
   .replace(/[·．。．.,，'"`\-–—!?()（）「」<>《》]/g, ''); }
 function loadEvidenceFlow(responses, options) {
@@ -204,6 +218,13 @@ console.log('\n[1] 요청 형태');
   check('전용 API도 300자 초과 토픽을 전송하지 않음',
     [qeLong.mod.fetchEvidence('가'.repeat(301), { referenceDate: '2026-08-26' }).errorCode,
      qeLong.log.length], ['INVALID_REQUEST', 0]);
+  const oneChar = loadQuizEvidence(() => ({ code: 200, text: JSON.stringify(STRUCTURED_BOOK) }));
+  const oneCharResult = oneChar.mod.fetchEvidence('책', {
+    referenceDate: '2026-08-29', quizType: 'short', searchQuery: '책 뜻 개요 역사 구성 특징'
+  });
+  check('한 글자 원토픽은 유지하고 확장 검색어만 API query에 사용',
+    [JSON.parse(oneChar.log[0].body).query, oneCharResult.resolved_topic.name],
+    ['책 뜻 개요 역사 구성 특징', '책']);
 }
 
 console.log('\n[2] 실패는 예외 대신 { error } — 호출 측이 fail-closed 여부를 결정한다');
@@ -325,7 +346,7 @@ console.log('\n[3] 상식퀴즈봇 배선');
     /function buildDistractorEvidenceQuery|function fetchDistractorEvidence|function mergeGenerationEvidence/.test(QSRC), false);
   check('생성용 근거 조회 함수', /function fetchGenerationEvidence\(topic, referenceDate, wantMulti, avoidAnswers, room\)/.test(QSRC), true);
   check('생성 query는 토픽만, 옵션은 별도 필드',
-    /fetchQuizEvidenceWithKeyPool\(String\(topic\), \{/.test(QSRC) &&
+    /fetchQuizEvidenceWithKeyPool\(String\(topic\), evidenceOptions, room\)/.test(QSRC) &&
     /excludeAnswers: cleanEvidenceAvoidAnswers\(avoidAnswers\)/.test(QSRC), true);
   check('  → QUIZ_EVIDENCE 없으면 오류 상태', /if \(!QUIZ_EVIDENCE\)/.test(QSRC), true);
   check('사용자 지정 토픽은 검색 실패 시 fail-closed',
@@ -363,6 +384,24 @@ console.log('\n[3] 상식퀴즈봇 배선');
      recoveredEvidence._gatewaySearches],
     [3, undefined, key1, key2, 3]);
   check('429를 낸 DB 키는 공용 쿨다운에 반영', poolFallback.exhaustedKeys, [key1]);
+  const oneCharFlow = loadEvidenceFlow([STRUCTURED_BOOK]);
+  const oneCharEvidence = oneCharFlow.ctx.fetchGenerationEvidence(
+    '책', '2026-08-29', false, [], '테스트방');
+  check('한 글자 토픽은 첫 요청부터 검색 표현을 확장',
+    [oneCharFlow.calls.length, oneCharFlow.calls[0].query,
+     oneCharFlow.calls[0].options.searchQuery, oneCharEvidence.materials[0].answer],
+    [1, '책', '책 뜻 개요 역사 구성 특징', '도서']);
+  const shortFallback = loadEvidenceFlow([
+    { error: '주제에 대한 검색 결과를 찾지 못했습니다', errorCode: 'TOPIC_NOT_FOUND', retryable: false },
+    STRUCTURED_BIBLE
+  ]);
+  const bibleEvidence = shortFallback.ctx.fetchGenerationEvidence(
+    '성경', '2026-08-29', false, [], '테스트방');
+  check('2~4글자 토픽 검색 실패는 확장 검색으로 한 번 복구',
+    [shortFallback.calls.length, shortFallback.calls[0].options.searchQuery,
+     shortFallback.calls[1].options.searchQuery, bibleEvidence._gatewaySearches,
+     bibleEvidence.materials[0].answer],
+    [2, undefined, '성경 뜻 개요 역사 구성 특징', 2, '구약성경']);
   const scopedEvidence = direct.ctx.scopedEvidenceForMaterial(directEvidence, directEvidence.materials[0]);
   check('material별 정답·별칭·오답을 선택 소재 검증값으로만 투영',
     [directEvidence.materials.length, directEvidence.materials[0].distractors.length,

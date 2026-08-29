@@ -689,6 +689,8 @@ def assert_javascript_contract() -> None:
         'if (precisionKinds.length && !(isCustomTopic && hasEvidence))',
         'fetchGenerationEvidence(\n      topic, referenceDate, wantMulti, topicAvoidAnswers, room)',
         'fetchQuizEvidenceWithKeyPool(String(topic)',
+        'shouldExpandShortEvidenceTopic(result, topic, initiallyExpanded)',
+        'shortTopicEvidenceSearchQuery(topic)',
         'CLIENT_GEMINI_QUOTA_EXHAUSTED',
         'buildEvidenceMaterialPool(',
         'var MAX_GENERATION_GATEWAY_SEARCHES = 2;',
