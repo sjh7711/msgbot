@@ -69,7 +69,7 @@ function detailToText(detail) {
     if (detail.length) {
       var parts = [];
       for (var i = 0; i < detail.length && i < 3; i++) {
-        var d = detail[i];
+        var d = detail[i] || {};
         var where = (d.loc && d.loc.length) ? d.loc[d.loc.length - 1] : "";
         parts.push((where ? where + ": " : "") + (d.msg || ""));
       }
@@ -79,21 +79,87 @@ function detailToText(detail) {
   return String(detail);
 }
 
-// 출처 배열을 [{ id, title, url }] 로 정규화. id 는 답변의 [S1] 인용과 짝이 된다.
-// 서버 실제 필드(2026-08-02 확인): source_id, title, requested_url, final_url,
-// fetched_at, content_type, bytes, sha256, redirects, page_count, truncated.
+// 출처 배열을 [{ id, title, url }] 로 정규화. 제목만 있고 실제 URL이 없는
+// 항목은 검색 근거로 인정하지 않는다. id 는 답변의 [S1] 인용과 짝이 된다.
 function normSources(arr) {
   var out = [];
   if (!arr) return out;
   try {
     for (var i = 0; i < arr.length && i < 5; i++) {
       var s = arr[i] || {};
-      var u = String(s.final_url || s.requested_url || s.url || "");
-      var t = String(s.title || "");
-      if (!u && !t) continue;
-      out.push({ id: String(s.source_id || s.id || ("S" + (i + 1))), title: t, url: u });
+      var u = String(s.final_url || s.requested_url || s.url || "")
+          .replace(/^\s+|\s+$/g, "");
+      if (!/^https?:\/\/[^\s\/?#]+(?:[\/?#][^\s]*)?$/i.test(u)) continue;
+      out.push({
+        id: String(s.source_id || s.id || ("S" + (i + 1))),
+        title: String(s.title || ""),
+        url: u
+      });
     }
   } catch (_) {}
+  return out;
+}
+
+// HTTP 오류와 구버전 서버의 HTTP 200 검색 실패를 같은 실패 경로로 전달한다.
+// connectFailed=false: 서버에는 도달했으므로 연결 장애와 구분할 수 있다.
+function decodeGatewayResponse(code, resp, raw) {
+  if (code < 200 || code >= 300) {
+    var serverError = resp && typeof resp.error === "object" ? resp.error : null;
+    var msg = resp ? detailToText(resp.detail) : String(raw || "").slice(0, 160);
+    if (!msg && serverError) msg = String(serverError.message || "");
+    if (code === 503 && !msg) msg = "웹 검색을 지금 쓸 수 없습니다(검색 서비스 중단).";
+    // 현재 서버와 구버전 서버 일부는 검색 답변의 출처 검증 실패를 구조화 코드
+    // 없이 detail 문자열로만 보낸다. 일반 5xx와 구분해야 로컬 모델로 폴백해
+    // 무근거 답변을 만들지 않는다.
+    var legacyNoEvidence = /(?:검색[^\r\n]{0,100}(?:출처|근거)|(?:출처|근거)[^\r\n]{0,100}(?:없|표시하지|누락))/i.test(msg);
+    return {
+      error: msg || ("HTTP " + code),
+      errorCode: serverError && serverError.code
+          ? String(serverError.code) : (legacyNoEvidence ? "SEARCH_NO_EVIDENCE" : ""),
+      httpStatus: code,
+      retryable: !!(serverError && serverError.retryable),
+      connectFailed: false
+    };
+  }
+
+  var answer = resp && typeof resp.answer === "string"
+      ? resp.answer.replace(/^\s+|\s+$/g, "") : "";
+  if (!answer) {
+    return { error: "응답이 비어 있습니다.", httpStatus: code, connectFailed: false };
+  }
+
+  var sources = normSources(resp.sources);
+  var route = String(resp.route || "chat");
+  var isSearch = route === "web_search" || !!resp.searched || !!resp.search;
+  var zeroResults = resp.search && resp.search.results != null &&
+      String(resp.search.results).replace(/^\s+|\s+$/g, "") === "0";
+  var noResultsAnswer = /^(검색 결과를 찾지 못했습니다|검색 결과가 없습니다|No search results were found)[.!]?$/i.test(answer);
+  if (isSearch && (!sources.length || zeroResults || noResultsAnswer)) {
+    return {
+      error: "검색 근거를 확보하지 못했습니다. 질문 표현을 바꿔 다시 요청해 주세요.",
+      errorCode: "SEARCH_NO_EVIDENCE",
+      httpStatus: code,
+      connectFailed: false
+    };
+  }
+
+  var out = {
+    route: route,
+    routeReason: String(resp.route_reason || ""),
+    answer: answer,
+    sources: sources,
+    searched: !!resp.searched,
+    fallbackUsed: !!resp.fallback_used,
+    partial: !!resp.partial,
+    truncated: !!resp.truncated,
+    title: "",
+    url: "",
+    elapsedMs: resp.elapsed_ms || 0
+  };
+  if (out.route === "url_summary" && out.sources.length) {
+    out.title = out.sources[0].title;
+    out.url = out.sources[0].url;
+  }
   return out;
 }
 
@@ -151,36 +217,7 @@ function ask(query) {
     var resp = null;
     try { resp = JSON.parse(raw); } catch (pe) {}
 
-    if (code < 200 || code >= 300) {
-      var msg = resp ? detailToText(resp.detail) : raw.slice(0, 160);
-      // SearXNG 가 죽으면 검색 경로만 503 이다. 사용자에게 이유를 알려준다.
-      if (code === 503 && !msg) msg = "웹 검색을 지금 쓸 수 없습니다(검색 서비스 중단).";
-      return { error: msg || ("HTTP " + code) };
-    }
-    if (!resp || typeof resp.answer !== "string" || !resp.answer) {
-      return { error: "응답이 비어 있습니다." };
-    }
-
-    var out = {
-      route: String(resp.route || "chat"),
-      routeReason: String(resp.route_reason || ""),
-      answer: String(resp.answer).replace(/^\s+|\s+$/g, ""),
-      sources: normSources(resp.sources),
-      searched: !!resp.searched,
-      fallbackUsed: !!resp.fallback_used,
-      partial: !!resp.partial,
-      truncated: !!resp.truncated,
-      title: "",
-      url: "",
-      elapsedMs: resp.elapsed_ms || 0
-    };
-    // URL 요약도 출처가 sources 로 온다(전용 endpoint 의 source 객체와 다름).
-    // 문서가 하나뿐이므로 첫 항목이 그 문서다.
-    if (out.route === "url_summary" && out.sources.length) {
-      out.title = out.sources[0].title;
-      out.url = out.sources[0].url;
-    }
-    return out;
+    return decodeGatewayResponse(code, resp, raw);
   } catch (e) {
     var em = (e && e.message) ? e.message : String(e);
     // 응답 코드를 받기 전에 터졌으면 서버에 닿지 못한 것 → 폴백 대상.

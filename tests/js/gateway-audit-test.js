@@ -256,6 +256,56 @@ console.log('\n[2] 실패는 예외 대신 { error } — 호출 측이 fail-clos
     'MODEL_OUTPUT_FORMAT');
 }
 
+console.log('\n[2-1] 제미니봇 HTTP 200 검색 실패 판정');
+{
+  const noSearchEvidence = loadGw(() => ({ code: 200, text: JSON.stringify({
+    route: 'web_search', answer: '검색 결과를 찾지 못했습니다.', searched: true,
+    sources: [], search: { results: 0 }
+  }) }), { modulePath: 'e:/msgbot/Bots/제미니봇/ask.js' });
+  const noSearchResult = noSearchEvidence.mod.ask('수인분당선 6량 편성 이유');
+  check('HTTP 200이어도 검색 결과·출처 0건은 실패',
+    [noSearchResult.errorCode, noSearchResult.httpStatus, noSearchResult.connectFailed],
+    ['SEARCH_NO_EVIDENCE', 200, false]);
+
+  const titleOnly = loadGw(() => ({ code: 200, text: JSON.stringify({
+    route: 'web_search', answer: '제목만 있는 검색 결과', searched: true,
+    sources: [{ source_id: 'S1', title: '제목뿐', final_url: '' }], search: { results: 1 }
+  }) }), { modulePath: 'e:/msgbot/Bots/제미니봇/ask.js' });
+  check('실제 URL 없는 출처는 검색 근거로 인정하지 않음',
+    titleOnly.mod.ask('검색 질문').errorCode, 'SEARCH_NO_EVIDENCE');
+
+  const groundedSearch = loadGw(() => ({ code: 200, text: JSON.stringify({
+    route: 'web_search', answer: '근거가 있는 답 [S1]', searched: true,
+    sources: [{ source_id: 'S1', title: '공식 자료', final_url: 'https://example.com/source' }],
+    search: { results: 1 }
+  }) }), { modulePath: 'e:/msgbot/Bots/제미니봇/ask.js' });
+  const groundedResult = groundedSearch.mod.ask('검색 질문');
+  check('URL 출처가 있는 검색 응답은 정상 유지',
+    [groundedResult.answer, groundedResult.sources.length], ['근거가 있는 답 [S1]', 1]);
+
+  const structuredError = loadGw(() => ({ code: 429, text: JSON.stringify({
+    error: { code: 'RATE_LIMITED', message: '사용량 초과', retryable: true }
+  }) }), { modulePath: 'e:/msgbot/Bots/제미니봇/ask.js' });
+  const structuredErrorResult = structuredError.mod.ask('질문');
+  check('신형 서버 오류 코드·재시도 가능 여부 보존',
+    [structuredErrorResult.errorCode, structuredErrorResult.retryable,
+     structuredErrorResult.httpStatus, structuredErrorResult.connectFailed],
+    ['RATE_LIMITED', true, 429, false]);
+
+  const legacyNoEvidence = loadGw(() => ({ code: 503, text: JSON.stringify({
+    detail: '내부 LLM이 검색 답변에 출처를 표시하지 않았습니다'
+  }) }), { modulePath: 'e:/msgbot/Bots/제미니봇/ask.js' });
+  check('구형 detail 검색 출처 오류도 무근거 오류로 분류',
+    legacyNoEvidence.mod.ask('수인분당선 6량 편성 이유').errorCode,
+    'SEARCH_NO_EVIDENCE');
+
+  const geminiBot = fs.readFileSync('e:/msgbot/Bots/제미니봇/제미니봇.js', 'utf8');
+  check('SEARCH_NO_EVIDENCE는 로컬 Gemini 무근거 폴백 금지',
+    /if \(r\.errorCode === "SEARCH_NO_EVIDENCE"\) return false;/.test(geminiBot), true);
+  check('검색 무근거 전용 사용자 안내',
+    /웹 검색 근거를 찾지 못해 답변하지 않았습니다/.test(geminiBot), true);
+}
+
 console.log('\n[3] 상식퀴즈봇 배선');
 {
   const genStart = QSRC.indexOf('function generateQuiz(');

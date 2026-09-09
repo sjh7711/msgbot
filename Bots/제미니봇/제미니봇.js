@@ -383,6 +383,9 @@ function formatAskResult(res) {
 function gatewayFallbackAllowed(r, question) {
   if (!r || !r.error) return false;
   if (hasUrl(question)) return false;
+  // 검색은 수행됐지만 근거가 0건인 경우 로컬 모델로 내려가면, 웹을 보지 못한
+  // 모델이 그럴듯한 답을 지어낼 수 있다. 이 오류는 fail-closed로 끝낸다.
+  if (r.errorCode === "SEARCH_NO_EVIDENCE") return false;
   return true;
 }
 
@@ -397,6 +400,12 @@ function sendAnswer(room, question, hash, isProvider) {
       return true;
     }
     if (!gatewayFallbackAllowed(r, question)) {
+      if (r && r.errorCode === "SEARCH_NO_EVIDENCE") {
+        try {
+          bot.send(room, "⚠ 웹 검색 근거를 찾지 못해 답변하지 않았습니다.\n질문 표현을 바꾸거나 범위를 넓혀 요청해 주세요.");
+        } catch(_) {}
+        return false;
+      }
       // 링크가 든 질문은 로컬 키로 대신할 수 없다(문서를 못 읽는다).
       // 지어낸 요약을 주느니 못 했다고 말한다.
       try { bot.send(room, "⚠ 링크를 읽지 못했습니다. 잠시 후 다시 시도해 주세요."); } catch(_) {}
