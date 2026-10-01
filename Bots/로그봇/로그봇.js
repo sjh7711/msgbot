@@ -230,7 +230,21 @@ function _watchUsage() {
     "• !봇로그 eval        해당 봇의 최근 기록 (이름 부분일치)",
     "• !봇로그 도움말봇 30  해당 봇의 최근 30건",
     "• !봇로그 30          전체 봇의 최근 30건",
-    "개수: 1~" + WATCH_MAX_COUNT + ". 남아 있는 기록에서 조회합니다."].join("\n");
+    "개수: 1~" + WATCH_MAX_COUNT + ". 남아 있는 기록에서 조회합니다.",
+    "현재 상태·최근 진단 5건·앱/워커 오류 5건도 함께 표시합니다."].join("\n");
+}
+
+function _replyLogChunks(msg, text) {
+  // 스택이 포함된 보고서도 전송 한도에 걸려 사라지지 않도록 분할한다.
+  var chunks = [];
+  while (text.length > 2800) {
+    var end = text.lastIndexOf("\n", 2800);
+    if (end < 1400) end = 2800;
+    chunks.push(text.slice(0, end)); text = text.slice(end).replace(/^\n/, "");
+  }
+  if (text) chunks.push(text);
+  for (var i = 0; i < chunks.length; i++) msg.reply(
+    (chunks.length > 1 ? "[봇로그 " + (i + 1) + "/" + chunks.length + "]\n" : "") + chunks[i]);
 }
 
 function handleWatchCmd(msg) {
@@ -255,15 +269,12 @@ function handleWatchCmd(msg) {
   }
 
   var res = errlog.collectWatch(arg);
-  if (res.error) { msg.reply("봇 로그 읽기 실패: " + _errCut(res.error, 200)); return true; }
-  if (res.missing) {
-    msg.reply("봇 종료·복구 기록 파일이 아직 없습니다. 감시자가 기록을 남긴 뒤 조회할 수 있습니다.");
-    return true;
-  }
   var label = arg ? "'" + arg + "'" : "전체 봇";
   var entries = res.entries;
   var lines = ["[봇 종료·복구 기록] " + label];
-  if (!entries.length) lines.push("조회 조건에 맞는 기록이 없습니다.");
+  if (res.error) lines.push("봇 로그 읽기 실패: " + _errCut(res.error, 200));
+  else if (res.missing) lines.push("봇 종료·복구 기록 파일이 아직 없습니다.");
+  else if (!entries.length) lines.push("조회 조건에 맞는 기록이 없습니다.");
   else {
     lines.push("최근 " + Math.min(entries.length, count) + "건 (조회된 기록 " + entries.length + "건)");
     for (var i = Math.max(0, entries.length - count); i < entries.length; i++) {
@@ -274,8 +285,27 @@ function handleWatchCmd(msg) {
   if (res.skipped) lines.push("\n⚠ 형식을 읽지 못한 기록 " + res.skipped + "줄이 있습니다.");
   if (res.truncated) lines.push("\n※ 파일의 최신 4,000줄에서 조회했습니다.");
   lines.push("\n※ 로그 용량 제한으로 이전 기록이 없을 수 있습니다.");
-  lines.push("※ OFF 감지·복구 이력이며 종료 원인 자체는 기록되지 않을 수 있습니다.");
-  msg.reply(lines.join("\n"));
+  if (typeof errlog.diagnose === "function") {
+    var diagnostic = errlog.diagnose(arg);
+    lines.push("\n[현재 상태]");
+    if (!diagnostic.current.length) lines.push("조회 조건에 맞는 봇을 찾지 못했습니다.");
+    for (var c = 0; c < diagnostic.current.length; c++) lines.push(
+      "[" + diagnostic.current[c].bot + "] " + _errCut(diagnostic.current[c].text, 1400));
+    function appendDetails(title, rows) {
+      lines.push("\n[" + title + "]");
+      if (!rows.length) lines.push("수집된 기록 없음 (오류가 없다는 뜻은 아닙니다).");
+      for (var d = 0; d < rows.length; d++) {
+        lines.push(rows[d].ts + " [" + rows[d].bot + "] " + rows[d].source);
+        var detail = String(rows[d].text);
+        lines.push(detail.length > 1800 ? detail.slice(0, 1800) + "… (원문 일부 생략)" : detail);
+      }
+    }
+    appendDetails("최근 상태·워커 진단 5건", diagnostic.events);
+    appendDetails("최근 앱·워커 오류 5건 — 발생 시각 확인", diagnostic.errors);
+    if (diagnostic.notices.length) lines.push("\n[수집 안내]\n" + diagnostic.notices.join("\n"));
+  } else lines.push("진단 모듈 업데이트가 필요합니다. lib/errlog.js 반영 후 로그봇을 재컴파일해주세요.");
+  lines.push("\n※ 과거 오류와 이번 종료의 관련성은 시각·상태를 함께 확인해야 합니다.");
+  _replyLogChunks(msg, lines.join("\n"));
   return true;
 }
 

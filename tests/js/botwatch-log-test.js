@@ -13,14 +13,21 @@ const botSource = fs.readFileSync(path.join(root, 'Bots/로그봇/로그봇.js')
 
 // Exercise the real collector and subscribed message handler without Android or a live chat.
 function harness(contents, options = {}) {
-  const files = {};
+  const files = Object.assign({}, options.files);
   if (contents !== null) files[watchPath] = contents;
   let reads = 0;
+  let lastReplies = [];
   const io = {
-    File: function (name) {
+    File: function (name, child) {
+      name = (typeof name === 'string' ? name : name.name) + (child ? '/' + child : '');
       this.name = name;
       this.exists = () => Object.hasOwn(files, name);
       this.isFile = () => true;
+      this.length = () => files[name]?.length || 0;
+      this.getName = () => name.split('/').pop();
+      this.isDirectory = () => Object.keys(files).some(key => key.startsWith(name + '/'));
+      this.listFiles = () => [...new Set(Object.keys(files).filter(key => key.startsWith(name + '/'))
+        .map(key => key.slice(name.length + 1).split('/')[0]))].map(child => new io.File(name, child));
     },
     FileInputStream: function (name) {
       reads++;
@@ -33,6 +40,11 @@ function harness(contents, options = {}) {
       let index = 0;
       this.readLine = () => index < lines.length ? lines[index++] : null;
       this.close = () => {};
+    },
+    FileWriter: function (name, append) {
+      if (!append) files[name] = '';
+      this.write = text => { files[name] = (files[name] || '') + text; };
+      this.close = () => {};
     }
   };
   const Packages = { android: {
@@ -42,7 +54,17 @@ function harness(contents, options = {}) {
     } } }
   } };
   const module = { exports: {} };
-  vm.runInNewContext(errSource, { module, Packages, java: { io } });
+  const java = { io,
+    text: { SimpleDateFormat: function () { this.setTimeZone = () => {}; this.format = () => '2026-10-01 14:00:00'; } },
+    util: { TimeZone: { getTimeZone: () => ({}) }, Date: function () {} },
+    lang: {
+    System: { getProperties: () => ({ get: () => ({ get: () => ({ size: () => 0 }) }) }) },
+    Runtime: { getRuntime: () => ({ totalMemory: () => 64 * 1048576, freeMemory: () => 32 * 1048576, maxMemory: () => 256 * 1048576 }) },
+    Thread: { getAllStackTraces: () => ({ entrySet: () => ({ iterator: () => ({ hasNext: () => false }) }) }) }
+  } };
+  vm.runInNewContext(errSource, { module, Packages, java, BotManager: {
+    getPower: () => false, isCompiled: () => options.compiled !== false
+  } });
   const errlog = module.exports;
   let onMessage;
   const bot = { getRootPath: () => sd + '/msgbot/Bots/로그봇', addListener: () => {}, setCommandPrefix: () => {} };
@@ -61,8 +83,10 @@ function harness(contents, options = {}) {
   return {
     errlog,
     reads: () => reads,
+    replies: () => lastReplies,
     command(content, hash = 'admin') {
       const replies = [];
+      lastReplies = replies;
       onMessage({ content, hash, reply: text => replies.push(text) });
       return replies.join('\n');
     }
@@ -100,7 +124,7 @@ test('chat command filters before limiting and includes the supplied incident ti
   assert.ok(output.indexOf('13:08:00') < output.indexOf('13:40:31'));
   assert.doesNotMatch(output, /도움말봇|12:58:00|13:02:00/);
   assert.match(output, /형식을 읽지 못한 기록 1줄/);
-  assert.match(output, /종료 원인 자체는 기록되지 않을 수/);
+  assert.match(output, /과거 오류와 이번 종료의 관련성/);
 });
 
 test('default shows the latest 15 and count-only form shows the requested number', () => {
@@ -158,4 +182,56 @@ test('existing error collection still attributes only failed recovery and abando
   assert.equal(result.entries.length, 3);
   assert.ok(result.entries.every(entry => /복구 실패|복구 포기/.test(entry.text)));
   assert.match(h.command('!에러 ChatManager'), /총 3건/);
+});
+
+test('diagnostics include app errors, worker failures and OFF state even without a recovery file', () => {
+  const h = harness(null, { files: {
+    [sd + '/msgbot/Bots/eval/bot.json']: '{"option":{"apiLevel":2,"scriptPower":true}}',
+    [sd + '/msgbot/Bots/eval/log.json']: JSON.stringify([{ a: 'DB open failed\nstack line', b: 3, c: '2026/10/01 13:02:00' }]),
+    [sd + '/msgbot/GLOBAL_LOG.json']: JSON.stringify([
+      { a: 'Compile Error(eval)\nReferenceError: BotManager is not defined', b: 3, c: '2026/10/01 13:01:00' },
+      { a: 'Runtime Error(도움말봇)\nother bot error', b: 3, c: '2026/10/01 13:03:00' },
+      { a: '컴파일 하였습니다: eval', b: 1, c: '2026/10/01 13:04:00' }
+    ]),
+    [sd + '/msgbot/botdiagnostic.log']: '2026-10-01 13:02:38 [eval] OFF 최초 감지: 전원=OFF; 컴파일=false',
+    [sd + '/msgbot/subscriber_error.log']: 'Thu Oct 01 13:01:59 KST 2026 [eval/EVAL_BOT_WORKER] task: worker failure'
+  } });
+  const output = h.command('!봇로그 eval');
+  assert.match(output, /파일이 아직 없습니다/);
+  assert.match(output, /전원=OFF; 컴파일=true/);
+  assert.match(output, /설정전원=true, API=2/);
+  assert.match(output, /워커=없음/);
+  assert.match(output, /2026-10-01 13:01:00.*앱 글로벌 로그/);
+  assert.match(output, /ReferenceError: BotManager is not defined/);
+  assert.match(output, /DB open failed\nstack line/);
+  assert.match(output, /worker failure/);
+  assert.match(output, /OFF 최초 감지/);
+  assert.doesNotMatch(output, /other bot error|컴파일 하였습니다/);
+});
+
+test('invalid app logs are disclosed and bot filters are never used as file paths', () => {
+  const h = harness(fixture, { files: {
+    [sd + '/msgbot/GLOBAL_LOG.json']: '{broken',
+    [sd + '/msgbot/Bots/eval/bot.json']: '{}'
+  } });
+  assert.match(h.command('!봇로그 eval'), /GLOBAL_LOG.json: JSON 읽기 실패/);
+  assert.equal(h.errlog.diagnose('../eval').current.length, 0);
+});
+
+test('state at detection survives later queries and long error reports are sent in bounded chunks', () => {
+  const h = harness(fixture, { files: {
+    [sd + '/msgbot/Bots/eval/bot.json']: '{"option":{"apiLevel":2,"scriptPower":true}}',
+    [sd + '/msgbot/Bots/eval/log.json']: '[]',
+    [sd + '/msgbot/GLOBAL_LOG.json']: JSON.stringify(Array.from({ length: 5 }, (_, i) => ({
+      a: 'Runtime Error(eval)\n' + 'stack frame '.repeat(200), b: 3, c: '2026/10/01 13:0' + i + ':00'
+    })))
+  } });
+  assert.equal(h.errlog.recordState('eval', 'OFF 최초 감지', '복구 직전'), true);
+  assert.equal(h.errlog.recordEvent('eval', '워커 종료', 'EVAL_BOT_WORKER interrupt'), true);
+  const output = h.command('!봇로그 eval');
+  assert.match(output, /2026-10-01 14:00:00 \[eval\] botdiagnostic.log/);
+  assert.match(output, /OFF 최초 감지: 복구 직전 전원=OFF/);
+  assert.match(output, /워커 종료: EVAL_BOT_WORKER interrupt/);
+  assert.ok(h.replies().length > 1);
+  assert.ok(h.replies().every(reply => reply.length < 2900));
 });

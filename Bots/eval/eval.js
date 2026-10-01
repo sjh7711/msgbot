@@ -50,7 +50,7 @@ function handleEval(msg) {
 
   if (lv >= admin.LEVEL_SUPER) {
     try { msg.reply(String(eval(code))); }
-    catch (e) { msg.reply(String(e)); }
+    catch (e) { logEvalError("eval 실행", e); msg.reply(String(e)); }
     return;
   }
 
@@ -293,11 +293,15 @@ function isMyCommand(text, msg) {
 
 // ─── 메시지 큐 + 워커 스레드 (ChatManager 구독, 공용 subscriber 모듈) ───
 var subscribe = require(libPath("subscriber.js"));
+function logEvalError(where, e) {
+  try { subscribe.logError(BOT_NAME, WORKER_NAME, where, e); } catch (_) {}
+}
 
 subscribe(BOT_NAME, WORKER_NAME, function (msg) {
   if (!isMyCommand(msg.content, msg)) return;
   try { handleMessage(msg); }
   catch (e) {
+    logEvalError("명령 처리", e);
     try { msg.reply("[eval] ⚠ 오류: " + ((e && e.message) ? e.message : e)); } catch (_) {}
   }
 });

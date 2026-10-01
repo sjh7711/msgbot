@@ -644,23 +644,30 @@ function _botListText(action) {
 function _applyOnOff(name) {
   try {
     var next = !BotManager.getPower(name);
-    // 켤 때: OFF(언로드)였던 봇은 미컴파일일 수 있으므로 먼저 prepare (이미 컴파일됐으면 무동작)
-    if (next) { try { BotManager.prepare(name, false); } catch(_) {} }
-    BotManager.setPower(name, next);
+    _watchDiagnostic(name, "수동 전원 변경 요청", "목표=" + (next ? "ON" : "OFF"));
     // 감시자가 사용자 의도와 싸우지 않도록 희망 상태를 남긴다. 수동으로 켜면
     // 크래시 루프 판정(백오프·포기)도 함께 초기화된다.
     _setWatchWant(name, next);
-    return name + " : " + (next ? "🟢 ON" : "🔴 OFF");
+    if (next) {
+      var result = _watchRecover(name);
+      if (!result.ok) return name + " : ⚠️ 켜기 실패 (" + result.err + ")";
+    } else BotManager.setPower(name, false);
+    _watchDiagnostic(name, "수동 전원 변경 결과", "");
+    return name + " : " + (next ? "🟢 ON (유지 여부 확인 중)" : "🔴 OFF");
   } catch(e) {
+    _watchDiagnostic(name, "수동 전원 변경 예외", String(e));
     return name + " : ⚠️ 전원 변경 실패 (" + (e && e.message ? e.message : e) + ")";
   }
 }
 
 function _applyCompile(name) {
   try {
-    var ok = BotManager.compile(name, false);
+    _watchDiagnostic(name, "수동 컴파일 시작", "");
+    var ok = BotManager.compile(name, true);
+    _watchDiagnostic(name, "수동 컴파일 결과", "반환값=" + ok);
     return name + " : " + (ok ? "✅ 컴파일 성공" : "❌ 컴파일 실패");
   } catch(e) {
+    _watchDiagnostic(name, "수동 컴파일 예외", String(e));
     return name + " : ❌ 컴파일 오류 (" + (e && e.message ? e.message : e) + ")";
   }
 }
@@ -717,6 +724,17 @@ var WATCH_LOG_MAX = 200 * 1024;         // 로그가 무한정 커지지 않게 
 var _watchWant = null;    // { name: { want, at } } — 파일 내용. null 이면 아직 안 읽음
 var _watchState = {};     // name -> { tries, nextAt, okSince, gaveUp } (메모리, 재컴파일 시 초기화)
 var _watchLastTick = 0;
+var _watchDiag = null;
+
+function _watchDiagnostic(name, reason, detail) {
+  try {
+    if (!_watchDiag) _watchDiag = require(Packages.android.os.Environment.getExternalStorageDirectory()
+      .getAbsolutePath() + "/msgbot/lib/errlog.js");
+    if (!_watchDiag.recordState(name, reason, detail)) throw new Error("진단 파일 기록 실패");
+  } catch (e) {
+    _watchLog(name + " 진단 수집 실패 (" + reason + "): " + String(e));
+  }
+}
 
 function _watchStamp() {
   try {
@@ -799,16 +817,25 @@ function _watchNotify(text) {
   _watchFlushNotices();
 }
 
-// 꺼진 봇 하나를 되살린다. 성공 여부를 실제 전원 상태로 확인한다.
+// prepare 예외/컴파일 실패를 숨기지 않는다. ON은 즉시 상태이며 안정성은 10분간 따로 확인.
 function _watchRecover(name) {
   try {
-    try { BotManager.prepare(name, false); } catch(_) {}
+    _watchDiagnostic(name, "복구 직전", "");
+    var prepared = BotManager.prepare(name, true);
+    if (!BotManager.isCompiled(name)) {
+      var why = "prepare 반환값=" + prepared + ", 여전히 미컴파일";
+      _watchDiagnostic(name, "복구 컴파일 실패", why);
+      return { ok: false, err: why };
+    }
     BotManager.setPower(name, true);
-    var on = false;
-    try { on = !!BotManager.getPower(name); } catch(_) { on = false; }
-    return { ok: on, err: on ? "" : "setPower 후에도 OFF" };
+    var on = !!BotManager.getPower(name), compiled = !!BotManager.isCompiled(name);
+    _watchDiagnostic(name, "복구 직후", "prepare 반환값=" + prepared);
+    return { ok: on && compiled, err: on && compiled ? "" : "setPower 후 전원=" + on + ", 컴파일=" + compiled };
   } catch(e) {
-    return { ok: false, err: (e && e.message) ? e.message : String(e) };
+    var detail = String(e);
+    try { if (_watchDiag) detail = _watchDiag.errorDetail(e); } catch (_) {}
+    _watchDiagnostic(name, "복구 예외", detail);
+    return { ok: false, err: detail };
   }
 }
 
@@ -832,6 +859,7 @@ function _watchTick() {
     try { on = BotManager.getPower(nm); } catch(_) { continue; }   // 조회 실패는 판단 보류
 
     if (on) {
+      if (st.offSince) _watchDiagnostic(nm, "ON 재확인", "OFF 관측 후 " + Math.round((now - st.offSince) / 1000) + "초");
       st.offSince = 0;                    // 켜져 있으면 "꺼진 채 지속" 계측 초기화
       // 켜져 있음. 복구 이력이 있으면 충분히 버텼는지 보고 백오프를 푼다.
       if (st.tries > 0) {
@@ -844,12 +872,17 @@ function _watchTick() {
       continue;
     }
 
+    // 백오프/포기 중에도 첫 OFF 전환은 기록한다. 복구 시각과 종료 감지 시각을 구분.
+    if (!st.offSince) {
+      st.offSince = now;
+      _watchDiagnostic(nm, "OFF 최초 감지", st.okSince ?
+        "직전 ON 확인으로부터 " + Math.round((now - st.okSince) / 1000) + "초 (실제 종료시각 아님)" : "");
+    }
     st.okSince = 0;
     if (st.gaveUp) continue;              // 포기한 봇은 수동 개입(!onoff) 전까지 그대로 둔다
     if (now < st.nextAt) continue;        // 백오프 대기 중
 
     // 꺼진 걸 처음 본 시점을 기록하고, 충분히 지속됐을 때만 손댄다.
-    if (!st.offSince) { st.offSince = now; continue; }
     if (now - st.offSince < WATCH_CONFIRM_MS) continue;
 
     // 판정은 "시도하기 전"에 한다. 시도한 뒤에 포기를 정하면, 마지막 시도가 성공했는데도
@@ -858,6 +891,7 @@ function _watchTick() {
       // 정해진 횟수를 다 쓰고 마지막 백오프까지 기다렸는데 여전히 꺼져 있다.
       // 켜는 것 자체가 답이 아니라는 뜻 — 사람을 부른다.
       st.gaveUp = true;
+      _watchDiagnostic(nm, "자동 복구 포기", "시도=" + st.tries);
       _watchLog(nm + " 복구 포기 — 수동 확인 필요");
       _watchNotify("⛔ " + nm + " 이 계속 꺼집니다. " + st.tries + "회 되살렸지만 유지되지 않아 자동 복구를 멈춥니다.\n" +
                    "로그: " + WATCH_LOG_PATH + "\n확인 후 !onoff 로 켜면 감시가 다시 시작됩니다.");
@@ -870,8 +904,9 @@ function _watchTick() {
 
     if (r.ok) {
       st.okSince = now;
-      _watchLog(nm + " OFF 감지 → 복구 성공 (" + st.tries + "회차)");
-      _watchNotify("🔄 " + nm + " 이 꺼져 있어 다시 켰습니다. (" + st.tries + "회차)");
+      st.offSince = 0;
+      _watchLog(nm + " OFF 감지 → 전원 ON 확인 (" + st.tries + "회차, 유지 여부 확인 중)");
+      _watchNotify("🔄 " + nm + " 전원을 켰습니다. (" + st.tries + "회차, 유지 여부 확인 중)");
     } else {
       _watchLog(nm + " OFF 감지 → 복구 실패 (" + st.tries + "회차): " + r.err);
       _watchNotify("⚠️ " + nm + " 이 꺼져 있어 켜려 했지만 실패했습니다. (" + st.tries + "회차)\n사유: " + r.err);

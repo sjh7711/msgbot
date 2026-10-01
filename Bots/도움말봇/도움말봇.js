@@ -179,7 +179,7 @@ var REGISTRY = [
       { display: "!에러",                   triggers: ["!에러"],     desc: "봇 에러 로그 모아보기 (최근 24시간 요약)", admin: true },
       { display: "!에러 [시간|봇이름]",       triggers: ["!에러"],     desc: "기간(시간) 또는 특정 봇으로 좁혀 집계", admin: true },
       { display: "!에러 상세 / 전체",         triggers: ["!에러"],     desc: "원문 최근 15줄 / 남아 있는 기록 전부", admin: true },
-      { display: "!봇로그 [봇이름] [개수]",    triggers: ["!봇로그"],   desc: "봇 종료·자동 복구 성공/실패/포기 이력 (기본 15건, 최대 30건). 예: !봇로그 eval", admin: true }
+      { display: "!봇로그 [봇이름] [개수]",    triggers: ["!봇로그"],   desc: "종료·복구 이력과 현재 상태, 최근 앱/워커 오류를 함께 조회 (기본 15건, 최대 30건). 예: !봇로그 eval", admin: true }
     ]
   },
   {
@@ -551,7 +551,7 @@ var subscribe = (function() {
 })();
 
 subscribe(BOT_NAME, WORKER_NAME, function(msg) {
-  try { handleHelp(msg); } catch(_) {}
+  handleHelp(msg);  // 예외는 subscriber가 스택과 함께 기록한다.
 });
 
 // ─── 보일러플레이트 ─────────────────────────────────────────────────────────
