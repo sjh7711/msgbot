@@ -43,7 +43,7 @@ var deletedChat = (function() {
   try { if (typeof bot.getRootPath === "function") p = bot.getRootPath() + "/deletedchat.js"; } catch(_) {}
   return require(p);
 })();
-// 에러 로그 수집 + 권한. 못 불러오면 null → "!에러" 만 죽고 나머지는 그대로 동작한다
+// 에러 로그 수집 + 권한. 못 불러오면 null → 로그 조회만 실패하고 나머지는 그대로 동작한다
 // (이 두 파일 때문에 로그봇 전체가 컴파일 실패하지 않도록).
 function _libPath(name) {
   var p = "/sdcard/msgbot/lib/" + name;
@@ -145,7 +145,8 @@ function _errUsage() {
     "• " + ERR_CMD + " 6          최근 6시간",
     "• " + ERR_CMD + " 제미니봇    그 봇 것만",
     "• " + ERR_CMD + " 상세        최근 원문 " + ERR_RAW_MAX + "줄",
-    "• " + ERR_CMD + " 전체        남아 있는 기록 전부"].join("\n");
+    "• " + ERR_CMD + " 전체        남아 있는 기록 전부",
+    "• !봇로그 [봇이름] [개수]  종료·자동 복구 이력 (예: !봇로그 eval)"].join("\n");
 }
 
 function _errSummaryText(res, label) {
@@ -218,6 +219,66 @@ function handleErrCmd(msg) {
   return true;
 }
 
+// ─── "!봇로그" — 봇 전원 감시자의 종료·자동 복구 이력 ──────────────────────
+var WATCH_CMD = "!봇로그";
+var WATCH_DEFAULT_COUNT = 15;
+var WATCH_MAX_COUNT = 30;
+
+function _watchUsage() {
+  return [WATCH_CMD + " 사용법 (관리자 전용)",
+    "• !봇로그             전체 봇의 최근 " + WATCH_DEFAULT_COUNT + "건",
+    "• !봇로그 eval        해당 봇의 최근 기록 (이름 부분일치)",
+    "• !봇로그 도움말봇 30  해당 봇의 최근 30건",
+    "• !봇로그 30          전체 봇의 최근 30건",
+    "개수: 1~" + WATCH_MAX_COUNT + ". 남아 있는 기록에서 조회합니다."].join("\n");
+}
+
+function handleWatchCmd(msg) {
+  if (!admin || !admin.isAdmin(msg.hash)) {
+    msg.reply(WATCH_CMD + " 은 관리자만 사용할 수 있습니다."); return true;
+  }
+  var arg = String(msg.content).replace(/^\s+|\s+$/g, "").slice(WATCH_CMD.length)
+      .replace(/^\s+|\s+$/g, "");
+  if (/^(도움말|help|\?)$/i.test(arg)) { msg.reply(_watchUsage()); return true; }
+  if (!errlog || typeof errlog.collectWatch !== "function") {
+    msg.reply("봇 로그 모듈을 불러오지 못했습니다. lib/errlog.js를 업데이트한 뒤 로그봇을 재컴파일해주세요.");
+    return true;
+  }
+  var count = WATCH_DEFAULT_COUNT;
+  var countArg = /(?:^|\s)(\d+)$/.exec(arg);
+  if (countArg) {
+    count = Number(countArg[1]);
+    if (count < 1 || count > WATCH_MAX_COUNT) {
+      msg.reply("개수는 1~" + WATCH_MAX_COUNT + " 사이로 넣어주세요."); return true;
+    }
+    arg = arg.slice(0, countArg.index).replace(/\s+$/g, "");
+  }
+
+  var res = errlog.collectWatch(arg);
+  if (res.error) { msg.reply("봇 로그 읽기 실패: " + _errCut(res.error, 200)); return true; }
+  if (res.missing) {
+    msg.reply("봇 종료·복구 기록 파일이 아직 없습니다. 감시자가 기록을 남긴 뒤 조회할 수 있습니다.");
+    return true;
+  }
+  var label = arg ? "'" + arg + "'" : "전체 봇";
+  var entries = res.entries;
+  var lines = ["[봇 종료·복구 기록] " + label];
+  if (!entries.length) lines.push("조회 조건에 맞는 기록이 없습니다.");
+  else {
+    lines.push("최근 " + Math.min(entries.length, count) + "건 (조회된 기록 " + entries.length + "건)");
+    for (var i = Math.max(0, entries.length - count); i < entries.length; i++) {
+      var e = entries[i];
+      lines.push("\n" + e.ts + " [" + e.bot + "]\n" + _errCut(e.text, 200));
+    }
+  }
+  if (res.skipped) lines.push("\n⚠ 형식을 읽지 못한 기록 " + res.skipped + "줄이 있습니다.");
+  if (res.truncated) lines.push("\n※ 파일의 최신 4,000줄에서 조회했습니다.");
+  lines.push("\n※ 로그 용량 제한으로 이전 기록이 없을 수 있습니다.");
+  lines.push("※ OFF 감지·복구 이력이며 종료 원인 자체는 기록되지 않을 수 있습니다.");
+  msg.reply(lines.join("\n"));
+  return true;
+}
+
 // ─── 메시지 큐 + 워커 스레드 (ChatManager 구독, 공유 모듈) ───────────────────
 var WORKER_NAME = "LOG_BOT_WORKER";
 
@@ -229,8 +290,11 @@ subscribe(BOT_NAME, WORKER_NAME, function(msg) {
     }
   } catch (e) {}
 
-  // "!에러" — 에러 로그 모아보기 (관리자 전용)
+  // "!봇로그" / "!에러" — 로그 조회 (관리자 전용)
   try {
+    if (/^!봇로그(?:\s|$)/.test(String(msg.content || "").replace(/^\s+/, ""))) {
+      if (handleWatchCmd(msg)) return;
+    }
     if (msg.content && String(msg.content).indexOf(ERR_CMD) === 0) {
       if (handleErrCmd(msg)) return;
     }
